@@ -7,40 +7,57 @@ from fastapi.requests import Request
 import base64
 import hmac
 import json
+import secrets
 import time
 from core.settings import settings
-from apps.admin.services import FileService, ConfigService, LocalFileService
+from apps.admin.services import FileService, ConfigService
 
 
 def create_token(data: dict, expires_in: int = 3600 * 24 * 30) -> str:
     """
-    创建JWT token
+    创建JWT token (标准 base64url 编码)
     :param data: 数据负载
     :param expires_in: 过期时间(秒)
     """
-    header = base64.b64encode(
+    header = base64.urlsafe_b64encode(
         json.dumps({"alg": "HS256", "typ": "JWT"}).encode()
-    ).decode()
-    payload = base64.b64encode(
-        json.dumps({**data, "exp": int(time.time()) + expires_in}).encode()
-    ).decode()
+    ).decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(
+        json.dumps({
+            **data,
+            "iat": int(time.time()),
+            "jti": secrets.token_hex(8),
+            "exp": int(time.time()) + expires_in,
+        }).encode()
+    ).decode().rstrip("=")
 
     signature = hmac.new(
         settings.admin_token.encode(), f"{header}.{payload}".encode(), "sha256"
     ).digest()
-    signature = base64.b64encode(signature).decode()
+    signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
 
     return f"{header}.{payload}.{signature}"
 
 
 def verify_token(token: str) -> dict:
     """
-    验证JWT token
+    验证JWT token (兼容标准 base64url 和老版 base64)
     :param token: JWT token
     :return: 解码后的数据
     """
     try:
         header_b64, payload_b64, signature_b64 = token.split(".")
+
+        # 兼容老版 base64 和标准 base64url
+        def _b64decode_urlsafe(s: str) -> bytes:
+            # 先补齐 padding
+            pad = 4 - len(s) % 4
+            if pad != 4:
+                s += "=" * pad
+            try:
+                return base64.urlsafe_b64decode(s)
+            except Exception:
+                return base64.b64decode(s)
 
         # 验证签名
         expected_signature = hmac.new(
@@ -48,13 +65,13 @@ def verify_token(token: str) -> dict:
             f"{header_b64}.{payload_b64}".encode(),
             "sha256",
         ).digest()
-        expected_signature_b64 = base64.b64encode(expected_signature).decode()
+        expected_sig_str = base64.urlsafe_b64encode(expected_signature).decode().rstrip("=")
 
-        if not hmac.compare_digest(signature_b64, expected_signature_b64):
+        if not hmac.compare_digest(signature_b64, expected_sig_str):
             raise ValueError("无效的签名")
 
         # 解码payload
-        payload = json.loads(base64.b64decode(payload_b64))
+        payload = json.loads(_b64decode_urlsafe(payload_b64))
 
         # 检查是否过期
         if payload.get("exp", 0) < time.time():
@@ -126,7 +143,3 @@ async def get_file_service():
 
 async def get_config_service():
     return ConfigService()
-
-
-async def get_local_file_service():
-    return LocalFileService()

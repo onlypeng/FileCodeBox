@@ -71,6 +71,12 @@ DEFAULT_CONFIG = {
     "serverPort": 12345,
     "showAdminAddr": 0,
     "robotsText": "User-agent: *\nDisallow: /",
+    "maxMultiFileCount": 20,
+    "maxCollectionFiles": 100,
+    "maxSendFiles": 20,
+    "collectionDefaultMaxFiles": 20,
+    "collectionDefaultExpireDays": 7,
+    "trustedProxies": "",
 }
 
 

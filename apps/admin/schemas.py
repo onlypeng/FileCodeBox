@@ -8,24 +8,62 @@ class IDData(BaseModel):
     id: int
 
 
-class ShareItem(BaseModel):
-    expire_value: int
-    expire_style: str = "day"
-    filename: str
-
-
-class DeleteItem(BaseModel):
-    filename: str
-
-
 class LoginData(BaseModel):
     password: str
 
 
-class UpdateFileData(BaseModel):
-    id: int
-    code: Optional[str] = None
-    prefix: Optional[str] = None
-    suffix: Optional[str] = None
-    expired_at: Optional[Union[datetime.datetime, str]] = None
-    expired_count: Optional[int] = None
+class UpdateConfigRequest(BaseModel):
+    """配置更新请求 - 白名单校验"""
+    # 仅允许更新的配置项
+    file_storage: Optional[str] = None
+    storage_path: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    notify_title: Optional[str] = None
+    notify_content: Optional[str] = None
+    page_explain: Optional[str] = None
+    keywords: Optional[str] = None
+    s3_access_key_id: Optional[str] = None
+    s3_secret_access_key: Optional[str] = None
+    s3_bucket_name: Optional[str] = None
+    s3_endpoint_url: Optional[str] = None
+    s3_region_name: Optional[str] = None
+    s3_signature_version: Optional[str] = None
+    s3_hostname: Optional[str] = None
+    s3_proxy: Optional[int] = None
+    max_save_seconds: Optional[int] = None
+    aws_session_token: Optional[str] = None
+    onedrive_domain: Optional[str] = None
+    onedrive_client_id: Optional[str] = None
+    onedrive_username: Optional[str] = None
+    onedrive_password: Optional[str] = None
+    onedrive_root_path: Optional[str] = None
+    onedrive_proxy: Optional[int] = None
+    webdav_root_path: Optional[str] = None
+    webdav_proxy: Optional[int] = None
+    admin_token: Optional[str] = None
+    openUpload: Optional[int] = None
+    uploadSize: Optional[int] = None
+    expireStyle: Optional[list] = None
+    uploadMinute: Optional[int] = None
+    enableChunk: Optional[int] = None
+    webdav_url: Optional[str] = None
+    webdav_password: Optional[str] = None
+    webdav_username: Optional[str] = None
+    opacity: Optional[float] = None
+    background: Optional[str] = None
+    uploadCount: Optional[int] = None
+    themesSelect: Optional[str] = None
+    errorMinute: Optional[int] = None
+    errorCount: Optional[int] = None
+    serverWorkers: Optional[int] = None
+    serverHost: Optional[str] = None
+    serverPort: Optional[int] = None
+    showAdminAddr: Optional[int] = None
+    robotsText: Optional[str] = None
+    maxMultiFileCount: Optional[int] = None
+    maxCollectionFiles: Optional[int] = None
+    maxSendFiles: Optional[int] = None
+    collectionDefaultMaxFiles: Optional[int] = None
+    collectionDefaultExpireDays: Optional[int] = None
+    trustedProxies: Optional[str] = None

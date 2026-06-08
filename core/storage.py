@@ -6,9 +6,10 @@ import base64
 import hashlib
 import os
 import tempfile
+import zipfile
 from core.logger import logger
 import shutil
-from typing import Optional
+from typing import Optional, AsyncGenerator
 from urllib.parse import quote, unquote
 
 import aiofiles
@@ -22,7 +23,7 @@ from botocore.config import Config
 from fastapi import HTTPException, Response, UploadFile
 from core.response import APIResponse
 from core.settings import data_root, settings
-from apps.base.models import FileCodes, UploadChunk
+from apps.base.models import FileCodes, UploadChunk, FileItem, CollectionFile
 from core.utils import get_file_url, sanitize_filename
 from fastapi.responses import FileResponse, StreamingResponse
 
@@ -104,6 +105,30 @@ class FileStorageInterface:
         :param save_path: 文件保存路径
         """
         raise NotImplementedError
+
+    async def get_file_stream(self, save_path: str) -> AsyncGenerator[bytes, None]:
+        """
+        获取文件流（用于ZIP打包等场景）
+        :param save_path: 文件存储路径
+        :return: 异步字节流生成器
+        """
+        raise NotImplementedError
+
+    async def delete_file_by_path(self, storage_path: str, uuid_file_name: str):
+        """
+        根据路径删除文件（用于CollectionFile等场景）
+        :param storage_path: 存储目录路径
+        :param uuid_file_name: 文件名
+        """
+        raise NotImplementedError
+
+    async def get_file_size(self, save_path: str) -> Optional[int]:
+        """
+        获取文件大小
+        :param save_path: 文件路径
+        :return: 文件大小（字节），不支持则返回None
+        """
+        return None
 
 
 class SystemFileStorage(FileStorageInterface):
@@ -256,6 +281,32 @@ class SystemFileStorage(FileStorageInterface):
         file_path = self.root_path / save_path
         return file_path.exists()
 
+    async def get_file_stream(self, save_path: str) -> AsyncGenerator[bytes, None]:
+        """获取本地文件流"""
+        file_path = self.root_path / save_path
+        if not file_path.exists():
+            raise FileNotFoundError(f"文件不存在: {save_path}")
+        async with aiofiles.open(file_path, "rb") as f:
+            while True:
+                chunk = await f.read(256 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    async def delete_file_by_path(self, storage_path: str, uuid_file_name: str):
+        """根据路径删除本地文件"""
+        file_path = self.root_path / storage_path / uuid_file_name
+        if file_path.exists():
+            file_path.unlink()
+
+    async def get_file_size(self, save_path: str) -> Optional[int]:
+        """获取本地文件大小"""
+        file_path = self.root_path / save_path
+        try:
+            return file_path.stat().st_size
+        except Exception:
+            return None
+
 
 class S3FileStorage(FileStorageInterface):
     def __init__(self):
@@ -340,26 +391,26 @@ class S3FileStorage(FileStorageInterface):
                     ExpiresIn=3600,
                 )
             
-            # 创建ClientSession并传递给生成器复用
-            session = aiohttp.ClientSession()
-            
+            # 创建流式生成器，确保session总是被关闭
             async def stream_generator():
-                try:
-                    async with session.get(link) as resp:
-                        if resp.status != 200:
-                            raise HTTPException(
-                                status_code=resp.status,
-                                detail=f"从S3获取文件失败: {resp.status}"
-                            )
-                        # 设置块大小（例如64KB）
-                        chunk_size = 65536
-                        while True:
-                            chunk = await resp.content.read(chunk_size)
-                            if not chunk:
-                                break
-                            yield chunk
-                finally:
-                    await session.close()
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        async with session.get(link) as resp:
+                            if resp.status != 200:
+                                raise HTTPException(
+                                    status_code=resp.status,
+                                    detail="从S3获取文件失败"
+                                )
+                            chunk_size = 65536
+                            while True:
+                                chunk = await resp.content.read(chunk_size)
+                                if not chunk:
+                                    break
+                                yield chunk
+                    except HTTPException:
+                        raise
+                    except Exception:
+                        raise HTTPException(status_code=503, detail="服务代理下载异常")
             
             from fastapi.responses import StreamingResponse
             encoded_filename = quote(filename, safe='')
@@ -575,6 +626,49 @@ class S3FileStorage(FileStorageInterface):
             except Exception:
                 return False
 
+    async def get_file_stream(self, save_path: str) -> AsyncGenerator[bytes, None]:
+        """获取S3文件流"""
+        async with self.session.client(
+            "s3",
+            endpoint_url=self.endpoint_url,
+            aws_session_token=self.aws_session_token,
+            region_name=self.region_name,
+            config=Config(signature_version=self.signature_version),
+        ) as s3:
+            response = await s3.get_object(Bucket=self.bucket_name, Key=save_path)
+            async with response["Body"] as stream:
+                while True:
+                    chunk = await stream.read(256 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+
+    async def delete_file_by_path(self, storage_path: str, uuid_file_name: str):
+        """根据路径删除S3文件"""
+        key = f"{storage_path}/{uuid_file_name}"
+        async with self.session.client(
+            "s3",
+            endpoint_url=self.endpoint_url,
+            region_name=self.region_name,
+            config=Config(signature_version=self.signature_version),
+        ) as s3:
+            await s3.delete_object(Bucket=self.bucket_name, Key=key)
+
+    async def get_file_size(self, save_path: str) -> Optional[int]:
+        """获取S3文件大小"""
+        try:
+            async with self.session.client(
+                "s3",
+                endpoint_url=self.endpoint_url,
+                aws_session_token=self.aws_session_token,
+                region_name=self.region_name,
+                config=Config(signature_version=self.signature_version),
+            ) as s3:
+                head = await s3.head_object(Bucket=self.bucket_name, Key=save_path)
+                return head.get('ContentLength')
+        except Exception:
+            return None
+
 
 class OneDriveFileStorage(FileStorageInterface):
     def __init__(self):
@@ -639,7 +733,8 @@ class OneDriveFileStorage(FileStorageInterface):
 
     def _save(self, file, save_path):
         content = file.file.read()
-        name = save_path(file.filename)
+        # save_path 是字符串路径，提取文件名
+        name = os.path.basename(save_path)
         path = self._get_path_str(save_path)
         self.root_path.get_by_path(path).upload(name, content).execute_query()
 
@@ -687,34 +782,34 @@ class OneDriveFileStorage(FileStorageInterface):
             
             content_length = None  # 初始化为 None，表示未知大小
             
-            # 创建ClientSession并复用
-            session = aiohttp.ClientSession()
-            
-            # 尝试发送HEAD请求获取Content-Length
-            try:
-                async with session.head(link) as resp:
-                    if resp.status == 200 and 'Content-Length' in resp.headers:
-                        content_length = int(resp.headers['Content-Length'])
-            except Exception:
-                # 如果HEAD请求失败，则不提供 Content-Length
-                pass
-            
             async def stream_generator():
-                try:
-                    async with session.get(link) as resp:
-                        if resp.status != 200:
-                            raise HTTPException(
-                                status_code=resp.status,
-                                detail=f"从OneDrive获取文件失败: {resp.status}"
-                            )
-                        chunk_size = 65536
-                        while True:
-                            chunk = await resp.content.read(chunk_size)
-                            if not chunk:
-                                break
-                            yield chunk
-                finally:
-                    await session.close()
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        # 尝试发送HEAD请求获取Content-Length
+                        try:
+                            async with session.head(link) as resp:
+                                if resp.status == 200 and 'Content-Length' in resp.headers:
+                                    nonlocal content_length
+                                    content_length = int(resp.headers['Content-Length'])
+                        except Exception:
+                            pass
+                        
+                        async with session.get(link) as resp:
+                            if resp.status != 200:
+                                raise HTTPException(
+                                    status_code=resp.status,
+                                    detail="从OneDrive获取文件失败"
+                                )
+                            chunk_size = 65536
+                            while True:
+                                chunk = await resp.content.read(chunk_size)
+                                if not chunk:
+                                    break
+                                yield chunk
+                    except HTTPException:
+                        raise
+                    except Exception:
+                        raise HTTPException(status_code=503, detail="服务代理下载异常")
             
             encoded_filename = quote(filename, safe='')
             headers = {
@@ -889,9 +984,23 @@ class OpenDALFileStorage(FileStorageInterface):
         )
 
     async def save_file(self, file: UploadFile, save_path: str):
-        # 使用 asyncio.to_thread 避免阻塞事件循环
-        content = await asyncio.to_thread(file.file.read)
-        await self.operator.write(save_path, content)
+        # 使用流式写入，避免将整个文件读入内存
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            async with aiofiles.open(tmp_path, "wb") as f:
+                while True:
+                    chunk = await asyncio.to_thread(file.file.read, 256 * 1024)
+                    if not chunk:
+                        break
+                    await f.write(chunk)
+            # 读取临时文件并写入存储
+            async with aiofiles.open(tmp_path, "rb") as f:
+                content = await f.read()
+            await self.operator.write(save_path, content)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     async def delete_file(self, file_code: FileCodes):
         await self.operator.delete(await file_code.get_file_path())
@@ -1161,36 +1270,34 @@ class WebDAVFileStorage(FileStorageInterface):
             url = self._build_url(await file_code.get_file_path())
             content_length = None  # 初始化为 None，表示未知大小
             
-            # 创建ClientSession并复用（包含认证头）
-            session = aiohttp.ClientSession(headers={
-                "Authorization": f"Basic {base64.b64encode(f'{settings.webdav_username}:{settings.webdav_password}'.encode()).decode()}"
-            })
-            
-            # 尝试发送HEAD请求获取Content-Length
-            try:
-                async with session.head(url) as resp:
-                    if resp.status == 200 and 'Content-Length' in resp.headers:
-                        content_length = int(resp.headers['Content-Length'])
-            except Exception:
-                # 如果HEAD请求失败，则不提供 Content-Length
-                pass
-            
             async def stream_generator():
-                try:
-                    async with session.get(url) as resp:
-                        if resp.status != 200:
-                            raise HTTPException(
-                                status_code=resp.status,
-                                detail=f"文件获取失败{resp.status}: {await resp.text()}",
-                            )
-                        chunk_size = 65536
-                        while True:
-                            chunk = await resp.content.read(chunk_size)
-                            if not chunk:
-                                break
-                            yield chunk
-                finally:
-                    await session.close()
+                nonlocal content_length
+                async with aiohttp.ClientSession(auth=self.auth) as session:
+                    try:
+                        # 尝试发送HEAD请求获取Content-Length
+                        try:
+                            async with session.head(url) as resp:
+                                if resp.status == 200 and 'Content-Length' in resp.headers:
+                                    content_length = int(resp.headers['Content-Length'])
+                        except Exception:
+                            pass
+                        
+                        async with session.get(url) as resp:
+                            if resp.status != 200:
+                                raise HTTPException(
+                                    status_code=resp.status,
+                                    detail="文件获取失败"
+                                )
+                            chunk_size = 65536
+                            while True:
+                                chunk = await resp.content.read(chunk_size)
+                                if not chunk:
+                                    break
+                                yield chunk
+                    except HTTPException:
+                        raise
+                    except Exception:
+                        raise HTTPException(status_code=503, detail="服务代理下载异常")
             
             encoded_filename = quote(filename, safe='')
             headers = {
@@ -1203,9 +1310,11 @@ class WebDAVFileStorage(FileStorageInterface):
                 media_type="application/octet-stream",
                 headers=headers
             )
-        except aiohttp.ClientError as e:
+        except aiohttp.ClientError:
             raise HTTPException(
-                status_code=503, detail=f"WebDAV连接异常: {str(e)}")
+                status_code=503, detail="WebDAV连接异常")
+        except HTTPException:
+            raise
 
     async def save_chunk(self, upload_id: str, chunk_index: int, chunk_data: bytes, chunk_hash: str, save_path: str):
         """保存分片到 WebDAV"""
@@ -1339,6 +1448,28 @@ class WebDAVFileStorage(FileStorageInterface):
             async with session.head(url) as resp:
                 return resp.status == 200
 
+    async def get_file_stream(self, save_path: str) -> AsyncGenerator[bytes, None]:
+        """获取WebDAV文件流"""
+        url = self._build_url(save_path)
+        async with aiohttp.ClientSession(auth=self.auth) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    raise FileNotFoundError(f"文件获取失败: {save_path}")
+                while True:
+                    chunk = await resp.content.read(256 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+
+    async def delete_file_by_path(self, storage_path: str, uuid_file_name: str):
+        """根据路径删除WebDAV文件"""
+        key = f"{storage_path}/{uuid_file_name}"
+        url = self._build_url(key)
+        async with aiohttp.ClientSession(auth=self.auth) as session:
+            async with session.delete(url) as resp:
+                if resp.status not in (200, 204, 404):
+                    logger.info(f"WebDAV文件删除失败: {key}")
+
 
 storages = {
     "local": SystemFileStorage,
@@ -1347,3 +1478,59 @@ storages = {
     "opendal": OpenDALFileStorage,
     "webdav": WebDAVFileStorage,
 }
+
+
+async def create_zip_stream(file_items: list) -> AsyncGenerator[bytes, None]:
+    """
+    流式ZIP打包生成器，使用临时文件避免内存问题
+    :param file_items: FileItem 或 FileCodes 对象列表
+    :return: 异步字节流生成器
+    """
+    file_storage: FileStorageInterface = storages[settings.file_storage]()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+        tmp_path = tmp.name
+
+    try:
+        # 使用临时目录存放文件，然后流式写入ZIP
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            used_names: set[str] = set()
+            for item in file_items:
+                if hasattr(item, 'file_name') and hasattr(item, 'storage_path'):
+                    base_name = item.file_name
+                    full_path = f"{item.storage_path}/{item.uuid_file_name}"
+                elif hasattr(item, 'prefix') and hasattr(item, 'file_path'):
+                    base_name = f"{item.prefix}{item.suffix}"
+                    full_path = f"{item.file_path}/{item.uuid_file_name}"
+                else:
+                    continue
+
+                name = base_name
+                counter = 1
+                while name in used_names:
+                    stem, ext = os.path.splitext(base_name)
+                    name = f"{stem}_{counter}{ext}"
+                    counter += 1
+                used_names.add(name)
+
+                # 使用临时文件避免将整个文件读入内存
+                with tempfile.NamedTemporaryFile(delete=False) as item_tmp:
+                    item_tmp_path = item_tmp.name
+                try:
+                    async with aiofiles.open(item_tmp_path, "wb") as f:
+                        async for chunk in file_storage.get_file_stream(full_path):
+                            await f.write(chunk)
+                    zf.write(item_tmp_path, name)
+                finally:
+                    if os.path.exists(item_tmp_path):
+                        os.unlink(item_tmp_path)
+
+        async with aiofiles.open(tmp_path, "rb") as f:
+            while True:
+                chunk = await f.read(256 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)

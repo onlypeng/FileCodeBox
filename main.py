@@ -16,13 +16,13 @@ from tortoise.contrib.fastapi import register_tortoise
 from apps.admin.views import admin_api
 from apps.base.models import KeyValue
 from apps.base.utils import ip_limit
-from apps.base.views import share_api, chunk_api, presign_api
+from apps.base.views import share_api, chunk_api, presign_api, collection_api, delivery_api, ws_api
 from core.config import ensure_settings_row, refresh_settings
 from core.database import db_startup_lock, get_db_config, init_db
 from core.logger import logger
 from core.response import APIResponse
 from core.settings import settings, BASE_DIR, DEFAULT_CONFIG
-from core.tasks import delete_expire_files, clean_incomplete_uploads
+from core.tasks import delete_expire_files, clean_incomplete_uploads, clean_expired_collections
 from core.utils import hash_password, is_password_hashed
 
 
@@ -44,6 +44,7 @@ async def lifespan(app: FastAPI):
     # 启动后台任务
     task = asyncio.create_task(delete_expire_files())
     chunk_cleanup_task = asyncio.create_task(clean_incomplete_uploads())
+    collection_cleanup_task = asyncio.create_task(clean_expired_collections())
     logger.info("应用初始化完成")
 
     try:
@@ -53,7 +54,8 @@ async def lifespan(app: FastAPI):
         logger.info("正在关闭应用...")
         task.cancel()
         chunk_cleanup_task.cancel()
-        await asyncio.gather(task, chunk_cleanup_task, return_exceptions=True)
+        collection_cleanup_task.cancel()
+        await asyncio.gather(task, chunk_cleanup_task, collection_cleanup_task, return_exceptions=True)
         await Tortoise.close_connections()
         logger.info("应用已关闭")
 
@@ -74,6 +76,7 @@ async def load_config():
 
 
 async def migrate_password_to_hash():
+    # 如果是明文密码，迁移为 pbkdf2 哈希
     if not is_password_hashed(settings.admin_token):
         hashed = hash_password(settings.admin_token)
         settings.admin_token = hashed
@@ -82,13 +85,24 @@ async def migrate_password_to_hash():
             config_record.value["admin_token"] = hashed
             await config_record.save()
             logger.info("已将管理员密码迁移为哈希存储")
+    # 如果是旧的 sha256 哈希，升级为 pbkdf2（需要用户下次登录时触发，此处仅标记）
+    elif settings.admin_token.startswith("sha256$"):
+        logger.info("检测到旧版SHA256哈希密码，建议修改密码以升级安全性")
 
 
 app = FastAPI(lifespan=lifespan)
 
+# 配置缓存
+_config_cache = {"last_refresh": 0}
+_CONFIG_CACHE_TTL = 5  # 5秒缓存
+
 @app.middleware("http")
 async def refresh_settings_middleware(request, call_next):
-    await refresh_settings()
+    # 每5秒刷新一次配置，而非每次请求都刷新
+    now = time.time()
+    if now - _config_cache["last_refresh"] >= _CONFIG_CACHE_TTL:
+        await refresh_settings()
+        _config_cache["last_refresh"] = now
     return await call_next(request)
 
 app.add_middleware(
@@ -97,6 +111,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 # 使用 register_tortoise 来添加异常处理器
@@ -111,6 +126,9 @@ app.include_router(share_api)
 app.include_router(chunk_api)
 app.include_router(presign_api)
 app.include_router(admin_api)
+app.include_router(collection_api)
+app.include_router(delivery_api)
+app.include_router(ws_api)
 
 
 @app.exception_handler(404)
@@ -152,6 +170,9 @@ async def get_config():
             "notify_content": settings.notify_content,
             "show_admin_address": settings.showAdminAddr,
             "max_save_seconds": settings.max_save_seconds,
+            "maxMultiFileCount": getattr(settings, "maxMultiFileCount", 20),
+            "maxCollectionFiles": getattr(settings, "maxCollectionFiles", 100),
+            "maxSendFiles": getattr(settings, "maxSendFiles", 20),
         }
     )
 

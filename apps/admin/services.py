@@ -1,13 +1,11 @@
 import os
 import time
 
-from core.response import APIResponse
 from core.storage import FileStorageInterface, storages
 from core.settings import settings
-from apps.base.models import FileCodes, KeyValue, file_codes_pydantic
-from apps.base.utils import get_expire_info, get_file_path_name
+from core.config import _sync_ip_limits
+from apps.base.models import FileCodes, KeyValue, CollectionFile, file_codes_pydantic
 from fastapi import HTTPException
-from core.settings import data_root
 from core.utils import hash_password, is_password_hashed
 
 
@@ -22,60 +20,66 @@ class FileService:
 
     async def list_files(self, page: int, size: int, keyword: str = ""):
         offset = (page - 1) * size
-        files = (
-            await FileCodes.filter(prefix__icontains=keyword).limit(size).offset(offset)
-        )
-        total = await FileCodes.filter(prefix__icontains=keyword).count()
-        files_pydantic = [
-            await file_codes_pydantic.from_tortoise_orm(f) for f in files
-        ]
-        return files_pydantic, total
+        # 获取所有属于收件箱的 FileCode ID
+        collection_file_ids = await CollectionFile.filter(
+            file_code_id__isnull=False
+        ).values_list("file_code_id", flat=True)
+        # 过滤掉 None 值并转为列表
+        exclude_ids = [fid for fid in collection_file_ids if fid is not None]
 
-    async def download_file(self, file_id: int):
-        file_code = await FileCodes.filter(id=file_id).first()
-        if not file_code:
-            raise HTTPException(status_code=404, detail="文件不存在")
-        if file_code.text:
-            return APIResponse(detail=file_code.text)
-        else:
-            return await self.file_storage.get_file_response(file_code)
+        # 查询文件时排除收件箱文件
+        query = FileCodes.filter(prefix__icontains=keyword)
+        if exclude_ids:
+            query = query.exclude(id__in=exclude_ids)
 
-    async def share_local_file(self, item):
-        local_file = LocalFileClass(item.filename)
-        if not await local_file.exists():
-            raise HTTPException(status_code=404, detail="文件不存在")
+        total = await query.count()
+        files = await query.limit(size).offset(offset)
 
-        text = await local_file.read()
-        expired_at, expired_count, used_count, code = await get_expire_info(
-            item.expire_value, item.expire_style
-        )
-        path, suffix, prefix, uuid_file_name, save_path = await get_file_path_name(item)
+        result = []
+        for f in files:
+            item = {
+                "id": f.id,
+                "code": f.code,
+                "prefix": f.prefix,
+                "suffix": f.suffix,
+                "size": f.size,
+                "text": f.text,
+                "expired_at": f.expired_at.isoformat() if f.expired_at else None,
+                "expired_count": f.expired_count,
+                "created_at": f.created_at.isoformat() if f.created_at else None,
+                "is_multi_file": f.is_multi_file,
+                "file_count": 0,
+                "file_items": [],
+            }
+            # 多文件分享，获取子文件列表
+            if f.is_multi_file:
+                items = await f.items.all().order_by("sort_order")
+                item["file_count"] = len(items)
+                item["file_items"] = [
+                    {
+                        "id": i.id,
+                        "file_name": i.file_name,
+                        "file_size": i.file_size,
+                    }
+                    for i in items
+                ]
+            result.append(item)
 
-        await self.file_storage.save_file(text, save_path)
-
-        await FileCodes.create(
-            code=code,
-            prefix=prefix,
-            suffix=suffix,
-            uuid_file_name=uuid_file_name,
-            file_path=path,
-            size=local_file.size,
-            expired_at=expired_at,
-            expired_count=expired_count,
-            used_count=used_count,
-        )
-
-        return {
-            "code": code,
-            "name": local_file.file,
-        }
+        return result, total
 
 
 class ConfigService:
     def get_config(self):
-        return dict(settings.items())
+        from core.utils import SENSITIVE_KEYS
+        config = dict(settings.items())
+        # 脱敏敏感字段
+        for key in SENSITIVE_KEYS:
+            if key in config and config[key]:
+                config[key] = "******"
+        return config
 
     async def update_config(self, data: dict):
+        from core.utils import hash_password, is_password_hashed, encrypt_value, SENSITIVE_KEYS
         admin_token = data.get("admin_token")
         if admin_token is None or admin_token == "":
             raise HTTPException(status_code=400, detail="管理员密码不能为空")
@@ -86,10 +90,15 @@ class ConfigService:
         for key, value in data.items():
             if key not in settings.default_config:
                 continue
+            # 加密敏感字段
+            if key in SENSITIVE_KEYS and isinstance(value, str) and value and not value.startswith("enc:"):
+                data[key] = encrypt_value(value)
             if key in [
                 "errorCount",
                 "errorMinute",
                 "max_save_seconds",
+                "maxCollectionFiles",
+                "maxSendFiles",
                 "onedrive_proxy",
                 "openUpload",
                 "port",
@@ -98,61 +107,17 @@ class ConfigService:
                 "uploadMinute",
                 "uploadSize",
             ]:
-                data[key] = int(value)
+                try:
+                    data[key] = int(value)
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail=f"配置项 {key} 必须是整数")
             elif key in ["opacity"]:
-                data[key] = float(value)
-            else:
-                data[key] = value
+                try:
+                    data[key] = float(value)
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail=f"配置项 {key} 必须是数字")
 
         await KeyValue.filter(key="settings").update(value=data)
         for k, v in data.items():
             settings.__setattr__(k, v)
-
-
-class LocalFileService:
-    async def list_files(self):
-        files = []
-        if not os.path.exists(data_root / "local"):
-            os.makedirs(data_root / "local")
-        for file in os.listdir(data_root / "local"):
-            local_file = LocalFileClass(file)
-            files.append({
-                "file": local_file.file,
-                "ctime": local_file.ctime,
-                "size": local_file.size,
-            })
-        return files
-
-    async def delete_file(self, filename: str):
-        file = LocalFileClass(filename)
-        if await file.exists():
-            await file.delete()
-            return "删除成功"
-        raise HTTPException(status_code=404, detail="文件不存在")
-
-
-class LocalFileClass:
-    def __init__(self, file):
-        self.file = file
-        self.path = data_root / "local" / file
-        if os.path.exists(self.path):
-            self.ctime = time.strftime(
-                "%Y-%m-%d %H:%M:%S", time.localtime(os.path.getctime(self.path))
-            )
-            self.size = os.path.getsize(self.path)
-        else:
-            self.ctime = None
-            self.size = None
-
-    async def read(self):
-        return open(self.path, "rb")
-
-    async def write(self, data):
-        with open(self.path, "w") as f:
-            f.write(data)
-
-    async def delete(self):
-        os.remove(self.path)
-
-    async def exists(self):
-        return os.path.exists(self.path)
+        _sync_ip_limits()

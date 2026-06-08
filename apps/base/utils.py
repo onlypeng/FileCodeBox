@@ -77,7 +77,7 @@ async def get_expire_info(
             if expire_style == "count":
                 expired_count = extra
             elif expire_style == "forever":
-                code = await get_random_code(style="string")
+                code = await get_random_code()
         else:
             expired_at = result
         if expired_at and expired_at - now > max_timedelta:
@@ -91,11 +91,12 @@ async def get_expire_info(
     return expired_at, expired_count, used_count, code
 
 
-async def get_random_code(style: str = "num") -> str:
-    while True:
-        code = await get_random_num() if style == "num" else await get_random_string()
+async def get_random_code(style: str = "string") -> str:
+    for _ in range(20):
+        code = await get_random_string()
         if not await FileCodes.filter(code=code).exists():
             return str(code)
+    raise HTTPException(500, "生成取件码失败，请重试")
 
 
 async def calculate_file_hash(file: UploadFile, chunk_size=1024 * 1024) -> str:

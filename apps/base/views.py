@@ -1,22 +1,26 @@
 import datetime
 import hashlib
+import json
 import os
 import uuid
 from datetime import timedelta
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
-from fastapi import APIRouter, Form, UploadFile, File, Depends, HTTPException
+from fastapi import APIRouter, Form, UploadFile, File, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from starlette import status
 
 from apps.admin.dependencies import share_required_login
-from apps.base.models import FileCodes, UploadChunk, PresignUploadSession
+from apps.base.models import FileCodes, UploadChunk, PresignUploadSession, FileItem, CollectionBox, CollectionFile
 from apps.base.schemas import (
     SelectFileModel,
     InitChunkUploadModel,
     CompleteUploadModel,
     PresignUploadInitRequest,
+    CreateCollectionRequest,
+    UpdateCollectionConfigRequest,
 )
 from apps.base.utils import (
     get_expire_info,
@@ -26,8 +30,10 @@ from apps.base.utils import (
 )
 from core.response import APIResponse
 from core.settings import settings
-from core.storage import storages, FileStorageInterface
-from core.utils import get_select_token, get_now, sanitize_filename
+from core.storage import storages, FileStorageInterface, create_zip_stream
+from core.utils import get_select_token, get_now, sanitize_filename, verify_select_token, hash_password
+from core.websocket import ws_manager
+from core.tasks import CollectionEvents
 
 share_api = APIRouter(prefix="/share", tags=["分享"])
 
@@ -76,6 +82,8 @@ class FileUploadService:
             expired_at=expired_at,
             expired_count=expired_count,
             used_count=used_count,
+            expire_style=expire_style,
+            expire_value=expire_value,
             **extra_fields,
         )
         return code
@@ -106,6 +114,17 @@ async def share_text(
     expire_style: str = Form(default="day"),
     ip: str = Depends(ip_limit["upload"]),
 ):
+    if expire_style not in settings.expireStyle:
+        raise HTTPException(status_code=400, detail="过期时间类型错误")
+
+    # 校验过期时间不超过系统最大保存时间
+    max_save_seconds = getattr(settings, "max_save_seconds", 0)
+    if max_save_seconds > 0 and expire_style != "forever":
+        expire_seconds = _expire_to_seconds(expire_style, expire_value)
+        if expire_seconds > max_save_seconds:
+            max_days = max_save_seconds // 86400
+            raise HTTPException(status_code=400, detail=f"过期时间超过系统限制，最长{max_days}天")
+
     text_size = len(text.encode("utf-8"))
     max_txt_size = 222 * 1024
     if text_size > max_txt_size:
@@ -122,6 +141,8 @@ async def share_text(
         used_count=used_count,
         size=len(text),
         prefix="Text",
+        expire_style=expire_style,
+        expire_value=expire_value,
     )
     ip_limit["upload"].add_ip(ip)
     return APIResponse(detail={"code": code})
@@ -131,31 +152,142 @@ async def share_text(
 async def share_file(
     expire_value: int = Form(default=1, gt=0),
     expire_style: str = Form(default="day"),
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    files: List[UploadFile] = File(default=[]),
     ip: str = Depends(ip_limit["upload"]),
 ):
-    file_size = await validate_file_size(file, settings.uploadSize)
     if expire_style not in settings.expireStyle:
         raise HTTPException(status_code=400, detail="过期时间类型错误")
+
+    # 校验过期时间不超过系统最大保存时间
+    max_save_seconds = getattr(settings, "max_save_seconds", 0)
+    if max_save_seconds > 0 and expire_style != "forever":
+        expire_seconds = _expire_to_seconds(expire_style, expire_value)
+        if expire_seconds > max_save_seconds:
+            max_days = max_save_seconds // 86400
+            raise HTTPException(status_code=400, detail=f"过期时间超过系统限制，最长{max_days}天")
+
+    file_storage: FileStorageInterface = storages[settings.file_storage]()
+
+    # 兼容单文件模式
+    upload_files = list(files) if files else []
+    if file and not upload_files:
+        upload_files = [file]
+
+    if not upload_files:
+        raise HTTPException(status_code=400, detail="未选择文件")
+
+    # 多文件数量限制
+    max_count = getattr(settings, "maxSendFiles", 20)
+    if len(upload_files) > max_count:
+        raise HTTPException(status_code=400, detail=f"文件数量超过限制，最多{max_count}个")
+
+    # 限流窗口内文件数量限制
+    upload_count = getattr(settings, "uploadCount", 0)
+    if upload_count > 0 and len(upload_files) > upload_count:
+        raise HTTPException(status_code=400, detail=f"文件数量超过限流限制，最多{upload_count}个")
+
     expired_at, expired_count, used_count, code = await get_expire_info(
         expire_value, expire_style
     )
-    path, suffix, prefix, uuid_file_name, save_path = await get_file_path_name(file)
-    file_storage: FileStorageInterface = storages[settings.file_storage]()
-    await file_storage.save_file(file, save_path)
-    await create_file_code(
+
+    # 单文件模式（向后兼容）
+    if len(upload_files) == 1:
+        f = upload_files[0]
+        file_size = await validate_file_size(f, settings.uploadSize)
+        path, suffix, prefix, uuid_file_name, save_path = await get_file_path_name(f)
+        await file_storage.save_file(f, save_path)
+        file_code = await FileCodes.create(
+            code=code,
+            prefix=prefix,
+            suffix=suffix,
+            uuid_file_name=uuid_file_name,
+            file_path=path,
+            size=file_size,
+            expired_at=expired_at,
+            expired_count=expired_count,
+            used_count=used_count,
+            is_multi_file=False,
+            expire_style=expire_style,
+            expire_value=expire_value,
+        )
+        # 为单文件也创建 FileItem 记录
+        await FileItem.create(
+            file_code=file_code,
+            file_name=f"{prefix}{suffix}",
+            file_size=file_size,
+            storage_path=path,
+            uuid_file_name=uuid_file_name,
+            sort_order=0,
+        )
+        ip_limit["upload"].add_ip(ip)
+        return APIResponse(detail={"code": code, "name": f.filename})
+
+    # 多文件模式
+    total_size = 0
+    file_items_data = []
+    today = datetime.datetime.now()
+    storage_path_prefix = settings.storage_path.strip("/")
+    file_uuid = uuid.uuid4().hex
+    base_path = f"share/data/{today.strftime('%Y/%m/%d')}/{file_uuid}"
+    path = f"{storage_path_prefix}/{base_path}" if storage_path_prefix else base_path
+
+    # 先验证所有文件大小
+    validated_files = []
+    for idx, f in enumerate(upload_files):
+        file_size = await validate_file_size(f, settings.uploadSize)
+        total_size += file_size
+        if total_size > settings.uploadSize:
+            raise HTTPException(status_code=403, detail="文件总大小超过限制")
+        filename = await sanitize_filename(unquote(f.filename or ""))
+        prefix, suffix = os.path.splitext(filename)
+        save_path = f"{path}/{filename}"
+        validated_files.append((f, file_size, filename, prefix, suffix, save_path, idx))
+
+    # 验证通过后再保存文件
+    saved_paths = []
+    try:
+        for f, file_size, filename, prefix, suffix, save_path, idx in validated_files:
+            await file_storage.save_file(f, save_path)
+            saved_paths.append(save_path)
+            file_items_data.append({
+                "file_name": f"{prefix}{suffix}",
+                "file_size": file_size,
+                "storage_path": path,
+                "uuid_file_name": filename,
+                "sort_order": idx,
+            })
+    except Exception as e:
+        # 保存失败时回滚已保存的文件
+        for sp in saved_paths:
+            try:
+                # 构造临时 FileCodes 对象用于删除
+                temp_code = FileCodes(file_path=path, uuid_file_name=os.path.basename(sp))
+                await file_storage.delete_file(temp_code)
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail="文件保存失败，请重试")
+
+    file_code = await FileCodes.create(
         code=code,
-        prefix=prefix,
-        suffix=suffix,
-        uuid_file_name=uuid_file_name,
+        prefix="",
+        suffix="",
+        uuid_file_name=None,
         file_path=path,
-        size=file_size,
+        size=total_size,
         expired_at=expired_at,
         expired_count=expired_count,
         used_count=used_count,
+        is_multi_file=True,
+        expire_style=expire_style,
+        expire_value=expire_value,
     )
+
+    for item_data in file_items_data:
+        await FileItem.create(file_code=file_code, **item_data)
+
     ip_limit["upload"].add_ip(ip)
-    return APIResponse(detail={"code": code, "name": file.filename})
+    return APIResponse(detail={"code": code, "name": f"{len(upload_files)}个文件", "is_multi_file": True})
 
 
 async def get_code_file_by_code(
@@ -170,10 +302,54 @@ async def get_code_file_by_code(
 
 
 async def update_file_usage(file_code: FileCodes) -> None:
+    """原子更新文件使用次数"""
     file_code.used_count += 1
     if file_code.expired_count > 0:
+        # 使用原子操作扣减过期次数，防止并发竞态
+        result = await FileCodes.filter(id=file_code.id, expired_count__gt=0).update(
+            expired_count=file_code.expired_count - 1,
+            used_count=file_code.used_count,
+        )
+        if result == 0:
+            # 并发导致次数已为0，重新获取最新状态
+            await file_code.refresh_from_db()
+            return
         file_code.expired_count -= 1
-    await file_code.save()
+    else:
+        await file_code.save()
+
+
+@share_api.get("/check_code/")
+async def check_code_type(code: str):
+    """检查码类型：file / collection / delivery / retrieve / unknown"""
+    code = _validate_code(code)
+    # 先检查是否为普通文件码
+    has, file_code = await get_code_file_by_code(code)
+    if has:
+        return APIResponse(detail={"type": "file", "code": code})
+
+    # 检查是否为收件箱管理码
+    box = await CollectionBox.filter(collection_code=code).first()
+    if box:
+        if await box.is_expired():
+            return APIResponse(detail={"type": "collection", "code": code, "expired": True, "title": box.title})
+        return APIResponse(detail={"type": "collection", "code": code, "title": box.title})
+
+    # 检查是否为取件码
+    box = await CollectionBox.filter(retrieve_code=code).first()
+    if box:
+        if await box.is_expired() or await box.is_retrieve_expired():
+            return APIResponse(detail={"type": "retrieve", "code": code, "expired": True, "title": box.title})
+        return APIResponse(detail={"type": "retrieve", "code": code, "title": box.title})
+
+    # 检查是否为投递码
+    box = await CollectionBox.filter(delivery_code=code).first()
+    if box:
+        if await box.is_expired() or await box.is_delivery_expired():
+            return APIResponse(detail={"type": "delivery", "code": code, "expired": True, "title": box.title})
+        return APIResponse(detail={"type": "delivery", "code": code, "title": box.title})
+
+    return APIResponse(code=404, detail={"type": "unknown", "code": code})
 
 
 @share_api.get("/select/")
@@ -185,12 +361,33 @@ async def get_code_file(code: str, ip: str = Depends(ip_limit["error"])):
         return APIResponse(code=404, detail=file_code)
 
     assert isinstance(file_code, FileCodes)
+
+    # 多文件模式：返回文件列表
+    if file_code.is_multi_file:
+        await update_file_usage(file_code)
+        items = await FileItem.filter(file_code=file_code).order_by("sort_order")
+        return APIResponse(detail={
+            "code": file_code.code,
+            "name": f"{len(items)}个文件",
+            "size": file_code.size,
+            "is_multi_file": True,
+            "items": [
+                {
+                    "id": item.id,
+                    "file_name": item.file_name,
+                    "file_size": item.file_size,
+                }
+                for item in items
+            ],
+        })
+
     await update_file_usage(file_code)
     return await file_storage.get_file_response(file_code)
 
 
 @share_api.post("/select/")
 async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"])):
+    data.code = _validate_code(data.code)
     file_storage: FileStorageInterface = storages[settings.file_storage]()
     has, file_code = await get_code_file_by_code(data.code)
     if not has:
@@ -198,6 +395,33 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
         return APIResponse(code=404, detail=file_code)
 
     assert isinstance(file_code, FileCodes)
+
+    # 多文件模式：返回文件列表信息
+    if file_code.is_multi_file:
+        await update_file_usage(file_code)
+        items = await FileItem.filter(file_code=file_code).order_by("sort_order")
+        return APIResponse(
+            detail={
+                "code": file_code.code,
+                "name": f"{len(items)}个文件",
+                "size": file_code.size,
+                "text": "",
+                "is_multi_file": True,
+                "created_at": file_code.created_at.isoformat() if file_code.created_at else None,
+                "expired_at": file_code.expired_at.isoformat() if file_code.expired_at else None,
+                "expire_style": file_code.expire_style,
+                "expire_value": file_code.expire_value,
+                "items": [
+                    {
+                        "id": item.id,
+                        "file_name": item.file_name,
+                        "file_size": item.file_size,
+                    }
+                    for item in items
+                ],
+            }
+        )
+
     await update_file_usage(file_code)
     return APIResponse(
         detail={
@@ -209,6 +433,10 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
                 if file_code.text is not None
                 else await file_storage.get_file_url(file_code)
             ),
+            "created_at": file_code.created_at.isoformat() if file_code.created_at else None,
+            "expired_at": file_code.expired_at.isoformat() if file_code.expired_at else None,
+            "expire_style": file_code.expire_style,
+            "expire_value": file_code.expire_value,
         }
     )
 
@@ -216,11 +444,14 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
 @share_api.get("/download")
 async def download_file(key: str, code: str, ip: str = Depends(ip_limit["error"])):
     file_storage: FileStorageInterface = storages[settings.file_storage]()
-    if await get_select_token(code) != key:
+    if not await verify_select_token(key, code):
         ip_limit["error"].add_ip(ip)
         raise HTTPException(status_code=403, detail="下载鉴权失败")
-    has, file_code = await get_code_file_by_code(code, False)
+    has, file_code = await get_code_file_by_code(code, True)
     if not has:
+        # 区分"不存在"和"已过期"
+        if isinstance(file_code, str) and "过期" in file_code:
+            raise HTTPException(status_code=410, detail=file_code)
         return APIResponse(code=404, detail="文件不存在")
     assert isinstance(file_code, FileCodes)
     return (
@@ -350,6 +581,11 @@ async def upload_chunk(
     uploaded_count = await UploadChunk.filter(
         upload_id=upload_id, completed=True
     ).count()
+    # 限制单个会话的分片数量，防止资源耗尽（允许多 5 个重传分片）
+    if uploaded_count > chunk_info.total_chunks + 5:
+        raise HTTPException(
+            status_code=400, detail="分片上传数量已超过限制"
+        )
     # 已上传分片的最大可能大小 + 当前分片
     max_uploaded_size = uploaded_count * chunk_info.chunk_size + chunk_size
     if max_uploaded_size > settings.uploadSize:
@@ -370,7 +606,7 @@ async def upload_chunk(
         )
     except Exception as e:
         raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"分片保存失败: {str(e)}"
+            status.HTTP_500_INTERNAL_SERVER_ERROR, detail="分片保存失败，请重试"
         )
 
     # 更新或创建分片记录（保存成功后再记录）
@@ -446,6 +682,18 @@ async def get_upload_status(upload_id: str):
 async def complete_upload(
     upload_id: str, data: CompleteUploadModel, ip: str = Depends(ip_limit["upload"])
 ):
+    # 校验过期时间类型
+    if data.expire_style not in settings.expireStyle:
+        raise HTTPException(status_code=400, detail="过期时间类型错误")
+
+    # 校验过期时间不超过系统最大保存时间
+    max_save_seconds = getattr(settings, "max_save_seconds", 0)
+    if max_save_seconds > 0 and data.expire_style != "forever":
+        expire_seconds = _expire_to_seconds(data.expire_style, data.expire_value)
+        if expire_seconds > max_save_seconds:
+            max_days = max_save_seconds // 86400
+            raise HTTPException(status_code=400, detail=f"过期时间超过系统限制，最长{max_days}天")
+
     # 获取上传基本信息
     chunk_info = await UploadChunk.filter(upload_id=upload_id, chunk_index=-1).first()
     if not chunk_info:
@@ -498,6 +746,8 @@ async def complete_upload(
             uuid_file_name=f"{prefix}{suffix}",
             prefix=prefix,
             suffix=suffix,
+            expire_style=data.expire_style,
+            expire_value=data.expire_value,
         )
         # 清理临时文件
         await storage.clean_chunks(upload_id, save_path)
@@ -514,7 +764,7 @@ async def complete_upload(
         except Exception:
             pass
         raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"文件合并失败: {str(e)}"
+            status.HTTP_500_INTERNAL_SERVER_ERROR, detail="文件合并失败，请重试"
         )
 
 
@@ -551,6 +801,21 @@ async def presign_upload_init(
         )
     if data.expire_style not in settings.expireStyle:
         raise HTTPException(400, "过期时间类型错误")
+
+    # 校验过期时间不超过系统最大保存时间
+    max_save_seconds = getattr(settings, "max_save_seconds", 0)
+    if max_save_seconds > 0 and data.expire_style != "forever":
+        expire_seconds = _expire_to_seconds(data.expire_style, data.expire_value)
+        if expire_seconds > max_save_seconds:
+            max_days = max_save_seconds // 86400
+            raise HTTPException(400, f"过期时间超过系统限制，最长{max_days}天")
+
+    # 限制未完成会话总数，防止资源耗尽
+    total_active = await PresignUploadSession.filter(
+        expires_at__gt=await get_now(),
+    ).count()
+    if total_active > 50:
+        raise HTTPException(429, "正在进行中的上传过多，请稍后再试")
 
     upload_id = uuid.uuid4().hex
     path, _, _, filename, save_path = await FileUploadService.generate_file_path(
@@ -604,7 +869,7 @@ async def presign_upload_proxy(
     try:
         await storage.save_file(file, session.save_path)
     except Exception as e:
-        raise HTTPException(500, f"文件保存失败: {str(e)}")
+        raise HTTPException(500, "文件保存失败，请重试")
 
     code = await FileUploadService.create_file_record(
         session.file_name,
@@ -629,6 +894,22 @@ async def presign_upload_confirm(upload_id: str, ip: str = Depends(ip_limit["upl
     storage: FileStorageInterface = storages[settings.file_storage]()
     if not await storage.file_exists(session.save_path):
         raise HTTPException(404, "文件未上传或上传失败")
+
+    # 校验上传文件大小是否与声明一致
+    if hasattr(storage, 'get_file_size'):
+        actual_size = await storage.get_file_size(session.save_path)
+        if actual_size is not None and abs(actual_size - session.file_size) > 1024:
+            # 文件大小差异超过1KB，可能被篡改
+            try:
+                # 删除不匹配的文件
+                temp_file_code = FileCodes(
+                    file_path=os.path.dirname(session.save_path),
+                    uuid_file_name=os.path.basename(session.save_path),
+                )
+                await storage.delete_file(temp_file_code)
+            except Exception:
+                pass
+            raise HTTPException(400, "上传文件大小与声明不符")
 
     code = await FileUploadService.create_file_record(
         session.file_name,
@@ -686,3 +967,769 @@ async def presign_upload_cancel(upload_id: str):
 
     await session.delete()
     return APIResponse(detail={"message": "上传会话已取消"})
+
+
+# ============ 多文件下载API ============
+
+
+@share_api.get("/download/item/{item_id}")
+async def download_single_file(item_id: int, code: str, ip: str = Depends(ip_limit["error"])):
+    """下载多文件分享中的单个文件"""
+    file_item = await FileItem.filter(id=item_id).first()
+    if not file_item:
+        raise HTTPException(404, "文件不存在")
+
+    # 验证取件码权限
+    file_code = await FileCodes.filter(id=file_item.file_code_id).first()
+    if not file_code or file_code.code != code:
+        ip_limit["error"].add_ip(ip)
+        raise HTTPException(403, "取件码不匹配")
+
+    if await file_code.is_expired():
+        raise HTTPException(404, "文件已过期")
+
+    # 下载时扣除次数
+    await update_file_usage(file_code)
+
+    file_storage: FileStorageInterface = storages[settings.file_storage]()
+    full_path = f"{file_item.storage_path}/{file_item.uuid_file_name}"
+
+    # 本地存储直接返回文件
+    if settings.file_storage == "local":
+        from fastapi.responses import FileResponse
+        from urllib.parse import quote
+        from core.settings import data_root
+
+        file_path = data_root / full_path
+        if not file_path.exists():
+            raise HTTPException(404, "文件已过期删除")
+        filename = file_item.file_name
+        encoded_filename = quote(filename, safe='')
+        headers = {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+        }
+        try:
+            content_length = file_path.stat().st_size
+            headers["Content-Length"] = str(content_length)
+        except Exception:
+            pass
+        return FileResponse(
+            file_path,
+            media_type="application/octet-stream",
+            headers=headers,
+            filename=filename,
+        )
+
+    # 其他存储：使用流式响应
+    async def stream_generator():
+        async for chunk in file_storage.get_file_stream(full_path):
+            yield chunk
+
+    from urllib.parse import quote
+    filename = file_item.file_name
+    encoded_filename = quote(filename, safe='')
+    return StreamingResponse(
+        stream_generator(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"},
+    )
+
+
+@share_api.get("/zip/{code}")
+async def download_zip(code: str, ip: str = Depends(ip_limit["error"])):
+    """流式打包下载多文件"""
+    has, file_code = await get_code_file_by_code(code)
+    if not has:
+        ip_limit["error"].add_ip(ip)
+        # 区分"不存在"和"已过期"
+        if isinstance(file_code, str) and "过期" in file_code:
+            raise HTTPException(410, file_code)
+        raise HTTPException(404, "文件不存在")
+
+    assert isinstance(file_code, FileCodes)
+
+    if not file_code.is_multi_file:
+        raise HTTPException(400, "该分享不是多文件分享")
+
+    items = await FileItem.filter(file_code=file_code).order_by("sort_order")
+    if not items:
+        raise HTTPException(404, "没有文件可下载")
+
+    return StreamingResponse(
+        create_zip_stream(items),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(code)}.zip"
+        },
+    )
+
+
+# ============ 收件箱API ============
+collection_api = APIRouter(prefix="/collection", tags=["收件箱"])
+
+
+def _generate_code(length: int = 6) -> str:
+    """生成密码学安全的随机码"""
+    import secrets
+    import string
+    chars = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(chars) for _ in range(length))
+
+
+import re
+
+_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
+
+
+def _validate_code(code: str) -> str:
+    """验证码格式：6位大写字母+数字，自动转大写"""
+    if not code:
+        raise HTTPException(status_code=400, detail="码不能为空")
+    code = code.strip().upper()
+    if not _CODE_PATTERN.match(code):
+        raise HTTPException(status_code=400, detail="码格式错误，必须为6位大写字母和数字")
+    return code
+
+
+def _expire_to_seconds(expire_style: str, expire_value: int) -> int:
+    """将过期时间转换为秒数（count 模式返回 0，不限制时间）"""
+    if expire_style == "day":
+        return expire_value * 86400
+    elif expire_style == "hour":
+        return expire_value * 3600
+    elif expire_style == "minute":
+        return expire_value * 60
+    elif expire_style == "count":
+        return 0  # count 模式仅限制使用次数，不限制时间
+    return 0
+
+
+def _calculate_expired_at(expire_style: str, expire_value: int, base_time: datetime.datetime) -> Optional[datetime.datetime]:
+    """统一计算过期时间（count 模式给 365 天，forever 返回 None）"""
+    if expire_style == "forever":
+        return None
+    delta_map = {
+        "day": timedelta(days=1),
+        "hour": timedelta(hours=1),
+        "minute": timedelta(minutes=1),
+        "count": timedelta(days=365),  # count 模式给较长过期时间
+    }
+    delta = delta_map.get(expire_style, timedelta(days=7))
+    return base_time + delta * expire_value
+
+
+async def _get_unique_code(model_class, field_name: str, length: int = 6) -> str:
+    """确保码唯一，最多重试 20 次"""
+    for _ in range(20):
+        code = _generate_code(length)
+        if not await model_class.filter(**{field_name: code}).exists():
+            return code
+    raise HTTPException(500, "生成唯一码失败，请重试")
+
+
+@collection_api.post("/create/", dependencies=[Depends(share_required_login)])
+async def create_collection(data: CreateCollectionRequest, ip: str = Depends(ip_limit["upload"])):
+    """创建收件箱，返回三码"""
+    collection_code = await _get_unique_code(CollectionBox, "collection_code")
+    delivery_code = await _get_unique_code(CollectionBox, "delivery_code")
+    retrieve_code = await _get_unique_code(CollectionBox, "retrieve_code")
+    now = await get_now()
+
+    # 校验最大文件数不超过系统限制
+    max_collection_files = getattr(settings, "maxCollectionFiles", 100)
+    if data.max_files < 1:
+        raise HTTPException(400, "最大文件数不能小于1")
+    if data.max_files > max_collection_files:
+        raise HTTPException(400, f"最大文件数不能超过{max_collection_files}")
+
+    # 校验过期时间类型
+    if data.expire_style not in settings.expireStyle:
+        raise HTTPException(400, "过期时间类型错误")
+    if data.delivery_expire_style not in settings.expireStyle:
+        raise HTTPException(400, "投件码过期时间类型错误")
+    if data.retrieve_expire_style not in settings.expireStyle:
+        raise HTTPException(400, "取件码过期时间类型错误")
+
+    # 校验过期时间不超过系统最大保存时间
+    max_save_seconds = getattr(settings, "max_save_seconds", 0)
+    if max_save_seconds > 0:
+        if data.expire_style != "forever":
+            expire_seconds = _expire_to_seconds(data.expire_style, data.expire_value)
+            if expire_seconds > max_save_seconds:
+                max_days = max_save_seconds // 86400
+                raise HTTPException(400, f"收件箱过期时间超过系统限制，最长{max_days}天")
+        if data.delivery_expire_style != "forever":
+            delivery_expire_seconds = _expire_to_seconds(data.delivery_expire_style, data.delivery_expire_value)
+            if delivery_expire_seconds > max_save_seconds:
+                max_days = max_save_seconds // 86400
+                raise HTTPException(400, f"投件码过期时间超过系统限制，最长{max_days}天")
+        if data.retrieve_expire_style != "forever":
+            retrieve_expire_seconds = _expire_to_seconds(data.retrieve_expire_style, data.retrieve_expire_value)
+            if retrieve_expire_seconds > max_save_seconds:
+                max_days = max_save_seconds // 86400
+                raise HTTPException(400, f"取件码过期时间超过系统限制，最长{max_days}天")
+
+    # 校验投件码和取件码过期时间不超过收件箱过期时间
+    collection_expire_seconds = _expire_to_seconds(data.expire_style, data.expire_value) if data.expire_style != "forever" else float('inf')
+    if data.delivery_expire_style != "forever" and collection_expire_seconds != float('inf'):
+        delivery_expire_seconds = _expire_to_seconds(data.delivery_expire_style, data.delivery_expire_value)
+        if delivery_expire_seconds > collection_expire_seconds:
+            raise HTTPException(400, "投件码过期时间不能超过收件箱过期时间")
+    if data.retrieve_expire_style != "forever" and collection_expire_seconds != float('inf'):
+        retrieve_expire_seconds = _expire_to_seconds(data.retrieve_expire_style, data.retrieve_expire_value)
+        if retrieve_expire_seconds > collection_expire_seconds:
+            raise HTTPException(400, "取件码过期时间不能超过收件箱过期时间")
+
+    # 向后兼容：旧字段 expire_days 自动转换
+    if data.expire_days is not None and data.expire_style == "day" and data.expire_value == 7:
+        expire_value = data.expire_days
+        expire_style = "day"
+    else:
+        expire_value = data.expire_value
+        expire_style = data.expire_style
+
+    # 统一计算过期时间
+    expired_at = _calculate_expired_at(expire_style, expire_value, now)
+    delivery_expired_at = _calculate_expired_at(data.delivery_expire_style, data.delivery_expire_value, now)
+    retrieve_expired_at = _calculate_expired_at(data.retrieve_expire_style, data.retrieve_expire_value, now)
+
+    box = await CollectionBox.create(
+        collection_code=collection_code,
+        delivery_code=delivery_code,
+        retrieve_code=retrieve_code,
+        title=data.title,
+        description=data.description,
+        password=data.password if not data.password else hash_password(data.password),
+        max_files=data.max_files,
+        expire_style=expire_style,
+        expire_value=expire_value,
+        expired_at=expired_at,
+        delivery_expire_style=data.delivery_expire_style,
+        delivery_expire_value=data.delivery_expire_value,
+        delivery_expired_at=delivery_expired_at,
+        retrieve_expire_style=data.retrieve_expire_style,
+        retrieve_expire_value=data.retrieve_expire_value,
+        retrieve_expired_at=retrieve_expired_at,
+        creator_ip=ip,
+        creator_name="匿名",
+    )
+
+    ip_limit["upload"].add_ip(ip)
+
+    # 触发事件
+    await CollectionEvents.emit("collection.created", {
+        "collection_code": box.collection_code,
+        "delivery_code": box.delivery_code,
+        "title": box.title,
+        "creator_ip": ip,
+    })
+
+    return APIResponse(detail=await _build_collection_response(box, include_files=False))
+
+
+# ============ 投件API（使用 delivery_code）============
+delivery_api = APIRouter(prefix="/delivery", tags=["投递"])
+
+
+@delivery_api.get("/{delivery_code}")
+async def get_delivery_page(delivery_code: str):
+    """获取投递页面信息（仅上传表单，不暴露文件列表）"""
+    box = await CollectionBox.filter(delivery_code=delivery_code).first()
+    if not box:
+        raise HTTPException(404, "投件码不存在")
+    if await box.is_expired():
+        raise HTTPException(410, "收件箱已过期")
+    if await box.is_delivery_expired():
+        raise HTTPException(410, "投件码已过期")
+
+    file_count = await CollectionFile.filter(collection=box).count()
+    return APIResponse(detail={
+        "delivery_code": box.delivery_code,
+        "title": box.title,
+        "description": box.description,
+        "max_files": box.max_files,
+        "file_count": file_count,
+        "delivery_count": box.delivery_count,
+        "delivery_used_count": box.delivery_used_count,
+        "created_at": box.created_at.isoformat() if box.created_at else None,
+        # 收件箱过期配置
+        "expire_style": box.expire_style,
+        "expire_value": box.expire_value,
+        "expired_at": box.expired_at.isoformat() if box.expired_at else None,
+        # 投件码过期配置
+        "delivery_expire_style": box.delivery_expire_style,
+        "delivery_expire_value": box.delivery_expire_value,
+        "delivery_expired_at": box.delivery_expired_at.isoformat() if box.delivery_expired_at else None,
+        # 取件码过期配置
+        "retrieve_expire_style": box.retrieve_expire_style,
+        "retrieve_expire_value": box.retrieve_expire_value,
+        "retrieve_expired_at": box.retrieve_expired_at.isoformat() if box.retrieve_expired_at else None,
+    })
+
+
+@delivery_api.post("/upload/", dependencies=[Depends(share_required_login)])
+async def delivery_upload(
+    delivery_code: str = Form(...),
+    file: UploadFile = File(...),
+    uploader_name: str = Form(default=""),
+    ip: str = Depends(ip_limit["upload"]),
+):
+    """投递文件到收件箱，使用 delivery_code 认证"""
+    delivery_code = _validate_code(delivery_code)
+    box = await CollectionBox.filter(delivery_code=delivery_code).first()
+    if not box:
+        raise HTTPException(404, "投件码不存在")
+    if await box.is_expired():
+        raise HTTPException(410, "收件箱已过期")
+    if await box.is_delivery_expired():
+        raise HTTPException(410, "投件码已过期或投递次数已用完")
+
+    # 校验投递次数限制
+    if box.delivery_count > 0 and box.delivery_used_count >= box.delivery_count:
+        raise HTTPException(403, "投递次数已用完")
+
+    current_count = await CollectionFile.filter(collection=box).count()
+    if current_count >= box.max_files:
+        raise HTTPException(403, "收件箱已满")
+
+    file_size = await validate_file_size(file, settings.uploadSize)
+
+    # 创建投递记录（状态：uploading）
+    collection_file = await CollectionFile.create(
+        collection=box,
+        uploader_name=uploader_name,
+        uploader_ip=ip,
+        status="uploading",
+    )
+
+    # 广播上传中状态
+    await ws_manager.broadcast(box.collection_code, {
+        "type": "file_uploading",
+        "file_id": collection_file.id,
+        "filename": file.filename or "",
+        "progress": 0,
+        "uploader": uploader_name or "匿名",
+    })
+
+    try:
+        # 保存文件并创建 FileCode 记录
+        file_storage: FileStorageInterface = storages[settings.file_storage]()
+        today = datetime.datetime.now()
+        storage_path_prefix = settings.storage_path.strip("/")
+        file_uuid = uuid.uuid4().hex
+        base_path = f"collection/{box.collection_code}/{today.strftime('%Y/%m/%d')}/{file_uuid}"
+        path = f"{storage_path_prefix}/{base_path}" if storage_path_prefix else base_path
+        filename = await sanitize_filename(unquote(file.filename or ""))
+        save_path = f"{path}/{filename}"
+
+        await file_storage.save_file(file, save_path)
+
+        prefix, suffix = os.path.splitext(filename)
+        # 创建关联的 FileCode 记录（用于复用文件存储和下载逻辑）
+        file_code = await FileCodes.create(
+            code=f"col_{collection_file.id}_{_generate_code(4)}",
+            prefix=prefix,
+            suffix=suffix,
+            uuid_file_name=filename,
+            file_path=path,
+            size=file_size,
+            expired_at=None,
+            expired_count=-1,
+            used_count=0,
+            expire_style="forever",
+            expire_value=0,
+        )
+
+        # 更新投递记录
+        collection_file.file_code = file_code
+        collection_file.status = "completed"
+        await collection_file.save()
+
+        # 广播上传完成
+        await ws_manager.broadcast(box.collection_code, {
+            "type": "file_completed",
+            "file_id": collection_file.id,
+            "filename": filename,
+            "file_size": file_size,
+            "uploader": uploader_name or "匿名",
+        })
+
+        # 触发事件
+        await CollectionEvents.emit("file.delivered", {
+            "file_id": collection_file.id,
+            "collection_code": box.collection_code,
+            "filename": filename,
+            "file_size": file_size,
+            "uploader": uploader_name or "匿名",
+        })
+
+        ip_limit["upload"].add_ip(ip)
+        # 投递成功，递增次数
+        if box.delivery_count > 0:
+            await CollectionBox.filter(id=box.id).update(delivery_used_count=box.delivery_used_count + 1)
+        return APIResponse(detail={
+            "id": collection_file.id,
+            "filename": filename,
+            "file_size": file_size,
+            "status": "completed",
+        })
+
+    except Exception as e:
+        # 上传失败
+        collection_file.status = "failed"
+        await collection_file.save()
+        await ws_manager.broadcast(box.collection_code, {
+            "type": "file_delivery_failed",
+            "file_id": collection_file.id,
+            "filename": file.filename or "",
+            "error": str(e),
+        })
+        # 触发事件
+        await CollectionEvents.emit("file.delivery_failed", {
+            "file_id": collection_file.id,
+            "collection_code": box.collection_code,
+            "filename": file.filename or "",
+            "error": str(e),
+        })
+        raise HTTPException(500, "文件上传失败，请重试")
+
+
+# ============ 收件箱管理API（使用 collection_code）============
+
+
+@collection_api.get("/manage/{collection_code}")
+async def get_collection_manage(collection_code: str):
+    """收件人管理页面 - 获取投递文件列表"""
+    collection_code = _validate_code(collection_code)
+    box = await CollectionBox.filter(collection_code=collection_code).first()
+    if not box:
+        raise HTTPException(404, "收件箱不存在")
+    if await box.is_expired():
+        raise HTTPException(410, "收件箱已过期")
+
+    return APIResponse(detail=await _build_collection_response(box))
+
+
+@collection_api.get("/retrieve/{retrieve_code}")
+async def get_collection_retrieve(retrieve_code: str):
+    """取件码访问 - 只读查看文件列表（不可删除/管理）"""
+    retrieve_code = _validate_code(retrieve_code)
+    box = await CollectionBox.filter(retrieve_code=retrieve_code).first()
+    if not box:
+        raise HTTPException(404, "取件码不存在")
+    if await box.is_expired():
+        raise HTTPException(410, "收件箱已过期")
+    if await box.is_retrieve_expired():
+        raise HTTPException(410, "取件码已过期")
+
+    return APIResponse(detail=await _build_collection_response(box))
+
+
+@collection_api.get("/manage-by-delivery/{delivery_code}")
+async def get_collection_manage_by_delivery(delivery_code: str):
+    """通过投件码获取收件箱文件列表（投件码持有者可查看已投递的文件）"""
+    delivery_code = _validate_code(delivery_code)
+    box = await CollectionBox.filter(delivery_code=delivery_code).first()
+    if not box:
+        raise HTTPException(404, "投件码不存在")
+    if await box.is_expired():
+        raise HTTPException(410, "收件箱已过期")
+    # 注意：不检查投件码是否过期，已投递的文件应始终可查看
+
+    return APIResponse(detail=await _build_collection_response(box))
+
+
+async def _build_file_list(box: CollectionBox) -> list:
+    """构建收件箱文件列表（使用 prefetch_related 消除 N+1 查询）"""
+    files = await CollectionFile.filter(collection=box).prefetch_related('file_code').order_by("created_at")
+    return [
+        {
+            "id": f.id,
+            "file_name": f"{f.file_code.prefix}{f.file_code.suffix}" if f.file_code else "未知",
+            "file_size": f.file_code.size if f.file_code else 0,
+            "uploader_name": f.uploader_name or "",
+            "status": f.status,
+            "created_at": f.created_at.isoformat(),
+        }
+        for f in files
+    ]
+
+
+async def _build_collection_response(box: CollectionBox, include_files: bool = True) -> dict:
+    """统一的收件箱响应构建（所有端点复用）"""
+    file_list = await _build_file_list(box) if include_files else []
+    total_size = sum(f["file_size"] for f in file_list) if include_files else 0
+
+    return {
+        "collection_code": box.collection_code,
+        "delivery_code": box.delivery_code,
+        "retrieve_code": box.retrieve_code,
+        "title": box.title,
+        "description": box.description,
+        "max_files": box.max_files,
+        "created_at": box.created_at.isoformat() if box.created_at else None,
+        # 收件箱过期配置
+        "expire_style": box.expire_style,
+        "expire_value": box.expire_value,
+        "expired_at": box.expired_at.isoformat() if box.expired_at else None,
+        # 投件码过期配置
+        "delivery_expire_style": box.delivery_expire_style,
+        "delivery_expire_value": box.delivery_expire_value,
+        "delivery_expired_at": box.delivery_expired_at.isoformat() if box.delivery_expired_at else None,
+        # 取件码过期配置
+        "retrieve_expire_style": box.retrieve_expire_style,
+        "retrieve_expire_value": box.retrieve_expire_value,
+        "retrieve_expired_at": box.retrieve_expired_at.isoformat() if box.retrieve_expired_at else None,
+        # 文件信息
+        "file_count": len(file_list),
+        "total_size": total_size,
+        "files": file_list,
+    }
+
+
+@collection_api.get("/status/{collection_code}")
+async def get_collection_status(collection_code: str):
+    """获取收件箱状态（同管理页面数据）"""
+    return await get_collection_manage(collection_code)
+
+
+@collection_api.patch("/update/{collection_code}")
+async def update_collection_config(collection_code: str, data: UpdateCollectionConfigRequest):
+    """更新收件箱配置（收件箱过期时间不可更改，仅投件码/取件码过期时间和最大文件数可修改）"""
+    box = await CollectionBox.filter(collection_code=collection_code).first()
+    if not box:
+        raise HTTPException(404, "收件箱不存在")
+    if await box.is_expired():
+        raise HTTPException(410, "收件箱已过期")
+
+    update_data = {}
+
+    # 校验投件码/取件码过期时间不超过收件箱过期时间
+    collection_expire_seconds = _expire_to_seconds(box.expire_style, box.expire_value) if box.expire_style != "forever" else float('inf')
+
+    # 投件码有效期（从当前时间重新计算，支持延长已过期的投件码）
+    if data.delivery_expire_style is not None and data.delivery_expire_value is not None:
+        if data.delivery_expire_style not in settings.expireStyle:
+            raise HTTPException(400, "投件码过期时间类型错误")
+        max_save_seconds = getattr(settings, "max_save_seconds", 0)
+        if max_save_seconds > 0 and data.delivery_expire_style != "forever":
+            delivery_expire_seconds = _expire_to_seconds(data.delivery_expire_style, data.delivery_expire_value)
+            if delivery_expire_seconds > max_save_seconds:
+                max_days = max_save_seconds // 86400
+                raise HTTPException(400, f"投件码过期时间超过系统限制，最长{max_days}天")
+        if data.delivery_expire_style != "forever" and collection_expire_seconds != float('inf'):
+            delivery_expire_seconds = _expire_to_seconds(data.delivery_expire_style, data.delivery_expire_value)
+            if delivery_expire_seconds > collection_expire_seconds:
+                raise HTTPException(400, "投件码过期时间不能超过收件箱过期时间")
+        update_data["delivery_expire_style"] = data.delivery_expire_style
+        update_data["delivery_expire_value"] = data.delivery_expire_value
+        update_data["delivery_expired_at"] = _calculate_expired_at(
+            data.delivery_expire_style, data.delivery_expire_value, await get_now()
+        )
+
+    # 取件码有效期（从当前时间重新计算，支持延长已过期的取件码）
+    if data.retrieve_expire_style is not None and data.retrieve_expire_value is not None:
+        if data.retrieve_expire_style not in settings.expireStyle:
+            raise HTTPException(400, "取件码过期时间类型错误")
+        max_save_seconds = getattr(settings, "max_save_seconds", 0)
+        if max_save_seconds > 0 and data.retrieve_expire_style != "forever":
+            retrieve_expire_seconds = _expire_to_seconds(data.retrieve_expire_style, data.retrieve_expire_value)
+            if retrieve_expire_seconds > max_save_seconds:
+                max_days = max_save_seconds // 86400
+                raise HTTPException(400, f"取件码过期时间超过系统限制，最长{max_days}天")
+        if data.retrieve_expire_style != "forever" and collection_expire_seconds != float('inf'):
+            retrieve_expire_seconds = _expire_to_seconds(data.retrieve_expire_style, data.retrieve_expire_value)
+            if retrieve_expire_seconds > collection_expire_seconds:
+                raise HTTPException(400, "取件码过期时间不能超过收件箱过期时间")
+        update_data["retrieve_expire_style"] = data.retrieve_expire_style
+        update_data["retrieve_expire_value"] = data.retrieve_expire_value
+        update_data["retrieve_expired_at"] = _calculate_expired_at(
+            data.retrieve_expire_style, data.retrieve_expire_value, await get_now()
+        )
+
+    if data.max_files is not None:
+        max_collection_files = getattr(settings, "maxCollectionFiles", 100)
+        if data.max_files > max_collection_files:
+            raise HTTPException(400, f"最大文件数不能超过{max_collection_files}")
+        current_file_count = await CollectionFile.filter(collection=box).count()
+        if data.max_files < current_file_count:
+            raise HTTPException(400, f"最大文件数不能小于当前已有文件数({current_file_count})")
+        update_data["max_files"] = data.max_files
+
+    if update_data:
+        await CollectionBox.filter(collection_code=collection_code).update(**update_data)
+        await box.refresh_from_db()
+
+    return APIResponse(detail=await _build_collection_response(box))
+
+
+@collection_api.get("/download/{file_id}")
+async def download_collection_file(file_id: int, code: str, ip: str = Depends(ip_limit["error"])):
+    """下载收件箱中的文件（需管理码或取件码校验）"""
+    collection_file = await CollectionFile.filter(id=file_id).first()
+    if not collection_file:
+        raise HTTPException(404, "文件不存在")
+
+    if not collection_file.file_code_id:
+        raise HTTPException(404, "文件记录不存在")
+
+    # 验证码权限：管理码或取件码
+    box = await CollectionBox.filter(id=collection_file.collection_id).first()
+    if not box:
+        raise HTTPException(404, "收件箱不存在")
+
+    if code != box.collection_code and code != box.retrieve_code:
+        ip_limit["error"].add_ip(ip)
+        raise HTTPException(403, "码不匹配，无权下载")
+
+    if await box.is_expired():
+        raise HTTPException(410, "收件箱已过期")
+
+    # 取件码独立过期检查
+    if code == box.retrieve_code and await box.is_retrieve_expired():
+        raise HTTPException(410, "取件码已过期")
+
+    file_code = await FileCodes.filter(id=collection_file.file_code_id).first()
+    if not file_code:
+        raise HTTPException(404, "文件已删除")
+
+    file_storage: FileStorageInterface = storages[settings.file_storage]()
+    return await file_storage.get_file_response(file_code)
+
+
+@collection_api.get("/zip/{code}")
+async def download_collection_zip(code: str):
+    """打包下载收件箱所有文件（支持管理码和取件码）"""
+    box = await CollectionBox.filter(collection_code=code).first()
+    if not box:
+        # 尝试按取件码查找
+        box = await CollectionBox.filter(retrieve_code=code).first()
+    if not box:
+        raise HTTPException(404, "收件箱不存在")
+    if await box.is_expired():
+        raise HTTPException(410, "收件箱已过期")
+
+    # 取件码独立过期检查
+    if code == box.retrieve_code and await box.is_retrieve_expired():
+        raise HTTPException(410, "取件码已过期")
+
+    collection_files = await CollectionFile.filter(collection=box, status="completed").order_by("created_at")
+    if not collection_files:
+        raise HTTPException(404, "没有文件可下载")
+
+    # 获取所有 FileCode 关联的文件
+    file_items = []
+    for cf in collection_files:
+        if cf.file_code_id:
+            fc = await FileCodes.filter(id=cf.file_code_id).first()
+            if fc and fc.uuid_file_name and fc.file_path:
+                file_items.append(fc)
+
+    if not file_items:
+        raise HTTPException(404, "没有文件可下载")
+
+    return StreamingResponse(
+        create_zip_stream(file_items),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(code)}.zip"
+        },
+    )
+
+
+@collection_api.delete("/delete/{file_id}")
+async def delete_collection_file(file_id: int):
+    """删除收件箱中的文件（收件人操作）"""
+    collection_file = await CollectionFile.filter(id=file_id).first()
+    if not collection_file:
+        raise HTTPException(404, "文件不存在")
+
+    # 删除关联的 FileCode 和存储文件
+    if collection_file.file_code_id:
+        file_code = await FileCodes.filter(id=collection_file.file_code_id).first()
+        if file_code:
+            file_storage: FileStorageInterface = storages[settings.file_storage]()
+            try:
+                await file_storage.delete_file(file_code)
+            except Exception:
+                pass
+            await file_code.delete()
+
+    box = await CollectionBox.filter(id=collection_file.collection_id).first()
+    collection_code = box.collection_code if box else ""
+    await collection_file.delete()
+
+    # 广播文件删除
+    if collection_code:
+        await ws_manager.broadcast(collection_code, {
+            "type": "file_deleted",
+            "file_id": file_id,
+        })
+
+    return APIResponse(detail={"message": "文件已删除"})
+
+
+# ============ WebSocket端点 ============
+ws_api = APIRouter(tags=["WebSocket"])
+
+
+@ws_api.websocket("/ws/collection/{code}")
+async def websocket_collection(websocket: WebSocket, code: str):
+    """收件箱实时推送 WebSocket"""
+    # 支持通过 collection_code 或 delivery_code 连接
+    collection = await CollectionBox.filter(collection_code=code).first()
+    if not collection:
+        collection = await CollectionBox.filter(delivery_code=code).first()
+    if not collection:
+        await websocket.close(code=404, reason="收件箱不存在")
+        return
+
+    if await collection.is_expired():
+        await websocket.close(code=410, reason="收件箱已过期")
+        return
+
+    room_code = collection.collection_code
+    # 等待客户端发送第一条消息获取昵称
+    await ws_manager.connect(room_code, websocket, nickname="")
+    try:
+        # 第一条消息作为昵称注册
+        first_msg = await websocket.receive_text()
+        nickname = ""
+        try:
+            msg_data = json.loads(first_msg)
+            if isinstance(msg_data, dict) and msg_data.get("type") == "join":
+                nickname = msg_data.get("nickname", "")
+                # 更新昵称
+                for conn in ws_manager.active_connections.get(room_code, []):
+                    if conn["ws"] is websocket:
+                        conn["nickname"] = nickname
+                        break
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # 广播用户加入
+        online_users = ws_manager.get_online_users(room_code)
+        await ws_manager.broadcast(room_code, {
+            "type": "user_joined",
+            "nickname": nickname,
+            "online_users": online_users,
+        })
+
+        while True:
+            data = await websocket.receive_text()
+            # 客户端发送的进度消息，广播给房间内其他连接
+            try:
+                msg = json.loads(data)
+                if isinstance(msg, dict) and msg.get("type") in ("file_uploading", "file_progress"):
+                    await ws_manager.broadcast(room_code, msg)
+            except (json.JSONDecodeError, ValueError):
+                pass  # 忽略非JSON消息（如ping）
+    except WebSocketDisconnect:
+        left_nickname = ws_manager.disconnect(room_code, websocket)
+        # 广播用户离开
+        online_users = ws_manager.get_online_users(room_code)
+        await ws_manager.broadcast(room_code, {
+            "type": "user_left",
+            "nickname": left_nickname,
+            "online_users": online_users,
+        })

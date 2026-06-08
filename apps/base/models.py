@@ -24,10 +24,13 @@ class FileCodes(models.Model):
     expired_at = fields.DatetimeField(null=True)
     expired_count = fields.IntField(default=0)
     used_count = fields.IntField(default=0)
+    expire_style = fields.CharField(max_length=20, default="day")
+    expire_value = fields.IntField(default=1)
     created_at = fields.DatetimeField(auto_now_add=True)
     file_hash = fields.CharField(max_length=64, null=True)
     is_chunked = fields.BooleanField(default=False)
     upload_id = fields.CharField(max_length=36, null=True)
+    is_multi_file = fields.BooleanField(default=False)
 
     async def is_expired(self):
         if self.expired_at is None:
@@ -84,9 +87,94 @@ class PresignUploadSession(models.Model):
         return self.expires_at < await get_now()
 
 
+class FileItem(models.Model):
+    """多文件分享中的单个文件项"""
+    id = fields.IntField(pk=True)
+    file_code = fields.ForeignKeyField("models.FileCodes", related_name="items", on_delete=fields.CASCADE)
+    file_name = fields.CharField(max_length=255)
+    file_size = fields.BigIntField(default=0)
+    file_hash = fields.CharField(max_length=64, null=True)
+    storage_path = fields.CharField(max_length=512)
+    uuid_file_name = fields.CharField(max_length=255, null=True)
+    sort_order = fields.IntField(default=0)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    async def get_full_path(self):
+        """获取完整的存储路径"""
+        return f"{self.storage_path}/{self.uuid_file_name}"
+
+
+class CollectionBox(models.Model):
+    """收件箱（文件收集）- 三码分离 + expire_style 模式"""
+    id = fields.IntField(pk=True)
+    collection_code = fields.CharField(max_length=6, unique=True, index=True)
+    delivery_code = fields.CharField(max_length=6, unique=True, index=True)
+    retrieve_code = fields.CharField(max_length=6, unique=True, index=True, default="")
+    title = fields.CharField(max_length=100, default="")
+    description = fields.TextField(default="", null=True)
+    creator_ip = fields.CharField(max_length=45, default="")
+    creator_name = fields.CharField(max_length=50, default="匿名")
+    password = fields.CharField(max_length=255, default="", null=True)
+    max_files = fields.IntField(default=20)
+    # 收件箱过期配置（创建后不可更改）
+    expire_style = fields.CharField(max_length=20, default="day")
+    expire_value = fields.IntField(default=7)
+    expired_at = fields.DatetimeField(null=True)
+    # 投件码过期配置
+    delivery_expire_style = fields.CharField(max_length=20, default="day")
+    delivery_expire_value = fields.IntField(default=7)
+    delivery_expired_at = fields.DatetimeField(null=True)
+    # 取件码过期配置
+    retrieve_expire_style = fields.CharField(max_length=20, default="day")
+    retrieve_expire_value = fields.IntField(default=7)
+    retrieve_expired_at = fields.DatetimeField(null=True)
+    delivery_count = fields.IntField(default=-1)  # 最大投递次数，-1 表示不限
+    delivery_used_count = fields.IntField(default=0)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    async def is_expired(self):
+        """收件箱是否过期"""
+        if self.expire_style == "forever":
+            return False
+        if self.expired_at is None:
+            return False
+        return self.expired_at < await get_now()
+
+    async def is_delivery_expired(self):
+        """投件码是否过期（独立于收件箱过期）"""
+        if self.delivery_expire_style == "forever":
+            return False
+        if self.delivery_expired_at is None:
+            return False
+        return self.delivery_expired_at < await get_now()
+
+    async def is_retrieve_expired(self):
+        """取件码是否过期（独立于收件箱过期）"""
+        if self.retrieve_expire_style == "forever":
+            return False
+        if self.retrieve_expired_at is None:
+            return False
+        return self.retrieve_expired_at < await get_now()
+
+
+class CollectionFile(models.Model):
+    """收件箱中的投递文件 - 关联 FileCode"""
+    id = fields.IntField(pk=True)
+    collection = fields.ForeignKeyField("models.CollectionBox", related_name="files", on_delete=fields.CASCADE)
+    file_code = fields.ForeignKeyField("models.FileCodes", related_name="collection_files", null=True, on_delete=fields.SET_NULL)
+    uploader_name = fields.CharField(max_length=50, default="", null=True)
+    uploader_ip = fields.CharField(max_length=45, default="")
+    status = fields.CharField(max_length=20, default="uploading")
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+
 file_codes_pydantic = pydantic_model_creator(FileCodes, name="FileCodes")
 upload_chunk_pydantic = pydantic_model_creator(UploadChunk, name="UploadChunk")
 key_value_pydantic = pydantic_model_creator(KeyValue, name="KeyValue")
 presign_upload_session_pydantic = pydantic_model_creator(
     PresignUploadSession, name="PresignUploadSession"
 )
+file_item_pydantic = pydantic_model_creator(FileItem, name="FileItem")
+collection_box_pydantic = pydantic_model_creator(CollectionBox, name="CollectionBox")
+collection_file_pydantic = pydantic_model_creator(CollectionFile, name="CollectionFile")

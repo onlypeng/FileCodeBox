@@ -9,7 +9,7 @@ import os
 
 from tortoise.expressions import Q
 
-from apps.base.models import FileCodes, UploadChunk
+from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFile
 from apps.base.utils import ip_limit, get_chunk_file_path_name
 from core.config import refresh_settings
 from core.settings import settings, data_root
@@ -30,8 +30,8 @@ async def delete_expire_files():
             await ip_limit["error"].remove_expired_ip()
             await ip_limit["upload"].remove_expired_ip()
             expire_data = await FileCodes.filter(
-                Q(expired_at__lt=await get_now()) | Q(expired_count=0)
-            ).all()
+                Q(expired_at__isnull=False, expired_at__lt=await get_now()) | Q(expired_count=0)
+            ).exclude(expired_count=-1, expired_at__isnull=True).all()
             for exp in expire_data:
                 try:
                     await file_storage.delete_file(exp)
@@ -84,3 +84,71 @@ async def clean_incomplete_uploads():
             logging.error(f"清理未完成上传任务异常: {e}")
         finally:
             await asyncio.sleep(3600)
+
+
+# ============ 收件箱事件定义 ============
+
+class CollectionEvents:
+    """收件箱事件处理器"""
+    _handlers = {}
+
+    @classmethod
+    def on(cls, event_name: str, handler):
+        """注册事件处理器"""
+        if event_name not in cls._handlers:
+            cls._handlers[event_name] = []
+        cls._handlers[event_name].append(handler)
+
+    @classmethod
+    async def emit(cls, event_name: str, data: dict):
+        """触发事件"""
+        handlers = cls._handlers.get(event_name, [])
+        for handler in handlers:
+            try:
+                await handler(data)
+            except Exception as e:
+                logging.error(f"事件处理器错误 {event_name}: {e}")
+
+        # 默认日志
+        logging.info(f"[Event] {event_name}: {data}")
+
+
+# 注册默认事件处理器
+async def _log_collection_created(data: dict):
+    logging.info(f"收件箱已创建: collection_code={data.get('collection_code')}, delivery_code={data.get('delivery_code')}")
+
+
+async def _log_file_delivered(data: dict):
+    logging.info(f"文件已投递: file_id={data.get('file_id')}, collection_code={data.get('collection_code')}")
+
+
+async def _log_delivery_failed(data: dict):
+    logging.warning(f"文件投递失败: file_id={data.get('file_id')}, error={data.get('error')}")
+
+
+CollectionEvents.on("collection.created", _log_collection_created)
+CollectionEvents.on("file.delivered", _log_file_delivered)
+CollectionEvents.on("file.delivery_failed", _log_delivery_failed)
+
+
+async def clean_expired_collections():
+    """定期清理过期收件箱（仅清理超时 uploading 状态的投递记录）"""
+    while True:
+        try:
+            await refresh_settings()
+            now = await get_now()
+
+            # 清理超时的 uploading 状态投递记录
+            expire_time = now - datetime.timedelta(hours=1)
+            stale_files = await CollectionFile.filter(
+                status="uploading", created_at__lt=expire_time
+            ).all()
+            for sf in stale_files:
+                sf.status = "failed"
+                await sf.save()
+                logging.info(f"投递记录标记为失败: id={sf.id}")
+
+        except Exception as e:
+            logging.error(f"清理过期收件箱异常: {e}")
+        finally:
+            await asyncio.sleep(600)

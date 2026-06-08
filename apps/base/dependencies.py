@@ -2,6 +2,8 @@ from typing import Dict, Union
 from datetime import datetime, timedelta
 from fastapi import HTTPException, Request
 
+from core.settings import settings
+
 
 class IPRateLimit:
     def __init__(self, count: int, minutes: int):
@@ -35,11 +37,25 @@ class IPRateLimit:
         }
 
     def __call__(self, request: Request) -> str:
-        ip = (
-            request.headers.get("X-Real-IP")
-            or request.headers.get("X-Forwarded-For")
-            or request.client.host
-        )
-        if not self.check_ip(ip):
+        # 获取客户端真实IP，防止伪造
+        client_ip = request.client.host if request.client else "unknown"
+        trusted_proxies = getattr(settings, "trustedProxies", "")
+        if trusted_proxies:
+            trusted_list = [ip.strip() for ip in trusted_proxies.split(",") if ip.strip()]
+            if client_ip in trusted_list:
+                # 仅信任来自可信代理的转发头
+                forwarded_for = request.headers.get("X-Forwarded-For")
+                if forwarded_for:
+                    # 取第一个非可信代理的IP
+                    ips = [ip.strip() for ip in forwarded_for.split(",")]
+                    for ip in reversed(ips):
+                        if ip not in trusted_list:
+                            client_ip = ip
+                            break
+                else:
+                    real_ip = request.headers.get("X-Real-IP")
+                    if real_ip:
+                        client_ip = real_ip.strip()
+        if not self.check_ip(client_ip):
             raise HTTPException(status_code=423, detail="请求次数过多，请稍后再试")
-        return ip
+        return client_ip
