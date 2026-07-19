@@ -92,8 +92,9 @@ async def get_expire_info(
 
 
 async def get_random_code(style: str = "string") -> str:
+    length = getattr(settings, 'codeDigitCount', 8)
     for _ in range(20):
-        code = await get_random_string()
+        code = await get_random_string(length)
         if not await FileCodes.filter(code=code).exists():
             return str(code)
     raise HTTPException(500, "生成取件码失败，请重试")

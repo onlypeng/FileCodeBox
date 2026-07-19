@@ -10,7 +10,7 @@ import json
 import secrets
 import time
 from core.settings import settings
-from apps.admin.services import FileService, ConfigService
+from apps.admin.services import FileService, ConfigService, ActivityLogService, CollectionService, LocalFileService
 
 
 def create_token(data: dict, expires_in: int = 3600 * 24 * 30) -> str:
@@ -143,3 +143,23 @@ async def get_file_service():
 
 async def get_config_service():
     return ConfigService()
+
+
+async def get_activity_log_service():
+    return ActivityLogService()
+
+
+async def get_collection_service():
+    return CollectionService()
+
+
+async def get_local_file_service():
+    return LocalFileService()
+
+
+async def get_admin_session(authorization: str = Header(default=None)):
+    return _require_admin_payload(authorization)
+
+
+def get_admin_session_expire_seconds() -> int:
+    return 3600 * 24 * 30

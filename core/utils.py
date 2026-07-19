@@ -5,6 +5,7 @@
 import datetime
 import hashlib
 import hmac as hmac_module
+import html
 import os
 import random
 import re
@@ -26,20 +27,22 @@ async def get_random_num():
 r_s = string.ascii_uppercase + string.digits
 
 
-async def get_random_string():
+async def get_random_string(length: int = 8):
     """
-    获取随机字符串
+    获取随机字符串（默认8位，提高碰撞抵抗）
     :return:
     """
-    return "".join(secrets.choice(r_s) for _ in range(6))
+    return "".join(secrets.choice(r_s) for _ in range(length))
 
 
 async def get_now():
     """
-    获取当前时间
-    :return:
+    获取当前时间（naive datetime，与 Tortoise ORM use_tz=False 配置一致）
+    注意：Tortoise ORM 配置了 use_tz=False，返回 naive datetime，
+    因此此函数也必须返回 naive datetime 以确保比较正确。
+    时区为 UTC+8（Asia/Shanghai）。
     """
-    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).replace(tzinfo=None)
 
 
 async def get_select_token(code: str):
@@ -163,10 +166,16 @@ async def sanitize_filename(filename: str) -> str:
     """
     安全处理文件名：
     1. 剥离路径只保留文件名
-    2. 替换非法字符
-    3. 处理空文件名情况
+    2. 拒绝路径遍历攻击（..）
+    3. 替换非法字符
+    4. 处理空文件名情况
     """
+    # 先检测路径遍历攻击
+    if ".." in filename or "/" in filename or "\\" in filename:
+        filename = filename.replace("..", "").replace("/", "").replace("\\", "")
     filename = os.path.basename(filename)
+    # 拒绝空字节注入
+    filename = filename.replace("\x00", "")
     illegal_chars = r'[\\/*?:"<>|\x00-\x1F]'  # 包含控制字符
     # 替换非法字符为下划线
     cleaned = re.sub(illegal_chars, "_", filename)
@@ -183,6 +192,15 @@ async def sanitize_filename(filename: str) -> str:
     return cleaned[:255]
 
 
+def escape_html_text(text: str) -> str:
+    """
+    对文本内容进行 HTML 转义，防止 XSS 攻击
+    """
+    if not text:
+        return text
+    return html.escape(text, quote=False)
+
+
 # 敏感字段列表
 SENSITIVE_KEYS = {
     "s3_secret_access_key", "onedrive_password", "webdav_password",
@@ -191,35 +209,79 @@ SENSITIVE_KEYS = {
 
 
 def _get_encryption_key() -> bytes:
-    """从 admin_token 派生加密密钥"""
-    # 使用固定盐值从 admin_token 派生密钥
+    """从 admin_token 派生 32 字节 AES-256 密钥"""
     key_material = hashlib.sha256(f"FileCodeBox_Encryption_{settings.admin_token}".encode()).digest()
     return key_material
 
 
 def encrypt_value(value: str) -> str:
-    """加密敏感值，返回 base64 编码的加密数据（含随机盐）"""
+    """使用 AES-256-GCM 加密敏感值，返回 base64 编码的加密数据"""
     if not value:
         return value
     import base64 as b64
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        # 回退到旧版 XOR 加密（兼容未安装 cryptography 的环境）
+        return _encrypt_value_xor(value)
+
     key = _get_encryption_key()
-    # 使用随机盐避免相同明文产生相同密文
+    nonce = secrets.token_bytes(12)
+    value_bytes = value.encode('utf-8')
+    aesgcm = AESGCM(key)
+    encrypted = aesgcm.encrypt(nonce, value_bytes, None)
+    return f"enc:aes:{b64.b64encode(nonce + encrypted).decode()}"
+
+
+def _encrypt_value_xor(value: str) -> str:
+    """旧版 XOR 加密（兼容回退）"""
+    import base64 as b64
+    key = _get_encryption_key()
     salt = secrets.token_bytes(16)
     value_bytes = value.encode('utf-8')
-    # 将 salt 和 key 混合作为实际加密密钥
     actual_key = hashlib.pbkdf2_hmac('sha256', key, salt, 1000, dklen=len(value_bytes))
     encrypted = bytes(a ^ b for a, b in zip(value_bytes, actual_key))
     return f"enc:{b64.b64encode(salt + encrypted).decode()}"
 
 
 def decrypt_value(value: str) -> str:
-    """解密敏感值"""
+    """解密敏感值（自动识别 AES-GCM 或旧版 XOR 格式）"""
     if not value or not value.startswith("enc:"):
         return value
     import base64 as b64
+
+    if value.startswith("enc:aes:"):
+        return _decrypt_value_aes(value, b64)
+    else:
+        return _decrypt_value_xor(value, b64)
+
+
+def _decrypt_value_aes(value: str, b64) -> str:
+    """AES-256-GCM 解密"""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        return value  # 无法解密，返回原值
+
     key = _get_encryption_key()
-    raw = b64.b64decode(value[4:])
-    if len(raw) < 17:  # 至少包含 16 字节 salt + 1 字节数据
+    raw = b64.b64decode(value[8:])  # 跳过 "enc:aes:"
+    if len(raw) < 13:  # 至少 12 字节 nonce + 1 字节数据
+        return value
+    nonce = raw[:12]
+    encrypted = raw[12:]
+    aesgcm = AESGCM(key)
+    try:
+        decrypted = aesgcm.decrypt(nonce, encrypted, None)
+        return decrypted.decode('utf-8')
+    except Exception:
+        return value  # 解密失败，返回原值
+
+
+def _decrypt_value_xor(value: str, b64) -> str:
+    """旧版 XOR 解密（兼容）"""
+    key = _get_encryption_key()
+    raw = b64.b64decode(value[4:])  # 跳过 "enc:"
+    if len(raw) < 17:
         return value
     salt = raw[:16]
     encrypted = raw[16:]

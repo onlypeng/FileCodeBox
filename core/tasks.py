@@ -9,9 +9,9 @@ import os
 
 from tortoise.expressions import Q
 
-from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFile
+from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFile, PresignUploadSession
 from apps.base.utils import ip_limit, get_chunk_file_path_name
-from core.config import refresh_settings
+from core.config import refresh_settings, should_refresh_config
 from core.settings import settings, data_root
 from core.storage import FileStorageInterface, storages
 from core.utils import get_now
@@ -20,7 +20,8 @@ from core.utils import get_now
 async def delete_expire_files():
     while True:
         try:
-            await refresh_settings()
+            if should_refresh_config():
+                await refresh_settings()
             file_storage: FileStorageInterface = storages[settings.file_storage]()
             # 遍历 share目录下的所有文件夹，删除空的文件夹，并判断父目录是否为空，如果为空也删除
             if settings.file_storage == "local":
@@ -29,9 +30,16 @@ async def delete_expire_files():
                         os.rmdir(root)
             await ip_limit["error"].remove_expired_ip()
             await ip_limit["upload"].remove_expired_ip()
+            now = await get_now()
+            # 过期条件：时间过期 或 count 用尽
             expire_data = await FileCodes.filter(
-                Q(expired_at__isnull=False, expired_at__lt=await get_now()) | Q(expired_count=0)
-            ).exclude(expired_count=-1, expired_at__isnull=True).all()
+                Q(expired_at__isnull=False, expired_at__lt=now) | Q(expired_count=0)
+            ).exclude(
+                # 排除 forever 模式（expired_count=-1 且无过期时间）
+                Q(expired_count=-1, expired_at__isnull=True) |
+                # 排除 forever 模式下 count 为 0 的情况（forever 不因 count 用尽而删除）
+                Q(expired_count=0, expire_style="forever")
+            ).all()
             for exp in expire_data:
                 try:
                     await file_storage.delete_file(exp)
@@ -50,7 +58,8 @@ async def delete_expire_files():
 async def clean_incomplete_uploads():
     while True:
         try:
-            await refresh_settings()
+            if should_refresh_config():
+                await refresh_settings()
             file_storage: FileStorageInterface = storages[settings.file_storage]()
             expire_hours = getattr(settings, "chunk_expire_hours", 24)
             now = await get_now()
@@ -84,6 +93,43 @@ async def clean_incomplete_uploads():
             logging.error(f"清理未完成上传任务异常: {e}")
         finally:
             await asyncio.sleep(3600)
+
+
+async def clean_expired_presign_sessions():
+    """定期清理过期预签名上传会话"""
+    while True:
+        try:
+            if should_refresh_config():
+                await refresh_settings()
+            now = await get_now()
+            expired_sessions = await PresignUploadSession.filter(expires_at__lt=now).all()
+            for session in expired_sessions:
+                try:
+                    if session.mode == "direct":
+                        file_storage: FileStorageInterface = storages[settings.file_storage]()
+                        if await file_storage.file_exists(session.save_path):
+                            temp_file_code = FileCodes(
+                                file_path=os.path.dirname(session.save_path),
+                                uuid_file_name=os.path.basename(session.save_path),
+                            )
+                            await file_storage.delete_file(temp_file_code)
+                except Exception as e:
+                    logging.error(
+                        f"清理预签名上传文件失败 upload_id={session.upload_id}: {e}"
+                    )
+
+                try:
+                    await session.delete()
+                    logging.info(f"已清理过期预签名上传会话 upload_id={session.upload_id}")
+                except Exception as e:
+                    logging.error(
+                        f"删除预签名上传记录失败 upload_id={session.upload_id}: {e}"
+                    )
+
+        except Exception as e:
+            logging.error(f"清理过期预签名上传会话异常: {e}")
+        finally:
+            await asyncio.sleep(600)
 
 
 # ============ 收件箱事件定义 ============
@@ -135,7 +181,8 @@ async def clean_expired_collections():
     """定期清理过期收件箱（仅清理超时 uploading 状态的投递记录）"""
     while True:
         try:
-            await refresh_settings()
+            if should_refresh_config():
+                await refresh_settings()
             now = await get_now()
 
             # 清理超时的 uploading 状态投递记录
@@ -152,3 +199,15 @@ async def clean_expired_collections():
             logging.error(f"清理过期收件箱异常: {e}")
         finally:
             await asyncio.sleep(600)
+
+
+async def clean_admin_rate_limit():
+    """定期清理管理后台速率限制缓存"""
+    from apps.admin.views import admin_rate_limit
+    while True:
+        try:
+            await admin_rate_limit.cleanup()
+        except Exception as e:
+            logging.error(f"清理管理后台速率限制异常: {e}")
+        finally:
+            await asyncio.sleep(300)

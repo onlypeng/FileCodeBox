@@ -64,6 +64,8 @@ class CollectionUploadRequest(BaseModel):
 
 class UpdateCollectionConfigRequest(BaseModel):
     """更新收件箱配置请求 - 收件箱过期时间不可更改"""
+    title: Optional[str] = None
+    description: Optional[str] = None
     delivery_expire_style: Optional[str] = None
     delivery_expire_value: Optional[int] = None
     retrieve_expire_style: Optional[str] = None

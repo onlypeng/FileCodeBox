@@ -21,7 +21,6 @@ import re
 import aioboto3
 from botocore.config import Config
 from fastapi import HTTPException, Response, UploadFile
-from core.response import APIResponse
 from core.settings import data_root, settings
 from apps.base.models import FileCodes, UploadChunk, FileItem, CollectionFile
 from core.utils import get_file_url, sanitize_filename
@@ -166,7 +165,7 @@ class SystemFileStorage(FileStorageInterface):
     async def get_file_response(self, file_code: FileCodes):
         file_path = self.root_path / await file_code.get_file_path()
         if not file_path.exists():
-            return APIResponse(code=404, detail="文件已过期删除")
+            raise HTTPException(status_code=404, detail="文件已过期删除")
         filename = f"{file_code.prefix}{file_code.suffix}"
         encoded_filename = quote(filename, safe='')
         content_disposition = f"attachment; filename*=UTF-8''{encoded_filename}"

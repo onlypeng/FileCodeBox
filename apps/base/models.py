@@ -12,6 +12,13 @@ from datetime import datetime
 from core.utils import get_now
 
 
+def _make_naive(dt):
+    """将 datetime 转为 naive（去除时区信息），确保与 get_now() 可比较"""
+    if dt is not None and dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
+
+
 class FileCodes(models.Model):
     id = fields.IntField(pk=True)
     code = fields.CharField(max_length=255, unique=True, index=True)
@@ -36,7 +43,7 @@ class FileCodes(models.Model):
         if self.expired_at is None:
             return False
         if self.expired_at and self.expired_count < 0:
-            return self.expired_at < await get_now()
+            return _make_naive(self.expired_at) < await get_now()
         return self.expired_count <= 0
 
     async def get_file_path(self):
@@ -84,7 +91,7 @@ class PresignUploadSession(models.Model):
 
     async def is_expired(self):
         """检查会话是否已过期"""
-        return self.expires_at < await get_now()
+        return _make_naive(self.expires_at) < await get_now()
 
 
 class FileItem(models.Model):
@@ -107,9 +114,9 @@ class FileItem(models.Model):
 class CollectionBox(models.Model):
     """收件箱（文件收集）- 三码分离 + expire_style 模式"""
     id = fields.IntField(pk=True)
-    collection_code = fields.CharField(max_length=6, unique=True, index=True)
-    delivery_code = fields.CharField(max_length=6, unique=True, index=True)
-    retrieve_code = fields.CharField(max_length=6, unique=True, index=True, default="")
+    collection_code = fields.CharField(max_length=16, unique=True, index=True)
+    delivery_code = fields.CharField(max_length=16, unique=True, index=True)
+    retrieve_code = fields.CharField(max_length=16, unique=True, index=True, default="")
     title = fields.CharField(max_length=100, default="")
     description = fields.TextField(default="", null=True)
     creator_ip = fields.CharField(max_length=45, default="")
@@ -139,7 +146,7 @@ class CollectionBox(models.Model):
             return False
         if self.expired_at is None:
             return False
-        return self.expired_at < await get_now()
+        return _make_naive(self.expired_at) < await get_now()
 
     async def is_delivery_expired(self):
         """投件码是否过期（独立于收件箱过期）"""
@@ -147,7 +154,7 @@ class CollectionBox(models.Model):
             return False
         if self.delivery_expired_at is None:
             return False
-        return self.delivery_expired_at < await get_now()
+        return _make_naive(self.delivery_expired_at) < await get_now()
 
     async def is_retrieve_expired(self):
         """取件码是否过期（独立于收件箱过期）"""
@@ -155,7 +162,7 @@ class CollectionBox(models.Model):
             return False
         if self.retrieve_expired_at is None:
             return False
-        return self.retrieve_expired_at < await get_now()
+        return _make_naive(self.retrieve_expired_at) < await get_now()
 
 
 class CollectionFile(models.Model):
@@ -166,6 +173,18 @@ class CollectionFile(models.Model):
     uploader_name = fields.CharField(max_length=50, default="", null=True)
     uploader_ip = fields.CharField(max_length=45, default="")
     status = fields.CharField(max_length=20, default="uploading")
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+
+class ActivityLog(models.Model):
+    """活动日志模型"""
+    id = fields.IntField(pk=True)
+    action = fields.CharField(max_length=50, index=True)
+    target_type = fields.CharField(max_length=50, null=True)
+    target_id = fields.IntField(null=True)
+    user_ip = fields.CharField(max_length=45, default="")
+    user_agent = fields.TextField(null=True)
+    detail = fields.JSONField(null=True)
     created_at = fields.DatetimeField(auto_now_add=True)
 
 

@@ -31,7 +31,7 @@ from apps.base.utils import (
 from core.response import APIResponse
 from core.settings import settings
 from core.storage import storages, FileStorageInterface, create_zip_stream
-from core.utils import get_select_token, get_now, sanitize_filename, verify_select_token, hash_password
+from core.utils import get_select_token, get_now, sanitize_filename, verify_select_token, hash_password, escape_html_text
 from core.websocket import ws_manager
 from core.tasks import CollectionEvents
 
@@ -92,8 +92,17 @@ class FileUploadService:
 async def validate_file_size(file: UploadFile, max_size: int) -> int:
     size = file.size
     if size is None:
-        await file.seek(0, 2)  # type: ignore[arg-type]
-        size = file.file.tell()
+        # 流式上传未提供 Content-Length，使用分块读取累加，限制最大读取量
+        max_read = max_size + 1024 * 1024  # 允许超过限制 1MB 用于报错
+        size = 0
+        chunk_size = 64 * 1024  # 64KB 分块
+        while True:
+            chunk = await file.read(chunk_size)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_read:
+                break
         await file.seek(0)
     if size > max_size:
         max_size_mb = max_size / (1024 * 1024)
@@ -133,9 +142,11 @@ async def share_text(
     expired_at, expired_count, used_count, code = await get_expire_info(
         expire_value, expire_style
     )
+    # 对文本内容进行 HTML 转义，防止 XSS 攻击
+    safe_text = escape_html_text(text)
     await create_file_code(
         code=code,
-        text=text,
+        text=safe_text,
         expired_at=expired_at,
         expired_count=expired_count,
         used_count=used_count,
@@ -1068,8 +1079,8 @@ async def download_zip(code: str, ip: str = Depends(ip_limit["error"])):
 collection_api = APIRouter(prefix="/collection", tags=["收件箱"])
 
 
-def _generate_code(length: int = 6) -> str:
-    """生成密码学安全的随机码"""
+def _generate_code(length: int = 8) -> str:
+    """生成密码学安全的随机码（默认8位）"""
     import secrets
     import string
     chars = string.ascii_uppercase + string.digits
@@ -1078,16 +1089,16 @@ def _generate_code(length: int = 6) -> str:
 
 import re
 
-_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
+_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6,8}$")
 
 
 def _validate_code(code: str) -> str:
-    """验证码格式：6位大写字母+数字，自动转大写"""
+    """验证码格式：6-8位大写字母+数字，自动转大写"""
     if not code:
         raise HTTPException(status_code=400, detail="码不能为空")
     code = code.strip().upper()
     if not _CODE_PATTERN.match(code):
-        raise HTTPException(status_code=400, detail="码格式错误，必须为6位大写字母和数字")
+        raise HTTPException(status_code=400, detail="码格式错误，必须为6-8位大写字母和数字")
     return code
 
 
