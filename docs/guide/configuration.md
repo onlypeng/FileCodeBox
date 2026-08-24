@@ -19,10 +19,12 @@ FileCodeBox 支持两种配置方式：
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `name` | string | `文件快递柜 - FileCodeBox` | 站点名称，显示在页面标题和导航栏 |
+| `name` | string | `驿码 - FileCodeBox` | 站点名称，显示在页面标题和导航栏 |
 | `description` | string | `开箱即用的文件快传系统` | 站点描述，用于 SEO |
-| `keywords` | string | `FileCodeBox, 文件快递柜...` | 站点关键词，用于 SEO |
-| `port` | int | `12345` | 服务监听端口 |
+| `keywords` | string | `FileCodeBox, 驿码...` | 站点关键词，用于 SEO |
+| `serverHost` | string | `0.0.0.0` | 服务监听地址 |
+| `serverPort` | int | `12345` | 服务监听端口 |
+| `serverWorkers` | int | `1` | 工作进程数（建议设为 CPU 核心数） |
 
 ### 通知设置
 
@@ -122,7 +124,7 @@ FileCodeBox 支持两种配置方式：
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `errorMinute` | int | `1` | 错误限制的时间窗口（分钟） |
-| `errorCount` | int | `1` | 在时间窗口内允许的最大错误次数 |
+| `errorCount` | int | `10` | 在时间窗口内允许的最大错误次数 |
 
 此设置用于防止暴力破解提取码。
 
@@ -143,6 +145,50 @@ FileCodeBox 支持两种配置方式：
 - `opendal` - OpenDAL 存储
 
 详细的存储配置请参考 [存储配置](/guide/storage)。
+
+## 多文件与收件箱设置
+
+### 多文件分享
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `maxMultiFileCount` | int | `20` | 多文件分享单次数量上限 |
+| `maxSendFiles` | int | `20` | 发件时文件数量上限 |
+
+### 收件箱（文件收集）
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `maxCollectionFiles` | int | `100` | 收件箱最大文件数上限 |
+| `collectionDefaultMaxFiles` | int | `20` | 创建收件箱默认最大文件数 |
+| `collectionDefaultExpireDays` | int | `7` | 创建收件箱默认有效期（天） |
+
+## 实时通信设置
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `directRelayEnabled` | int | `1` | 直连快传服务器中转开关（1=开启，0=关闭） |
+| `directRelaySpeedLimit` | int | `0` | 服务器中转限速（KB/s，0 为不限速） |
+| `directTurnServers` | list | `[]` | WebRTC TURN 服务器列表，用于对称 NAT 下 P2P 失败时兜底直连 |
+
+TURN 服务器配置格式：
+
+```json
+[
+  {
+    "urls": "turn:host:3478?transport=udp",
+    "username": "xxx",
+    "credential": "yyy"
+  }
+]
+```
+
+## 网络安全设置
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `trustedProxies` | string | `""` | 可信代理 IP（逗号分隔），部署在反向代理之后时配置 |
+| `cors_origins` | string | `http://localhost:5173,...` | CORS 白名单（逗号分隔）；生产同源部署可留空禁用 |
 
 ## 配置示例
 
@@ -168,7 +214,7 @@ FileCodeBox 支持两种配置方式：
 
 ```python
 {
-    "name": "公共文件快递柜",
+    "name": "公共驿码服务",
     "uploadSize": 10485760,        # 10MB
     "uploadMinute": 1,             # 1分钟
     "uploadCount": 5,              # 最多5次

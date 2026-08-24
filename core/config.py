@@ -11,7 +11,7 @@ def _sync_ip_limits() -> None:
     ip_limit["error"].minutes = settings.errorMinute
     ip_limit["error"].count = settings.errorCount
     ip_limit["upload"].minutes = settings.uploadMinute
-    ip_limit["upload"].count = settings.uploadCount
+    ip_limit["upload"].count = settings.uploadRateLimitCount
 
 
 async def refresh_settings() -> None:

@@ -1,19 +1,17 @@
 # 管理面板
 
-FileCodeBox 提供了功能完善的管理面板，让管理员可以方便地管理文件、查看系统状态和修改配置。本文档介绍管理面板的各项功能和使用方法。
+FileCodeBox 提供了功能完善的管理面板，让管理员可以方便地管理文件、收件箱、直连房间和修改系统配置。本文档介绍管理面板的各项功能和使用方法。
 
 ## 访问管理面板
 
 ### 登录方式
 
-管理面板位于 `/admin` 路径。访问方式：
-
-1. 在浏览器中访问 `http://your-domain.com/admin`
-2. 输入管理员密码（`admin_token` 配置项的值）
+1. 在浏览器中访问 `http://your-domain.com/#/admin`（或 `/#/login`）
+2. 输入管理员口令（`admin_token` 配置项的值）
 3. 点击登录按钮
 
 ::: tip 提示
-默认管理员密码是 `FileCodeBox2023`。请务必在生产环境中修改此密码，详见 [安全设置](/guide/security)。
+默认管理员口令是 `FileCodeBox2023`。请务必在生产环境中修改此口令，详见 [安全设置](/guide/security)。
 :::
 
 ### 显示管理入口
@@ -25,7 +23,7 @@ FileCodeBox 提供了功能完善的管理面板，让管理员可以方便地�
 | `showAdminAddr` | int | `0` | 是否在首页显示管理入口（1=显示，0=隐藏） |
 
 ::: warning 安全建议
-在公开服务中，建议保持 `showAdminAddr` 为 `0`，通过直接访问 `/admin` 路径进入管理面板，减少被恶意扫描的风险。
+在公开服务中，建议保持 `showAdminAddr` 为 `0`，通过直接访问 `/#/admin` 路径进入管理面板，减少被恶意扫描的风险。
 :::
 
 ### 认证机制
@@ -34,7 +32,9 @@ FileCodeBox 提供了功能完善的管理面板，让管理员可以方便地�
 
 1. 登录成功后，服务器返回一个包含管理员身份的 Token
 2. 后续请求通过 `Authorization: Bearer <token>` 头部携带 Token
-3. Token 用于验证管理员身份，确保只有授权用户可以访问管理功能
+3. Token 默认有效期为 30 天
+
+管理员口令以 PBKDF2 哈希存储，非明文。可通过设置 `JWT_SECRET` 环境变量固定 Token 签名密钥（留空则从管理员口令派生）。
 
 ## 仪表盘
 
@@ -46,60 +46,34 @@ FileCodeBox 提供了功能完善的管理面板，让管理员可以方便地�
 
 | 指标 | 说明 |
 |------|------|
-| **文件总数** (`totalFiles`) | 系统中存储的文件总数量 |
-| **存储使用量** (`storageUsed`) | 所有文件占用的总存储空间（字节） |
-| **系统运行时间** (`sysUptime`) | 系统首次启动的时间 |
-| **昨日上传数** (`yesterdayCount`) | 昨天一整天上传的文件数量 |
-| **昨日上传量** (`yesterdaySize`) | 昨天上传文件的总大小（字节） |
-| **今日上传数** (`todayCount`) | 今天到目前为止上传的文件数量 |
-| **今日上传量** (`todaySize`) | 今天上传文件的总大小（字节） |
+| **总文件数** (`totalFiles`) | 系统中已分享的文件总数量 |
+| **存储空间** (`storageUsed`) | 所有文件占用的总存储空间（字节） |
+| **运行时间** (`sysUptime`) | 系统启动时间戳 |
+| **昨日/今日分享** | 前一天/当天分享的数量与容量 |
+| **收件箱统计** | 收件箱总数与有效数 |
+| **投递统计** | 累计投递、今日投递及容量 |
 
-### 指标说明
+### 文件健康与存储策略
 
-- **文件总数**：包括所有未过期的文件和文本分享
-- **存储使用量**：显示实际文件占用的存储空间，不包括数据库等系统文件
-- **昨日/今日统计**：基于文件创建时间计算，用于了解系统使用趋势
-
-::: tip 提示
-存储使用量显示的是字节数。例如 `10485760` 表示约 10MB。
-:::
+- **文件健康度**：基于真实文件记录统计有效、过期和类型分布，可在文件管理中清理过期文件。
+- **存储与上传策略**：展示当前存储后端、单文件上限、游客上传开关、最长保存时间等配置对上传链路的影响。
 
 ## 文件管理
 
 ### 文件列表
 
-文件管理页面展示系统中所有已分享的文件，支持分页浏览和搜索。
+文件管理页面展示系统中所有已分享的文件（不包含收件箱中的投递文件），支持分页浏览和搜索。
 
 **列表信息包括：**
-- 文件 ID
-- 提取码（code）
-- 文件名前缀（prefix）
-- 文件后缀（suffix）
-- 文件大小
-- 创建时间
-- 过期时间
-- 剩余下载次数
+- 提取码（code）、文件名、文件大小
+- 创建时间、过期时间、剩余下载次数
+- 多文件分享的子文件明细（`file_items`）
 
 ### 搜索文件
 
-使用搜索功能可以快速找到特定文件：
-
 1. 在搜索框中输入关键词
-2. 系统会根据文件名前缀（prefix）进行模糊匹配
+2. 系统根据文件名进行模糊匹配（匹配 `prefix` 字段）
 3. 搜索结果实时更新
-
-**搜索示例：**
-- 输入 `report` 可以找到所有文件名包含 "report" 的文件
-- 输入 `.pdf` 可以找到所有 PDF 文件（如果文件名包含此字符串）
-
-### 分页浏览
-
-文件列表支持分页显示：
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `page` | `1` | 当前页码 |
-| `size` | `10` | 每页显示数量 |
 
 ### 删除文件
 
@@ -118,83 +92,39 @@ FileCodeBox 提供了功能完善的管理面板，让管理员可以方便地�
 2. 然后从数据库中删除文件记录
 3. 删除后，对应的提取码将失效
 
-### 下载文件
+## 收件箱管理
 
-管理员可以直接下载任意文件：
+收件箱（文件收集）管理页面展示所有收件箱：
 
-1. 在文件列表中找到目标文件
-2. 点击下载按钮
-3. 文件将通过浏览器下载
+- 标题、管理码/投件码/取件码
+- 最大文件数与已投递文件数
+- 收件箱、投件码、取件码各自的过期时间与过期状态
+- 创建时间
 
-对于文本分享，系统会直接返回文本内容而不是下载文件。
+支持的操作：
 
-### 修改文件信息
+| 操作 | 说明 |
+|------|------|
+| **查看文件列表** | 查看收件箱中已投递的文件（文件名、大小、投递者、状态、时间） |
+| **删除收件箱** | 删除收件箱及其关联的所有文件（不可恢复） |
 
-管理员可以修改已分享文件的部分信息：
-
-| 可修改字段 | 说明 |
-|------------|------|
-| `code` | 提取码（必须唯一，不能与其他文件重复） |
-| `prefix` | 文件名前缀 |
-| `suffix` | 文件后缀名 |
-| `expired_at` | 过期时间 |
-| `expired_count` | 剩余下载次数 |
-
-**修改提取码：**
-```
-原提取码：abc123
-新提取码：myfile2024
-```
-
-::: warning 注意
-修改提取码时，系统会检查新提取码是否已被使用。如果已存在相同的提取码，修改将失败。
+::: danger 警告
+删除收件箱会同时删除其中所有已投递的文件，操作不可恢复！
 :::
 
-## 本地文件管理
+## 直连快传房间管理
 
-除了管理已分享的文件，管理面板还提供了本地文件管理功能，用于管理 `data/local` 目录中的文件。
+直连快传房间管理页面展示所有房间：
 
-### 查看本地文件
+- 房间码、标题、最大成员数
+- 当前在线人数、消息数
+- 过期时间与过期状态
 
-本地文件列表显示 `data/local` 目录中的所有文件：
+支持的操作：
 
-| 信息 | 说明 |
+| 操作 | 说明 |
 |------|------|
-| 文件名 | 文件的完整名称 |
-| 创建时间 | 文件的创建时间 |
-| 文件大小 | 文件大小（字节） |
-
-### 分享本地文件
-
-可以将本地文件快速分享：
-
-1. 在本地文件列表中选择要分享的文件
-2. 设置过期方式和过期值
-3. 点击分享按钮
-4. 系统生成提取码
-
-**分享参数：**
-
-| 参数 | 说明 |
-|------|------|
-| `filename` | 要分享的文件名 |
-| `expire_style` | 过期方式（day/hour/minute/forever/count） |
-| `expire_value` | 过期值（天数/小时数/分钟数/下载次数） |
-
-### 删除本地文件
-
-可以删除 `data/local` 目录中的文件：
-
-1. 在本地文件列表中找到要删除的文件
-2. 点击删除按钮
-3. 确认删除
-
-::: tip 使用场景
-本地文件管理功能适用于：
-- 批量上传文件到服务器后进行分享
-- 管理通过其他方式上传到服务器的文件
-- 清理不需要的本地文件
-:::
+| **删除房间** | 断开该房间所有在线 WebSocket 连接并删除房间及消息记录 |
 
 ## 系统设置
 
@@ -202,11 +132,12 @@ FileCodeBox 提供了功能完善的管理面板，让管理员可以方便地�
 
 在系统设置页面可以查看当前所有配置项的值。配置项按类别分组显示：
 
-- 基础设置（站点名称、描述等）
-- 上传设置（文件大小限制、频率限制等）
-- 存储设置（存储类型、路径等）
-- 主题设置（主题选择、透明度等）
-- 安全设置（管理员密码、错误限制等）
+- 基础设置（站点名称、描述、通知等）
+- 上传设置（文件大小限制、频率限制、分片开关等）
+- 存储设置（存储类型、路径及各存储后端凭据）
+- 主题设置（主题选择、透明度、背景图）
+- 安全设置（管理员口令、错误限制、可信代理、CORS）
+- 实时通信设置（直连中转开关、限速、TURN 服务器）
 
 ### 修改配置
 
@@ -224,19 +155,23 @@ FileCodeBox 提供了功能完善的管理面板，让管理员可以方便地�
 | 基础设置 | `name`, `description`, `keywords`, `notify_title`, `notify_content` |
 | 上传设置 | `uploadSize`, `uploadMinute`, `uploadCount`, `openUpload`, `enableChunk` |
 | 过期设置 | `expireStyle`, `max_save_seconds` |
+| 多文件/收件箱 | `maxSendFiles`, `maxMultiFileCount`, `maxCollectionFiles` |
 | 主题设置 | `themesSelect`, `opacity`, `background` |
 | 安全设置 | `admin_token`, `showAdminAddr`, `errorMinute`, `errorCount` |
 | 存储设置 | `file_storage`, `storage_path` 及各存储后端的配置 |
+| 网络设置 | `trustedProxies`, `cors_origins` |
+| 实时通信 | `directRelayEnabled`, `directRelaySpeedLimit`, `directTurnServers` |
 
 ::: warning 注意
-- `admin_token`（管理员密码）不能设置为空
+- `admin_token`（管理员口令）留空或保持脱敏占位符 `******` 表示不修改
+- 敏感凭据（S3/OneDrive/WebDAV 等）在界面中脱敏展示，留空表示不修改，保存时会加密存储
 - `themesChoices`（主题列表）不可通过管理面板修改
 - 修改存储设置后，已有文件不会自动迁移
 :::
 
 ### 配置生效
 
-配置修改后立即生效，无需重启服务。配置保存在数据库中，重启后仍然有效。
+配置修改后立即生效（最多 5 秒缓存延迟），无需重启服务。配置保存在数据库中，重启后仍然有效。
 
 **配置存储位置：**
 - 数据库：`data/filecodebox.db`
@@ -263,6 +198,7 @@ Content-Type: application/json
 ```json
 {
     "code": 200,
+    "message": "ok",
     "detail": {
         "token": "eyJhbGciOiJIUzI1NiIs...",
         "token_type": "Bearer"
@@ -297,55 +233,38 @@ Content-Type: application/json
 }
 ```
 
-**下载文件**
+### 收件箱管理接口
+
+**获取收件箱列表**
 ```
-GET /admin/file/download?id=123
+GET /admin/collection/list?page=1&size=10&keyword=
 Authorization: Bearer <token>
 ```
 
-**修改文件信息**
+**获取收件箱文件列表**
 ```
-PATCH /admin/file/update
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{
-    "id": 123,
-    "code": "newcode",
-    "expired_at": "2024-12-31T23:59:59"
-}
-```
-
-### 本地文件接口
-
-**获取本地文件列表**
-```
-GET /admin/local/lists
+GET /admin/collection/{collection_id}/files
 Authorization: Bearer <token>
 ```
 
-**删除本地文件**
+**删除收件箱**
 ```
-DELETE /admin/local/delete
+DELETE /admin/collection/{collection_id}
 Authorization: Bearer <token>
-Content-Type: application/json
-
-{
-    "filename": "example.txt"
-}
 ```
 
-**分享本地文件**
+### 直连快传房间接口
+
+**获取房间列表**
 ```
-POST /admin/local/share
+GET /admin/direct/room/list?page=1&size=10&keyword=
 Authorization: Bearer <token>
-Content-Type: application/json
+```
 
-{
-    "filename": "example.txt",
-    "expire_style": "day",
-    "expire_value": 7
-}
+**删除房间**
+```
+DELETE /admin/direct/room/{room_id}
+Authorization: Bearer <token>
 ```
 
 ### 配置接口
@@ -363,28 +282,27 @@ Authorization: Bearer <token>
 Content-Type: application/json
 
 {
-    "admin_token": "new-password",
     "uploadSize": 52428800
 }
 ```
 
 ## 常见问题
 
-### 忘记管理员密码
+### 忘记管理员口令
 
-如果忘记了管理员密码，可以通过以下方式重置：
+如果忘记了管理员口令，可以通过以下方式重置：
 
 1. 停止 FileCodeBox 服务
 2. 使用 SQLite 工具打开 `data/filecodebox.db`
 3. 查询 `keyvalue` 表中 `key='settings'` 的记录
-4. 修改 JSON 中的 `admin_token` 值
+4. 修改 JSON 中的 `admin_token` 值（需为 PBKDF2 哈希格式，或直接修改为明文后由系统在下次启动时自动迁移）
 5. 重启服务
 
 ```sql
 -- 查看当前配置
 SELECT * FROM keyvalue WHERE key = 'settings';
 
--- 或者删除配置，恢复默认密码
+-- 或者删除配置，恢复默认口令
 DELETE FROM keyvalue WHERE key = 'settings';
 ```
 
@@ -401,7 +319,7 @@ DELETE FROM keyvalue WHERE key = 'settings';
 如果修改配置后没有生效：
 
 1. 检查是否点击了保存按钮
-2. 刷新页面查看配置是否已保存
+2. 稍等几秒（配置有 5 秒缓存）后刷新页面
 3. 检查浏览器控制台是否有错误信息
 4. 确认配置值的格式是否正确（如数字类型不要输入字符串）
 

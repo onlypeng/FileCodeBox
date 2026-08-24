@@ -1,0 +1,64 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../FileCodeBoxFronted"
+		}
+	],
+	"settings": {},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": [
+			{
+				"name": "Python Debugger: FastAPI",
+				"type": "debugpy",
+				"request": "launch",
+				"module": "uvicorn",
+				"args": [
+					"main:app",
+					"--host",
+					"0.0.0.0",
+					"--port",
+					"12345",
+					"--reload"
+				],
+				"python": "/home/peng/Documents/trae_projects/FileCodeBox/.venv/bin/python",
+				"cwd": "${workspaceFolder:FileCodeBox}",
+				"jinja": true,
+				"justMyCode": false,
+				"subProcess": true,
+				"console": "integratedTerminal",
+				"env": {
+					"PYTHONUNBUFFERED": "1"
+				}
+			},
+			{
+				"name": "前端 Vite Dev Server",
+				"type": "node",
+				"request": "launch",
+				"runtimeExecutable": "npm",
+				"runtimeArgs": [
+					"run",
+					"dev"
+				],
+				"cwd": "${workspaceFolder:FileCodeBoxFronted}",
+				"console": "integratedTerminal",
+				"internalConsoleOptions": "neverOpen",
+				"autoAttachChildProcesses": true,
+				"restart": true
+			}
+		],
+		"compounds": [
+			{
+				"name": "前后端同时启动",
+				"configurations": [
+					"Python Debugger: FastAPI",
+					"前端 Vite Dev Server"
+				],
+				"stopAll": true
+			}
+		]
+	}
+}

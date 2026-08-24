@@ -6,18 +6,46 @@ import asyncio
 import datetime
 import logging
 import os
+from typing import Optional
 
 from tortoise.expressions import Q
 
-from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFile
+from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFile, Room
 from apps.base.utils import ip_limit, get_chunk_file_path_name
 from core.config import refresh_settings
 from core.settings import settings, data_root
 from core.storage import FileStorageInterface, storages
 from core.utils import get_now
+from core.websocket import ws_manager
+
+
+async def _retention_delta() -> Optional[datetime.timedelta]:
+    """过期保存时间 → 宽限时长；forever/无效配置返回 None 表示不自动清理。"""
+    style = getattr(settings, "expiredRetentionStyle", "forever")
+    value = int(getattr(settings, "expiredRetentionValue", 0) or 0)
+    if style == "forever" or value <= 0:
+        return None
+    units = {"day": 86400, "hour": 3600, "minute": 60}
+    seconds = value * units.get(style, 0)
+    if seconds <= 0:
+        return None
+    return datetime.timedelta(seconds=seconds)
+
+
+async def _expired_point(obj) -> Optional[datetime.datetime]:
+    """记录/收件箱/房间的过期时间点：时间型取 expired_at；
+    次数型（count）无绝对时间时按创建时间兜底。"""
+    if getattr(obj, "expired_at", None) is not None:
+        return obj.expired_at
+    return getattr(obj, "created_at", None)
 
 
 async def delete_expire_files():
+    """清理过期文件/分享记录（含文件实体）
+
+    过期判定：时间型 expired_at 到期；次数型（count）次数用尽。
+    过期后再保留"过期保存时间"宽限，到期由本任务删除记录与存储文件。
+    """
     while True:
         try:
             await refresh_settings()
@@ -29,10 +57,23 @@ async def delete_expire_files():
                         os.rmdir(root)
             await ip_limit["error"].remove_expired_ip()
             await ip_limit["upload"].remove_expired_ip()
+            retention = await _retention_delta()
+            now = await get_now()
+            # 已过期的记录：次数型（expired_count >= 0 且耗尽）或时间型（expired_at 到期）。
+            # 注意 count（按次）型文件的 expired_at 为创建后 365 天的兜底时间，不得按时间误删——
+            # 只有次数真正用尽（expired_count = 0）才算过期。
             expire_data = await FileCodes.filter(
-                Q(expired_at__isnull=False, expired_at__lt=await get_now()) | Q(expired_count=0)
-            ).exclude(expired_count=-1, expired_at__isnull=True).all()
+                Q(expired_count=0)
+                | (
+                    Q(expired_count__lt=0)
+                    & Q(expired_at__isnull=False)
+                    & Q(expired_at__lt=now)
+                )
+            ).all()
             for exp in expire_data:
+                expired_point = await _expired_point(exp)
+                if retention is not None and expired_point is not None and expired_point + retention > now:
+                    continue
                 try:
                     await file_storage.delete_file(exp)
                 except Exception as e:
@@ -132,7 +173,10 @@ CollectionEvents.on("file.delivery_failed", _log_delivery_failed)
 
 
 async def clean_expired_collections():
-    """定期清理过期收件箱（仅清理超时 uploading 状态的投递记录）"""
+    """定期清理过期收件箱：
+    - 超时 uploading 状态的投递记录标记为失败
+    - 已过期（整箱过期）且超过"过期保存时间"宽限的收件箱，删除整箱及其全部文件
+    """
     while True:
         try:
             await refresh_settings()
@@ -148,7 +192,79 @@ async def clean_expired_collections():
                 await sf.save()
                 logging.info(f"投递记录标记为失败: id={sf.id}")
 
+            # 整箱过期 + 宽限到期 → 删除收件箱（含全部文件与记录）
+            retention = await _retention_delta()
+            if retention is not None:
+                boxes = await CollectionBox.all().exclude(expire_style="forever")
+                for box in boxes:
+                    if not await box.is_expired():
+                        continue
+                    expired_point = await _expired_point(box)
+                    if expired_point is None or expired_point + retention > now:
+                        continue
+                    await _delete_collection_with_files(box)
+                    logging.info(f"已清理过期收件箱: code={box.collection_code}")
+
         except Exception as e:
             logging.error(f"清理过期收件箱异常: {e}")
         finally:
             await asyncio.sleep(600)
+
+
+async def _delete_collection_with_files(box) -> None:
+    """删除收件箱及其全部文件（文件实体 + 关联记录）"""
+    from core.storage import FileStorageInterface, storages
+    file_storage: FileStorageInterface = storages[settings.file_storage]()
+    collection_files = await CollectionFile.filter(collection=box).all()
+    for cf in collection_files:
+        if cf.file_code_id:
+            file_code = await FileCodes.filter(id=cf.file_code_id).first()
+            if file_code:
+                try:
+                    await file_storage.delete_file(file_code)
+                except Exception as e:
+                    logging.error(f"删除收件箱文件失败 code={file_code.code}: {e}")
+                try:
+                    await file_code.delete()
+                except Exception as e:
+                    logging.error(f"删除收件箱文件记录失败 code={file_code.code}: {e}")
+    await box.delete()
+
+
+async def clean_expired_rooms():
+    """定期清理过期实时房间（统一直连快传房间）
+    count 模式：剩余次数扣尽即视为过期（由 is_expired 统一判断）；
+    过期后再保留"过期保存时间"宽限，到期删除。"""
+    while True:
+        try:
+            await refresh_settings()
+            now = await get_now()
+            retention = await _retention_delta()
+
+            # 逐房间判断过期（forever 永不过期，count 按剩余次数，其余按时间）
+            rooms = await Room.all().exclude(expire_style="forever")
+            for room in rooms:
+                if not await room.is_expired():
+                    continue
+                if retention is not None:
+                    expired_point = await _expired_point(room)
+                    if expired_point is None or expired_point + retention > now:
+                        continue
+                await room.delete()
+                logging.info(f"已清理过期房间: code={room.room_code}")
+
+        except Exception as e:
+            logging.error(f"清理过期房间异常: {e}")
+        finally:
+            await asyncio.sleep(600)
+
+
+async def sweep_direct_connections():
+    """定期心跳探测直连房间连接，剔除断开但未清理的连接（防止在线人数虚高）"""
+    while True:
+        try:
+            await ws_manager.sweep_rooms()
+        except Exception as e:
+            logging.error(f"清扫直连连接异常: {e}")
+        finally:
+            await asyncio.sleep(20)

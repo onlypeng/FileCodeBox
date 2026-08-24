@@ -2,6 +2,11 @@ version: "3"
 services:
   file-code-box:
     image: lanol/filecodebox:latest
+    environment:
+      # 安全加固：JWT 签名密钥与敏感配置加密密钥必须设置强随机值。
+      # 未设置时 compose 会直接拒绝启动（:? 强制展开），避免回退到默认口令派生的弱密钥。
+      - JWT_SECRET=${JWT_SECRET:?请在 .env 中设置 JWT_SECRET（openssl rand -hex 32）}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:?请在 .env 中设置 ENCRYPTION_KEY（openssl rand -hex 32）}
     volumes:
       - fcb-data:/app/data:rw
     restart: unless-stopped

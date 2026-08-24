@@ -47,6 +47,8 @@ export default defineConfig({
                 { text: '文件上传', link: '/guide/upload' },
                 { text: '文件分享', link: '/guide/share' },
                 { text: '文件管理', link: '/guide/management' },
+                { text: '收件箱（文件收集）', link: '/guide/collection' },
+                { text: '聊天与直连传输', link: '/guide/realtime' },
               ],
             },
             {

@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: "FileCodeBox"
-  text: "文件快递柜"
-  tagline: 匿名口令分享文本，文件，像拿快递一样取文件
+  text: "驿码"
+  tagline: 匿名口令分享文本与文件，无需注册，输入口令即可分享与取件
   image:
     src: /logo_small.png
     alt: FileCodeBox

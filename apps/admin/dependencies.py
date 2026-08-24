@@ -2,15 +2,28 @@
 # @Author  : Lan
 # @File    : depends.py
 # @Software: PyCharm
-from fastapi import Header, HTTPException, Depends
+from fastapi import Header, HTTPException
 from fastapi.requests import Request
 import base64
 import hmac
 import json
+import os
 import secrets
 import time
-from core.settings import settings
 from apps.admin.services import FileService, ConfigService
+from core.settings import settings
+
+
+def _get_jwt_secret() -> str:
+    """
+    获取 JWT 签名密钥。
+    优先使用环境变量 JWT_SECRET；未配置时回退到 admin_token（向后兼容，但生产环境必须配置）。
+    注意：配置 JWT_SECRET 后，修改管理员密码不再导致已签发 Token 失效。
+    """
+    env_secret = os.getenv("JWT_SECRET")
+    if env_secret:
+        return env_secret
+    return settings.admin_token
 
 
 def create_token(data: dict, expires_in: int = 3600 * 24 * 30) -> str:
@@ -32,7 +45,7 @@ def create_token(data: dict, expires_in: int = 3600 * 24 * 30) -> str:
     ).decode().rstrip("=")
 
     signature = hmac.new(
-        settings.admin_token.encode(), f"{header}.{payload}".encode(), "sha256"
+        _get_jwt_secret().encode(), f"{header}.{payload}".encode(), "sha256"
     ).digest()
     signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
 
@@ -61,7 +74,7 @@ def verify_token(token: str) -> dict:
 
         # 验证签名
         expected_signature = hmac.new(
-            settings.admin_token.encode(),
+            _get_jwt_secret().encode(),
             f"{header_b64}.{payload_b64}".encode(),
             "sha256",
         ).digest()
@@ -95,8 +108,8 @@ def _require_admin_payload(authorization: str) -> dict:
     token = _extract_bearer_token(authorization)
     try:
         payload = verify_token(token)
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+    except ValueError:
+        raise HTTPException(status_code=401, detail="未授权或授权校验失败")
     if not payload.get("is_admin", False):
         raise HTTPException(status_code=401, detail="未授权或授权校验失败")
     return payload

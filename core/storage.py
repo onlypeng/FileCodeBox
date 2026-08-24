@@ -2,7 +2,6 @@
 # @Author  : Lan
 # @File    : storage.py
 # @Software: PyCharm
-import base64
 import hashlib
 import os
 import tempfile
@@ -23,7 +22,7 @@ from botocore.config import Config
 from fastapi import HTTPException, Response, UploadFile
 from core.response import APIResponse
 from core.settings import data_root, settings
-from apps.base.models import FileCodes, UploadChunk, FileItem, CollectionFile
+from apps.base.models import FileCodes, UploadChunk
 from core.utils import get_file_url, sanitize_filename
 from fastapi.responses import FileResponse, StreamingResponse
 
@@ -35,6 +34,7 @@ class FileStorageInterface:
         保存文件
         """
         raise NotImplementedError
+
 
     async def delete_file(self, file_code: FileCodes):
         """
@@ -154,6 +154,7 @@ class SystemFileStorage(FileStorageInterface):
         if not safe_save_path.parent.exists():
             safe_save_path.parent.mkdir(parents=True)
         await asyncio.to_thread(self._save, file.file, safe_save_path)
+
 
     async def delete_file(self, file_code: FileCodes):
         save_path = self.root_path / await file_code.get_file_path()
@@ -345,6 +346,7 @@ class S3FileStorage(FileStorageInterface):
                 ExtraArgs={"ContentType": file.content_type or "application/octet-stream"},
             )
 
+
     async def delete_file(self, file_code: FileCodes):
         async with self.session.client(
                 "s3",
@@ -430,8 +432,7 @@ class S3FileStorage(FileStorageInterface):
             raise HTTPException(status_code=503, detail="服务代理下载异常，请稍后再试")
 
     async def get_file_url(self, file_code: FileCodes):
-        if file_code.prefix == "文本分享":
-            return file_code.text
+        # 文本分享已合并为文件分享（.txt 落盘），统一按文件生成 URL
         if self.proxy:
             return await get_file_url(file_code.code)
         else:
@@ -751,13 +752,21 @@ class OneDriveFileStorage(FileStorageInterface):
             else:
                 raise e
 
+
     async def delete_file(self, file_code: FileCodes):
         await asyncio.to_thread(self._delete, await file_code.get_file_path())
 
     def _convert_link_to_download_link(self, link):
-        p1 = re.search(r"https://(.+)\.sharepoint\.com", link).group(1)
-        p2 = re.search(r"personal/(.+)/", link).group(1)
-        p3 = re.search(rf"{p2}/(.+)", link).group(1)
+        m1 = re.search(r"https://(.+)\.sharepoint\.com", link)
+        m2 = re.search(r"personal/(.+)/", link)
+        if not m1 or not m2:
+            raise ValueError(f"无法解析 OneDrive 分享链接: {link[:100]}")
+        p1 = m1.group(1)
+        p2 = m2.group(1)
+        m3 = re.search(rf"{p2}/(.+)", link)
+        if not m3:
+            raise ValueError(f"无法解析 OneDrive 分享链接: {link[:100]}")
+        p3 = m3.group(1)
         return f"https://{p1}.sharepoint.com/personal/{p2}/_layouts/52/download.aspx?share={p3}"
 
     def _get_file_url(self, save_path, name):
@@ -1002,6 +1011,7 @@ class OpenDALFileStorage(FileStorageInterface):
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
+
     async def delete_file(self, file_code: FileCodes):
         await self.operator.delete(await file_code.get_file_path())
 
@@ -1164,10 +1174,9 @@ class WebDAVFileStorage(FileStorageInterface):
                         # 创建目录
                         async with session.request("MKCOL", url) as mkcol_resp:
                             if mkcol_resp.status not in (200, 201, 409):
-                                content = await mkcol_resp.text()
                                 raise HTTPException(
-                                    status_code=mkcol_resp.status,
-                                    detail=f"目录创建失败: {content[:200]}",
+                                    status_code=503,
+                                    detail="WebDAV目录创建失败，请检查存储配置",
                                 )
 
     async def _is_dir_empty(self, dir_path: str) -> bool:
@@ -1229,14 +1238,14 @@ class WebDAVFileStorage(FileStorageInterface):
                         headers={"Content-Type": file.content_type or "application/octet-stream"}
                 ) as resp:
                     if resp.status not in (200, 201, 204):
-                        content = await resp.text()
                         raise HTTPException(
-                            status_code=resp.status,
-                            detail=f"文件上传失败: {content[:200]}",
+                            status_code=503,
+                            detail="WebDAV文件上传失败，请检查存储配置",
                         )
-        except aiohttp.ClientError as e:
-            raise HTTPException(
-                status_code=503, detail=f"WebDAV连接异常: {str(e)}")
+        except aiohttp.ClientError:
+            # 连接类错误不向客户端回显远程细节（避免泄露存储地址/凭据信息）
+            raise HTTPException(status_code=503, detail="WebDAV连接异常，请稍后再试")
+
 
     async def delete_file(self, file_code: FileCodes):
         """删除WebDAV文件及空目录"""
@@ -1247,18 +1256,16 @@ class WebDAVFileStorage(FileStorageInterface):
                 # 删除文件
                 async with session.delete(url) as resp:
                     if resp.status not in (200, 204, 404):
-                        content = await resp.text()
                         raise HTTPException(
-                            status_code=resp.status,
-                            detail=f"WebDAV删除失败: {content[:200]}",
+                            status_code=503,
+                            detail="WebDAV删除失败，请检查存储配置",
                         )
 
                 # 使用同一个 session 删除空目录
                 await self._delete_empty_dirs(file_path, session)
 
-        except aiohttp.ClientError as e:
-            raise HTTPException(
-                status_code=503, detail=f"WebDAV连接异常: {str(e)}")
+        except aiohttp.ClientError:
+            raise HTTPException(status_code=503, detail="WebDAV连接异常，请稍后再试")
 
     async def get_file_url(self, file_code: FileCodes):
         return await get_file_url(file_code.code)
@@ -1328,10 +1335,9 @@ class WebDAVFileStorage(FileStorageInterface):
         async with aiohttp.ClientSession(auth=self.auth) as session:
             async with session.put(chunk_url, data=chunk_data) as resp:
                 if resp.status not in (200, 201, 204):
-                    content = await resp.text()
                     raise HTTPException(
-                        status_code=resp.status,
-                        detail=f"分片上传失败: {content[:200]}"
+                        status_code=503,
+                        detail="WebDAV分片上传失败，请检查存储配置"
                     )
 
     async def merge_chunks(self, upload_id: str, chunk_info: UploadChunk, save_path: str) -> tuple[str, str]:
@@ -1391,10 +1397,9 @@ class WebDAVFileStorage(FileStorageInterface):
 
                 async with session.put(output_url, data=file_sender()) as resp:
                     if resp.status not in (200, 201, 204):
-                        content = await resp.text()
                         raise HTTPException(
-                            status_code=resp.status,
-                            detail=f"合并文件上传失败: {content[:200]}"
+                            status_code=503,
+                            detail="WebDAV合并文件上传失败，请检查存储配置"
                         )
         finally:
             # 清理临时文件
@@ -1506,10 +1511,12 @@ async def create_zip_stream(file_items: list) -> AsyncGenerator[bytes, None]:
                     continue
 
                 name = base_name
+                # 二次消毒，防止 ZIP 条目包含路径穿越（Zip Slip）
+                name = await sanitize_filename(name)
                 counter = 1
                 while name in used_names:
                     stem, ext = os.path.splitext(base_name)
-                    name = f"{stem}_{counter}{ext}"
+                    name = f"{await sanitize_filename(stem)}_{counter}{ext}"
                     counter += 1
                 used_names.add(name)
 

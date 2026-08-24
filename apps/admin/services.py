@@ -1,10 +1,7 @@
-import os
-import time
-
 from core.storage import FileStorageInterface, storages
 from core.settings import settings
 from core.config import _sync_ip_limits
-from apps.base.models import FileCodes, KeyValue, CollectionFile, file_codes_pydantic
+from apps.base.models import FileCodes, KeyValue
 from fastapi import HTTPException
 from core.utils import hash_password, is_password_hashed
 
@@ -14,26 +11,37 @@ class FileService:
         self.file_storage: FileStorageInterface = storages[settings.file_storage]()
 
     async def delete_file(self, file_id: int):
-        file_code = await FileCodes.get(id=file_id)
+        file_code = await FileCodes.filter(id=file_id).first()
+        if not file_code:
+            raise HTTPException(status_code=404, detail="文件不存在")
         await self.file_storage.delete_file(file_code)
         await file_code.delete()
 
-    async def list_files(self, page: int, size: int, keyword: str = ""):
-        offset = (page - 1) * size
-        # 获取所有属于收件箱的 FileCode ID
-        collection_file_ids = await CollectionFile.filter(
-            file_code_id__isnull=False
-        ).values_list("file_code_id", flat=True)
-        # 过滤掉 None 值并转为列表
-        exclude_ids = [fid for fid in collection_file_ids if fid is not None]
+    async def list_files(self, page: int, size: int, keyword: str = "", status: str = ""):
+        from core.utils import get_now, pagination
+        from tortoise.expressions import Q
 
-        # 查询文件时排除收件箱文件
-        query = FileCodes.filter(prefix__icontains=keyword)
-        if exclude_ids:
-            query = query.exclude(id__in=exclude_ids)
+        page, offset = pagination(page, size)
+        now = await get_now()
+        # 排除收件箱文件：用反向关联 JOIN 完成（collection_files 关联存在即排除），
+        # 避免每次分页请求全表加载 CollectionFile 的 file_code_id 列表到内存
+        query = FileCodes.exclude(collection_files__id__isnull=False).filter(prefix__icontains=keyword)
+
+        # 状态筛选（多选，逗号分隔：active=有效 / expired=已过期；两者都选=全部）
+        # 过期条件：时间过期（expired_at < now 且 非次数模式）或 次数用尽（次数模式且剩余 <= 0）
+        time_expired = Q(expired_at__lt=now, expired_count__lt=0)
+        count_expired = Q(expired_count__lte=0, expired_count__gte=0)
+        expired_q = time_expired | count_expired
+        statuses = [s for s in status.split(",") if s in ("active", "expired")]
+        if statuses and "active" not in statuses:
+            query = query.filter(expired_q)          # 仅 expired
+        elif statuses and "expired" not in statuses:
+            query = query.exclude(expired_q)         # 仅 active
+        # active+expired 或空 → 不过滤（全部）
 
         total = await query.count()
-        files = await query.limit(size).offset(offset)
+        # prefetch items 消除多文件子项列表的 N+1 查询
+        files = await query.limit(size).offset(offset).prefetch_related("items")
 
         result = []
         for f in files:
@@ -43,17 +51,20 @@ class FileService:
                 "prefix": f.prefix,
                 "suffix": f.suffix,
                 "size": f.size,
-                "text": f.text,
+                "remark": f.remark or None,  # 文本分享内容（备注字段）
+                "used_count": f.used_count,
                 "expired_at": f.expired_at.isoformat() if f.expired_at else None,
                 "expired_count": f.expired_count,
+                "expire_style": f.expire_style,
+                "expire_value": f.expire_value,
                 "created_at": f.created_at.isoformat() if f.created_at else None,
                 "is_multi_file": f.is_multi_file,
                 "file_count": 0,
                 "file_items": [],
             }
-            # 多文件分享，获取子文件列表
+            # 多文件分享，获取子文件列表（已预取，无需逐条查询）
             if f.is_multi_file:
-                items = await f.items.all().order_by("sort_order")
+                items = f.items or []
                 item["file_count"] = len(items)
                 item["file_items"] = [
                     {
@@ -79,45 +90,73 @@ class ConfigService:
         return config
 
     async def update_config(self, data: dict):
-        from core.utils import hash_password, is_password_hashed, encrypt_value, SENSITIVE_KEYS
-        admin_token = data.get("admin_token")
-        if admin_token is None or admin_token == "":
-            raise HTTPException(status_code=400, detail="管理员密码不能为空")
+        from core.utils import hash_password, is_password_hashed, encrypt_value, decrypt_value, is_encrypted, SENSITIVE_KEYS
 
-        if not is_password_hashed(admin_token):
+        # 读取现有配置，用于继承"脱敏占位符"对应的真实凭据
+        config_record = await KeyValue.filter(key="settings").first()
+        existing_config = config_record.value if config_record and config_record.value else {}
+
+        # 管理员密码：留空或占位符表示不修改（防止误操作改坏密码）
+        admin_token = data.get("admin_token")
+        if admin_token is None or str(admin_token).strip() == "" or admin_token == "******":
+            data.pop("admin_token", None)
+        elif not is_password_hashed(admin_token):
             data["admin_token"] = hash_password(admin_token)
 
         for key, value in data.items():
             if key not in settings.default_config:
                 continue
-            # 加密敏感字段
-            if key in SENSITIVE_KEYS and isinstance(value, str) and value and not value.startswith("enc:"):
+            # 跳过脱敏占位符/空值：继承数据库中的真实凭据（空值表示不修改）
+            if key in SENSITIVE_KEYS and (value == "******" or value == ""):
+                if key in existing_config:
+                    data[key] = existing_config[key]
+                else:
+                    data.pop(key, None)
+                continue
+            # 加密敏感字段（跳过已加密值）
+            if key in SENSITIVE_KEYS and isinstance(value, str) and value and not is_encrypted(value):
                 data[key] = encrypt_value(value)
             if key in [
                 "errorCount",
                 "errorMinute",
-                "max_save_seconds",
                 "maxCollectionFiles",
                 "maxSendFiles",
+                "maxTextLength",
                 "onedrive_proxy",
                 "openUpload",
                 "port",
                 "s3_proxy",
-                "uploadCount",
+                "uploadRateLimitCount",
                 "uploadMinute",
                 "uploadSize",
+                "directRelayEnabled",
+                "directRelaySpeedLimit",
+                "expiredRetentionValue",
             ]:
                 try:
                     data[key] = int(value)
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail=f"配置项 {key} 必须是整数")
+                # 限速/配额/时长类配置不允许负数
+                if data[key] < 0 and key in {
+                    "errorCount", "errorMinute", "maxCollectionFiles",
+                    "maxSendFiles", "maxTextLength", "uploadRateLimitCount", "uploadMinute",
+                    "uploadSize", "directRelaySpeedLimit", "expiredRetentionValue",
+                }:
+                    raise HTTPException(status_code=400, detail=f"配置项 {key} 不能为负数")
             elif key in ["opacity"]:
                 try:
                     data[key] = float(value)
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail=f"配置项 {key} 必须是数字")
 
-        await KeyValue.filter(key="settings").update(value=data)
+        await KeyValue.filter(key="settings").update(
+            value={**existing_config, **{k: v for k, v in data.items() if k in settings.default_config}}
+        )
         for k, v in data.items():
-            settings.__setattr__(k, v)
+            # 敏感字段运行时使用解密后的明文，避免写入密文到内存配置
+            if k in SENSITIVE_KEYS and is_encrypted(v):
+                settings.__setattr__(k, decrypt_value(v))
+            else:
+                settings.__setattr__(k, v)
         _sync_ip_limits()

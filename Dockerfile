@@ -39,18 +39,24 @@ COPY --from=frontend-builder /build/fronted-2023/dist ./themes/2023
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 环境变量配置
+# JWT_SECRET: 签名密钥，设置后修改管理员密码不会使已登录 Token 失效（留空则回退到管理员口令）
+# ENCRYPTION_KEY: 敏感配置（S3/WebDAV 等凭据）的加密密钥，强烈建议生产环境配置（留空则从管理员口令派生）
 ENV HOST="0.0.0.0" \
     PORT=12345 \
     WORKERS=1 \
-    LOG_LEVEL="info"
+    LOG_LEVEL="info" \
+    JWT_SECRET="" \
+    ENCRYPTION_KEY=""
 
 EXPOSE 12345
 
 # 生产环境启动命令
+# 注意：forwarded-allow-ips 仅信任回环地址的转发头，防止客户端伪造 X-Forwarded-For 绕过 IP 限流
+# 若部署在反向代理之后，请将代理地址加入 --forwarded-allow-ips 白名单
 CMD uvicorn main:app \
     --host $HOST \
     --port $PORT \
     --workers $WORKERS \
     --log-level $LOG_LEVEL \
     --proxy-headers \
-    --forwarded-allow-ips "*"
+    --forwarded-allow-ips "127.0.0.1"

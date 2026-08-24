@@ -151,7 +151,7 @@ curl -X POST "http://localhost:12345/admin/login" \
   -H "Content-Type: application/json" \
   -d '{"password": "FileCodeBox2023"}'
 
-# 返回: {"code":200,"msg":"success","detail":{"token":"xxx.xxx.xxx","token_type":"Bearer"}}
+# 返回: {"code":200,"message":"ok","detail":{"token":"xxx.xxx.xxx","token_type":"Bearer"}}
 
 # 2. 使用 token 上传文件
 curl -X POST "http://localhost:12345/share/file/" \

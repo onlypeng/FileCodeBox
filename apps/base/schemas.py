@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 
@@ -8,14 +8,15 @@ class SelectFileModel(BaseModel):
 
 class InitChunkUploadModel(BaseModel):
     file_name: str
-    chunk_size: int = 5 * 1024 * 1024
-    file_size: int
+    chunk_size: int = Field(default=5 * 1024 * 1024, gt=0)
+    file_size: int = Field(ge=0)
     file_hash: str
 
 
 class CompleteUploadModel(BaseModel):
     expire_value: int
     expire_style: str
+    remark: str = ""
 
 
 # 预签名上传相关模型
@@ -25,23 +26,18 @@ class PresignUploadInitRequest(BaseModel):
     file_size: int
     expire_value: int = 1
     expire_style: str = "day"
-
-
-class PresignUploadInitResponse(BaseModel):
-    """预签名上传初始化响应"""
-    upload_id: str
-    upload_url: str
-    mode: str  # "direct" 或 "proxy"
-    save_path: str
-    expires_in: int  # URL过期时间（秒）
+    remark: str = ""
 
 
 # 收件箱相关模型
 class CreateCollectionRequest(BaseModel):
-    """创建收件箱请求 - expire_style 模式"""
+    """创建收件箱请求 - expire_style 模式
+
+    注意：password 字段已废弃（从未被任何流程校验，前端也无入口设置），
+    创建时不再接收，避免给用户"已加密"的虚假安全感。存量 DB 中的值被忽略。
+    """
     title: str = ""
     description: Optional[str] = ""
-    password: Optional[str] = ""
     max_files: int = 20
     # 收件箱过期配置（创建后不可更改）
     expire_style: str = "day"
@@ -57,11 +53,6 @@ class CreateCollectionRequest(BaseModel):
     expire_days: Optional[int] = None
 
 
-class CollectionUploadRequest(BaseModel):
-    """收件箱投递请求（元数据部分通过Form）"""
-    uploader_name: Optional[str] = ""
-
-
 class UpdateCollectionConfigRequest(BaseModel):
     """更新收件箱配置请求 - 收件箱过期时间不可更改"""
     delivery_expire_style: Optional[str] = None
@@ -69,3 +60,24 @@ class UpdateCollectionConfigRequest(BaseModel):
     retrieve_expire_style: Optional[str] = None
     retrieve_expire_value: Optional[int] = None
     max_files: Optional[int] = None
+
+
+# 跨设备实时房间相关请求（统一为直连快传：聊天 + 文件 + P2P 媒体）
+class CreateRoomRequest(BaseModel):
+    """创建房间请求"""
+    title: str = ""
+    expire_style: str = "day"
+    expire_value: int = 1
+    # 人员上限（1~后台配置的 defaultMaxMembers；0/缺省用后台默认）
+    max_members: int = 0
+
+
+# 投递（delivery）分片上传
+class InitDeliveryChunkUploadRequest(BaseModel):
+    """投递分片上传初始化请求"""
+    delivery_code: str
+    uploader_name: str = ""
+    file_name: str
+    file_size: int = Field(ge=0)
+    chunk_size: int = Field(default=5 * 1024 * 1024, gt=0)
+    file_hash: str

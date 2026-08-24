@@ -1,6 +1,7 @@
 aioboto3==15.5.0
 aiohttp==3.13.3
 aiofiles==25.1.0
+cryptography==50.0.0
 fastapi==0.128.0
 pydantic==2.12.5
 uvicorn==0.40.0

@@ -11,9 +11,7 @@ from apps.base.dependencies import IPRateLimit
 from apps.base.models import FileCodes
 from core.settings import settings
 from core.utils import (
-    get_random_num,
     get_random_string,
-    max_save_times_desc,
     sanitize_filename,
     get_now,
 )
@@ -36,6 +34,9 @@ async def get_chunk_file_path_name(
 ) -> Tuple[str, str, str, str, str]:
     today = await get_now()
     storage_path = settings.storage_path.strip("/")
+    # 与 get_file_path_name 一致：文件名必须先净化，防止 ../ 等路径穿越
+    # （分片接口的 save_path 会参与本地存储合并/删除的文件路径拼接）
+    file_name = await sanitize_filename(unquote(file_name))
     base_path = f"share/data/{today.strftime('%Y/%m/%d')}/{upload_id}"
     path = f"{storage_path}/{base_path}" if storage_path else base_path
     prefix, suffix = os.path.splitext(file_name)
@@ -50,23 +51,12 @@ async def get_expire_info(
     now = await get_now()
     code = None
 
-    max_timedelta = (
-        datetime.timedelta(seconds=settings.max_save_seconds)
-        if settings.max_save_seconds > 0
-        else datetime.timedelta(days=7)
-    )
-    detail = (
-        await max_save_times_desc(settings.max_save_seconds)
-        if settings.max_save_seconds > 0
-        else "7天"
-    )
-    detail = f"限制最长时间为 {detail[0]}，可换用其他方式"
-
     expire_styles = {
         "day": lambda: now + datetime.timedelta(days=expire_value),
         "hour": lambda: now + datetime.timedelta(hours=expire_value),
         "minute": lambda: now + datetime.timedelta(minutes=expire_value),
-        "count": lambda: (now + datetime.timedelta(days=1), expire_value),
+        # 按次模式：无时间上限（次数用尽前永久有效），is_expired 仅按剩余次数判断
+        "count": lambda: (None, expire_value),
         "forever": lambda: (None, None),
     }
 
@@ -80,8 +70,6 @@ async def get_expire_info(
                 code = await get_random_code()
         else:
             expired_at = result
-        if expired_at and expired_at - now > max_timedelta:
-            raise HTTPException(status_code=403, detail=detail)
     else:
         expired_at = now + datetime.timedelta(days=1)
 
@@ -112,6 +100,6 @@ async def calculate_file_hash(file: UploadFile, chunk_size=1024 * 1024) -> str:
 
 
 ip_limit = {
-    "error": IPRateLimit(count=settings.errorCount, minutes=settings.errorMinute),
-    "upload": IPRateLimit(count=settings.uploadCount, minutes=settings.uploadMinute),
+    "error": IPRateLimit(count=settings.errorCount, minutes=settings.errorMinute, key="error"),
+    "upload": IPRateLimit(count=settings.uploadRateLimitCount, minutes=settings.uploadMinute, key="upload"),
 }
