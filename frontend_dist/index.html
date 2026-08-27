@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" href="/assets/logo_small.png" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0,minimum-scale=1.0,maximum-scale=1.0,user-scalable=no"
+  />
+  <meta name="description" content="{{description}}" />
+  <meta name="keywords" content="{{keywords}}" />
+  <meta name="generator" content="FileCodeBox2.2" />
+  <link rel="manifest" href="/assets/manifest.json" />
+  <meta name="github" content="https://github.com/vastsa/FileCodeBox" />
+  <title>{{title}}</title>
+  <script>
+    // 首帧前应用主题，防止切换/刷新时样式闪烁（FOUC）
+    (function () {
+      try {
+        var ALLOWED = ['light', 'dark', 'enterprise']
+        var id = null
+        var stored = localStorage.getItem('filecodebox:themeId')
+        if (stored && ALLOWED.indexOf(stored) !== -1) {
+          id = stored
+        } else {
+          // 用户未显式选择时，回退到本地缓存的站点默认主题
+          var cached = localStorage.getItem('config')
+          if (cached) {
+            try {
+              var config = JSON.parse(cached)
+              var siteTheme = config && config.spaTheme
+              if (typeof siteTheme === 'string') {
+                var key = siteTheme.indexOf('/') !== -1 ? siteTheme.split('/').pop() : siteTheme
+                if (ALLOWED.indexOf(key) !== -1) id = key
+              }
+            } catch (e) {}
+          }
+        }
+        id = id || 'light'
+        var el = document.documentElement
+        el.setAttribute('data-theme', id)
+        if (id === 'dark') el.classList.add('dark')
+      } catch (e) {}
+    })()
+  </script>
+  <script type="module" crossorigin src="/assets/index-BqKvWIg0.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-TJbuU1H8.css">
+</head>
+<body>
+<div id="app"></div>
+</body>
+</html>

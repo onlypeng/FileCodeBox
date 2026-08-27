@@ -39,11 +39,16 @@ async def lifespan(app: FastAPI):
     async with db_startup_lock():
         await load_config()
 
-    app.mount(
-        "/assets",
-        StaticFiles(directory=f"./{settings.themesSelect}/assets"),
-        name="assets",
-    )
+    # 静态资源：优先前端构建产物（frontend_dist/assets），缺失时回退主题模板 assets
+    frontend_dist = BASE_DIR / "frontend_dist"
+    if (frontend_dist / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")), name="assets")
+    else:
+        app.mount(
+            "/assets",
+            StaticFiles(directory=f"./{settings.themesSelect}/assets"),
+            name="assets",
+        )
 
     # 启动后台任务
     task = asyncio.create_task(delete_expire_files())
@@ -235,17 +240,24 @@ async def not_found_handler(request, exc=None):
 @app.get("/")
 async def index(request=None, exc=None):
     # 模板注入前转义，防止后台配置被篡改后注入任意 HTML/脚本（存储型 XSS 面）
-    return HTMLResponse(
-        content=open(
-            BASE_DIR / f"{settings.themesSelect}/index.html", "r", encoding="utf-8"
-        )
+    frontend_dist = BASE_DIR / "frontend_dist"
+    using_dist = (frontend_dist / "index.html").is_file()
+    html_file = frontend_dist / "index.html" if using_dist else BASE_DIR / f"{settings.themesSelect}/index.html"
+    content = (
+        open(html_file, "r", encoding="utf-8")
         .read()
         .replace("{{title}}", html.escape(str(settings.name)))
         .replace("{{description}}", html.escape(str(settings.description)))
         .replace("{{keywords}}", html.escape(str(settings.keywords)))
         .replace("{{opacity}}", html.escape(str(settings.opacity)))
-        .replace('"/assets/', '"assets/')
-        .replace("{{background}}", html.escape(str(settings.background))),
+        .replace("{{background}}", html.escape(str(settings.background)))
+    )
+    # 主题模板：资源路径相对化（与旧主题 asset 引用方式兼容）；
+    # 前端构建产物（dist）：资源为绝对路径 /assets/...，由 /assets 静态挂载直接提供，不做替换。
+    if not using_dist:
+        content = content.replace('"/assets/', '"assets/')
+    return HTMLResponse(
+        content=content,
         media_type="text/html",
         headers={"Cache-Control": "no-cache"},
     )
