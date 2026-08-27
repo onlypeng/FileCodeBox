@@ -196,6 +196,10 @@ class Room(models.Model):
     expired_at = fields.DatetimeField(null=True)
     # 次数模式剩余会话次数（-1 表示非次数模式不限制；expire_style="count" 时有效）
     expired_count = fields.IntField(default=-1)
+    # 是否把聊天消息/文件元信息保存到服务器（随房间过期删除，见 RoomMessage/RoomCachedFile）
+    save_messages = fields.IntField(default=0)
+    # 是否启用房间文件缓存（已接收成员作为多源，可转发给其他/新加入成员收取）
+    cache_enabled = fields.IntField(default=0)
     created_at = fields.DatetimeField(auto_now_add=True)
 
     async def is_expired(self):
@@ -207,6 +211,34 @@ class Room(models.Model):
         if self.expired_at is None:
             return False
         return self.expired_at < await get_now()
+
+
+class RoomMessage(models.Model):
+    """房间聊天消息（save_messages=1 时落库，随房间过期/删除清理）"""
+    id = fields.IntField(pk=True)
+    room_code = fields.CharField(max_length=12, index=True)
+    sender = fields.CharField(max_length=64, default="匿名")
+    content = fields.TextField(default="")
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "room_message"
+
+
+class RoomCachedFile(models.Model):
+    """房间缓存文件元信息（cache_enabled=1 时记录：已接收成员可作多源转发给他人/新成员收取）"""
+    id = fields.IntField(pk=True)
+    room_code = fields.CharField(max_length=12, index=True)
+    transfer_id = fields.CharField(max_length=64, index=True)
+    owner_id = fields.CharField(max_length=64, default="")
+    file_name = fields.CharField(max_length=255, default="")
+    file_size = fields.BigIntField(default=0)
+    # 记录文件已缓存的成员列表（逗号分隔的 client_id）；接收者完成接收后追加
+    cache_holder_ids = fields.TextField(default="")
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "room_cached_file"
 
 
 class IPLimit(models.Model):

@@ -70,6 +70,10 @@ class CreateRoomRequest(BaseModel):
     expire_value: int = 1
     # 人员上限（1~后台配置的 defaultMaxMembers；0/缺省用后台默认）
     max_members: int = 0
+    # 是否把聊天消息/文件元信息保存到服务器（随房间过期删除）
+    save_messages: bool = False
+    # 是否启用房间文件缓存（已接收成员可作为多源转发，其他成员/新成员可收取）
+    cache_enabled: bool = False
 
 
 # 投递（delivery）分片上传

@@ -27,6 +27,8 @@ from apps.base.models import (
     CollectionBox,
     CollectionFile,
     Room,
+    RoomMessage,
+    RoomCachedFile,
 )
 from apps.base.schemas import (
     SelectFileModel,
@@ -2165,6 +2167,8 @@ async def _build_room_response(room: Room) -> dict:
         "expired_count": room.expired_count,
         "expired_at": room.expired_at.isoformat() if room.expired_at else None,
         "created_at": room.created_at.isoformat() if room.created_at else None,
+        "save_messages": bool(room.save_messages),
+        "cache_enabled": bool(room.cache_enabled),
     }
 
 
@@ -2191,6 +2195,8 @@ async def _create_room(data: CreateRoomRequest, ip: str) -> Room:
         # count 模式：不限制时间，按"房间从有人变为无人"计次（expire_value 次）
         expired_at=None if is_count else _calculate_expired_at(data.expire_style, data.expire_value, await get_now()),
         expired_count=data.expire_value if is_count else -1,
+        save_messages=1 if data.save_messages else 0,
+        cache_enabled=1 if data.cache_enabled else 0,
     )
     await ip_limit["upload"].add_ip(ip)
     return room
@@ -2217,7 +2223,6 @@ async def get_room_info(room_code: str, ip: str = Depends(ip_limit["error"])):
 
 @ws_api.websocket("/ws/room/{room_code}")
 @ws_api.websocket("/ws/direct/{room_code}")
-@ws_api.websocket("/ws/chat/{room_code}")
 @ws_api.websocket("/ws/transfer/{room_code}")
 async def websocket_room(websocket: WebSocket, room_code: str):
     """实时房间 WebSocket：聊天 + 文件传输 + P2P 媒体统一（服务器中转兜底，文本/媒体不落盘）"""
@@ -2298,6 +2303,26 @@ async def websocket_room(websocket: WebSocket, room_code: str):
             "client_id": client_id,
         })
 
+        # 房间启用文件缓存：新加入者收到已缓存文件列表（有缓存持有者的可收取）
+        if room.cache_enabled:
+            try:
+                cached = await RoomCachedFile.filter(room_code=room.room_code).all()
+                cached_list = [
+                    {
+                        "transfer_id": c.transfer_id,
+                        "file_name": c.file_name,
+                        "file_size": c.file_size,
+                        "holders": [h for h in (c.cache_holder_ids or "").split(",") if h],
+                    }
+                    for c in cached
+                ]
+                await ws_manager.send_personal(room.room_code, websocket, {
+                    "type": "file_cache_list",
+                    "files": cached_list,
+                })
+            except Exception:
+                pass
+
         # 广播用户加入（含成员列表，供多人场景识别彼此）
         await ws_manager.broadcast(room.room_code, {
             "type": "user_joined",
@@ -2359,7 +2384,17 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                     })
                     continue
                 msg_times.append(now_ts)
-                # 聊天消息不落库：仅实时广播给所有连接（含发送者，回显按 client_id 匹配）
+                # save_messages=1：聊天消息落库（供房间过期后清理；实时仍只经内存广播）
+                if room.save_messages:
+                    try:
+                        await RoomMessage.create(
+                            room_code=room.room_code,
+                            sender=nickname or "匿名",
+                            content=content,
+                        )
+                    except Exception:
+                        pass
+                # 聊天消息广播给所有连接（含发送者，回显按 client_id 匹配）
                 await ws_manager.broadcast(room.room_code, {
                     "type": "chat_message",
                     "sender": nickname or "匿名",
@@ -2504,6 +2539,54 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                         "transfer_id": msg.get("transfer_id") or "",
                         "reason": msg.get("reason") or "",
                     })
+
+            # ============ 房间文件缓存（cache_enabled） ============
+            elif mtype == "file_cache_ready":
+                # 接收者完成接收并持有了文件 → 记录缓存（该 client_id 加入持有者集合）
+                if room.cache_enabled:
+                    transfer_id = (msg.get("transfer_id") or "")[:64]
+                    if transfer_id:
+                        cached = await RoomCachedFile.filter(
+                            room_code=room.room_code, transfer_id=transfer_id
+                        ).first()
+                        holders = set(
+                            (cached.cache_holder_ids or "").split(",") if cached else []
+                        )
+                        holders.add(client_id)
+                        if cached:
+                            cached.cache_holder_ids = ",".join(holders)
+                            await cached.save(update_fields=["cache_holder_ids"])
+                        else:
+                            await RoomCachedFile.create(
+                                room_code=room.room_code,
+                                transfer_id=transfer_id,
+                                owner_id=(msg.get("owner_id") or "")[:64],
+                                file_name=(msg.get("file_name") or "")[:255],
+                                file_size=int(msg.get("file_size") or 0),
+                                cache_holder_ids=",".join(holders),
+                            )
+                        # 广播缓存列表更新（其他成员可从此缓存源收取）
+                        await ws_manager.broadcast(room.room_code, {
+                            "type": "file_cache_update",
+                            "transfer_id": transfer_id,
+                            "file_name": (msg.get("file_name") or "")[:255],
+                            "file_size": int(msg.get("file_size") or 0),
+                            "holder_id": client_id,
+                            "holder_nickname": nickname or "匿名",
+                        })
+            elif mtype == "file_cache_request":
+                # 成员请求从某个缓存持有者收取文件 → 通知持有者（发起 file_offer 给请求者）
+                if room.cache_enabled:
+                    holder = (msg.get("holder_id") or "")[:64]
+                    if holder:
+                        await ws_manager.send_to_client(room.room_code, holder, {
+                            "type": "file_cache_request",
+                            "transfer_id": (msg.get("transfer_id") or "")[:64],
+                            "file_name": (msg.get("file_name") or "")[:255],
+                            "file_size": int(msg.get("file_size") or 0),
+                            "requester_id": client_id,
+                            "requester_nickname": nickname or "匿名",
+                        })
     except WebSocketDisconnect:
         pass
     finally:
@@ -2535,13 +2618,6 @@ async def websocket_room(websocket: WebSocket, room_code: str):
 compat_room_api = APIRouter(tags=["实时房间(兼容)"])
 
 
-@compat_room_api.post("/chat/create/", dependencies=[Depends(share_required_login)])
-async def compat_create_chat(data: CreateRoomRequest, ip: str = Depends(ip_limit["upload"])):
-    """旧聊天房间入口：创建直连快传房间（统一模式，兼容旧链接）"""
-    room = await _create_room(data, ip)
-    return APIResponse(detail=await _build_room_response(room))
-
-
 @compat_room_api.post("/transfer/create/", dependencies=[Depends(share_required_login)])
 async def compat_create_transfer(data: CreateRoomRequest, ip: str = Depends(ip_limit["upload"])):
     """旧传输房间入口：创建直连快传房间（统一模式，兼容旧链接）"""
@@ -2553,12 +2629,6 @@ async def compat_create_transfer(data: CreateRoomRequest, ip: str = Depends(ip_l
 async def compat_create_direct(data: CreateRoomRequest, ip: str = Depends(ip_limit["upload"])):
     """旧直连快传入口：创建直连快传房间（统一模式）"""
     room = await _create_room(data, ip)
-    return APIResponse(detail=await _build_room_response(room))
-
-
-@compat_room_api.get("/chat/info/{room_code}")
-async def compat_chat_info(room_code: str):
-    room = await _get_room(room_code)
     return APIResponse(detail=await _build_room_response(room))
 
 

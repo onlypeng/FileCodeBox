@@ -225,7 +225,8 @@ app.include_router(compat_room_api)
 
 
 # API 前缀：这些路径的 404 应返回 JSON（而非回退到 SPA 首页 HTML），便于前端统一处理
-_API_PREFIXES = ("/admin", "/share", "/chunk", "/presign", "/collection", "/delivery", "/room", "/ws")
+# /chat 为已移除的旧接口（统一到 /room、/direct），命中返回 JSON 404 便于旧客户端识别
+_API_PREFIXES = ("/admin", "/share", "/chunk", "/presign", "/collection", "/delivery", "/room", "/ws", "/chat")
 
 
 @app.exception_handler(404)

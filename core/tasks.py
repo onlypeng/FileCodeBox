@@ -10,7 +10,7 @@ from typing import Optional
 
 from tortoise.expressions import Q
 
-from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFile, Room
+from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFile, Room, RoomMessage, RoomCachedFile
 from apps.base.utils import ip_limit, get_chunk_file_path_name
 from core.config import refresh_settings
 from core.settings import settings, data_root
@@ -251,6 +251,15 @@ async def clean_expired_rooms():
                     if expired_point is None or expired_point + retention > now:
                         continue
                 await room.delete()
+                # 房间删除/过期：同步清理其保存的消息与缓存文件元信息
+                try:
+                    await RoomMessage.filter(room_code=room.room_code).delete()
+                except Exception:
+                    pass
+                try:
+                    await RoomCachedFile.filter(room_code=room.room_code).delete()
+                except Exception:
+                    pass
                 logging.info(f"已清理过期房间: code={room.room_code}")
 
         except Exception as e:
