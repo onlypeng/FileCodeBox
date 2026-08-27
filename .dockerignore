@@ -27,9 +27,8 @@ htmlcov/
 .DS_Store
 ._*
 
-# Frontend source (will be built from GitHub)
+# Frontend source (built into frontend_dist, committed in repo)
 fcb-fronted/
-themes/
 
 # Test files
 test_*.py
