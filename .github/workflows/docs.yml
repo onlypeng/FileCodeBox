@@ -43,11 +43,11 @@ jobs:
           cache: 'pnpm'
           cache-dependency-path: 'docs/pnpm-lock.yaml'
       - name: Setup Pages
-        # enablement: true 在首次运行时自动启用 GitHub Pages（Source=GitHub Actions）。
-        # 若 token 权限不足导致仍失败，请在仓库 Settings → Pages → Source 选择 "GitHub Actions" 手动启用。
+        # 注意：GitHub Pages 必须已在仓库设置中启用（Source 选 "GitHub Actions"）。
+        # Actions 的 GITHUB_TOKEN 无权限创建 Pages 站点（Resource not accessible by integration），
+        # 因此不能在此自动启用，需仓库管理员一次性手动开启：
+        #   Settings → Pages → Source: "GitHub Actions"
         uses: actions/configure-pages@v4
-        with:
-          enablement: true
       - name: Install dependencies
         working-directory: docs
         run: pnpm install
