@@ -59,6 +59,7 @@ from core.room_cache import (
     save_room_file,
     verify_download,
 )
+from core.room_token import issue_member_token, verify_member_token
 from core.storage import storages, FileStorageInterface, create_zip_stream
 from core.utils import get_now, sanitize_filename, verify_select_token
 from core.websocket import ws_manager
@@ -2333,6 +2334,23 @@ def _room_cache_lock(code: str) -> asyncio.Lock:
 MAX_OFFER_TARGETS = 32
 
 
+def _is_room_member(room_code: str, client_id: str, member_token: str = "") -> bool:
+    """判断调用者是否为该房间成员。
+
+    两条通道任一成立即可：
+    1. client_id 当前保持本房间 WebSocket 连接（client_id 由服务端签发，无法伪造）
+    2. 持有有效的短期成员令牌（welcome 时下发）
+
+    第 2 条是为断线场景兜底：只认"在线"时，用户切后台或弱网重连期间
+    就无法删除/管理自己刚上传的文件。令牌短期有效，过期需重新加入房间。
+    """
+    if not room_code or not client_id:
+        return False
+    if ws_manager.is_member_online(room_code, client_id):
+        return True
+    return verify_member_token(room_code, client_id, member_token)
+
+
 def _safe_int(value, default: int = 0, low: int = 0, high: int | None = None) -> int:
     """把 WS 消息里的数值字段安全转成 int（并做上下界收敛）。
 
@@ -2396,6 +2414,7 @@ async def upload_room_cache_file(
     uploader_name: str = Form(""),
     cache_hours: int = Form(0),
     file_hash: str = Form(""),
+    member_token: str = Form(""),
     ip: str = Depends(ip_limit["upload"]),
 ):
     """上传文件到房间服务器缓存（双通道中的"落盘"通道）。
@@ -2412,11 +2431,11 @@ async def upload_room_cache_file(
 
     # 复用文件柜的文件类型白名单（房间缓存此前走独立路径，不受该限制约束）
     _check_file_type_allowed(file.filename or "")
-    # 鉴权：必须是本房间当前在线成员（client_id 由服务端在 WS join 时签发，
-    # 未加入房间者无从得知）。此前无任何身份校验，任何拿到房间码的人都能往
-    # 服务器磁盘写文件并耗尽房间配额。
+    # 鉴权：必须是本房间成员（当前在线，或持有有效的短期成员令牌）。
+    # client_id 由服务端签发、令牌用应用密钥签名，未加入房间者都无法取得。
+    # 此前无任何校验，任何拿到房间码的人都能往服务器磁盘写文件并耗尽配额。
     uploader_id = (client_id or "").strip()[:64]
-    if not uploader_id or not ws_manager.is_member_online(room.room_code, uploader_id):
+    if not _is_room_member(room.room_code, uploader_id, (member_token or "").strip()):
         raise HTTPException(status_code=403, detail="请先加入房间再上传")
 
     # 同房间的配额校验 + 去重判定 + 落盘 + 登记必须在同一把锁内完成，
@@ -2701,17 +2720,17 @@ async def download_room_cache_file(
 
 
 @room_api.delete("/{room_code}/file/{transfer_id}")
-async def delete_room_cache_file(room_code: str, transfer_id: str, client_id: str = ""):
+async def delete_room_cache_file(room_code: str, transfer_id: str, client_id: str = "", member_token: str = ""):
     """删除房间缓存文件：落盘的会删除磁盘数据，同时移除 P2P 持有者记录。
 
-    鉴权：client_id 必填且必须是本房间当前在线成员。client_id 由服务端在 WS join
-    时签发（uuid4 前 16 位），未加入房间者无从得知，因此"该 id 正保持本房间连接"
-    可作为成员凭证。此前 client_id 可缺省，校验被整段跳过 —— 任何匿名请求都能
+    鉴权：client_id 必填，且必须是本房间成员（当前在线 或 持有有效成员令牌）。
+    client_id 由服务端在 WS join 时签发，未加入房间者无从得知。
+    此前 client_id 可缺省，校验被整段跳过 —— 任何匿名请求都能
     删掉任意房间的缓存文件（含服务器磁盘数据）。
     """
     room = await _get_room(room_code)
     client_id = (client_id or "").strip()[:64]
-    if not client_id or not ws_manager.is_member_online(room.room_code, client_id):
+    if not _is_room_member(room.room_code, client_id, (member_token or "").strip()):
         raise HTTPException(status_code=403, detail="请先加入房间再操作")
 
     entry = await RoomCachedFile.filter(
@@ -2821,9 +2840,11 @@ async def websocket_room(websocket: WebSocket, room_code: str):
             })
 
         # 告知本连接其 client_id（用于文件确认/媒体协商的定向回复）
+        # member_token：短期成员凭证，供 HTTP 接口（缓存上传/删除）在断线后仍能证明成员身份
         await ws_manager.send_personal(room.room_code, websocket, {
             "type": "welcome",
             "client_id": client_id,
+            "member_token": issue_member_token(room.room_code, client_id),
         })
 
         # 房间启用文件缓存：新加入者收到已缓存文件列表（有缓存持有者的可收取）

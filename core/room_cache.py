@@ -198,6 +198,15 @@ def delete_room_dir(room_code: str) -> int:
 DOWNLOAD_TTL = 30 * 60
 
 
+def app_secret() -> str:
+    """应用级 HMAC 密钥（下载签名与房间成员令牌共用）。
+
+    单独暴露是为了让 core/room_token.py 复用同一份密钥策略，
+    避免两处各自实现"环境变量 / 持久化随机密钥"的回退逻辑。
+    """
+    return _sign_secret()
+
+
 _SECRET_CACHE = ""
 
 
