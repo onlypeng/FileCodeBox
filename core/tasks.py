@@ -4,7 +4,7 @@
 # @Software: PyCharm
 import asyncio
 import datetime
-import logging
+from core.logger import logger
 import os
 from typing import Optional
 
@@ -14,6 +14,7 @@ from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFi
 from apps.base.utils import ip_limit, get_chunk_file_path_name
 from core.config import refresh_settings
 from core.settings import settings, data_root
+from core.room_cache import delete_room_dir, delete_room_file, sweep_incoming
 from core.storage import FileStorageInterface, storages
 from core.utils import get_now
 from core.websocket import ws_manager
@@ -77,13 +78,13 @@ async def delete_expire_files():
                 try:
                     await file_storage.delete_file(exp)
                 except Exception as e:
-                    logging.error(f"删除过期文件失败 code={exp.code}: {e}")
+                    logger.error(f"删除过期文件失败 code={exp.code}: {e}")
                 try:
                     await exp.delete()
                 except Exception as e:
-                    logging.error(f"删除记录失败 code={exp.code}: {e}")
+                    logger.error(f"删除记录失败 code={exp.code}: {e}")
         except Exception as e:
-            logging.error(e)
+            logger.error(e)
         finally:
             await asyncio.sleep(600)
 
@@ -109,20 +110,20 @@ async def clean_incomplete_uploads():
                         )
                     await file_storage.clean_chunks(session.upload_id, save_path)
                 except Exception as e:
-                    logging.error(
+                    logger.error(
                         f"清理分片文件失败 upload_id={session.upload_id}: {e}"
                     )
 
                 try:
                     await UploadChunk.filter(upload_id=session.upload_id).delete()
-                    logging.info(f"已清理过期上传会话 upload_id={session.upload_id}")
+                    logger.info(f"已清理过期上传会话 upload_id={session.upload_id}")
                 except Exception as e:
-                    logging.error(
+                    logger.error(
                         f"删除分片记录失败 upload_id={session.upload_id}: {e}"
                     )
 
         except Exception as e:
-            logging.error(f"清理未完成上传任务异常: {e}")
+            logger.error(f"清理未完成上传任务异常: {e}")
         finally:
             await asyncio.sleep(3600)
 
@@ -148,23 +149,23 @@ class CollectionEvents:
             try:
                 await handler(data)
             except Exception as e:
-                logging.error(f"事件处理器错误 {event_name}: {e}")
+                logger.error(f"事件处理器错误 {event_name}: {e}")
 
         # 默认日志
-        logging.info(f"[Event] {event_name}: {data}")
+        logger.info(f"[Event] {event_name}: {data}")
 
 
 # 注册默认事件处理器
 async def _log_collection_created(data: dict):
-    logging.info(f"收件箱已创建: collection_code={data.get('collection_code')}, delivery_code={data.get('delivery_code')}")
+    logger.info(f"收件箱已创建: collection_code={data.get('collection_code')}, delivery_code={data.get('delivery_code')}")
 
 
 async def _log_file_delivered(data: dict):
-    logging.info(f"文件已投递: file_id={data.get('file_id')}, collection_code={data.get('collection_code')}")
+    logger.info(f"文件已投递: file_id={data.get('file_id')}, collection_code={data.get('collection_code')}")
 
 
 async def _log_delivery_failed(data: dict):
-    logging.warning(f"文件投递失败: file_id={data.get('file_id')}, error={data.get('error')}")
+    logger.warning(f"文件投递失败: file_id={data.get('file_id')}, error={data.get('error')}")
 
 
 CollectionEvents.on("collection.created", _log_collection_created)
@@ -190,7 +191,7 @@ async def clean_expired_collections():
             for sf in stale_files:
                 sf.status = "failed"
                 await sf.save()
-                logging.info(f"投递记录标记为失败: id={sf.id}")
+                logger.info(f"投递记录标记为失败: id={sf.id}")
 
             # 整箱过期 + 宽限到期 → 删除收件箱（含全部文件与记录）
             retention = await _retention_delta()
@@ -203,10 +204,10 @@ async def clean_expired_collections():
                     if expired_point is None or expired_point + retention > now:
                         continue
                     await _delete_collection_with_files(box)
-                    logging.info(f"已清理过期收件箱: code={box.collection_code}")
+                    logger.info(f"已清理过期收件箱: code={box.collection_code}")
 
         except Exception as e:
-            logging.error(f"清理过期收件箱异常: {e}")
+            logger.error(f"清理过期收件箱异常: {e}")
         finally:
             await asyncio.sleep(600)
 
@@ -223,11 +224,11 @@ async def _delete_collection_with_files(box) -> None:
                 try:
                     await file_storage.delete_file(file_code)
                 except Exception as e:
-                    logging.error(f"删除收件箱文件失败 code={file_code.code}: {e}")
+                    logger.error(f"删除收件箱文件失败 code={file_code.code}: {e}")
                 try:
                     await file_code.delete()
                 except Exception as e:
-                    logging.error(f"删除收件箱文件记录失败 code={file_code.code}: {e}")
+                    logger.error(f"删除收件箱文件记录失败 code={file_code.code}: {e}")
     await box.delete()
 
 
@@ -257,15 +258,50 @@ async def clean_expired_rooms():
                 except Exception:
                     pass
                 try:
+                    # 先删数据库元信息，再删落盘文件（顺序不能反，否则先删记录会留下无人回收的孤儿文件）
                     await RoomCachedFile.filter(room_code=room.room_code).delete()
+                    delete_room_dir(room.room_code)
                 except Exception:
                     pass
-                logging.info(f"已清理过期房间: code={room.room_code}")
+                logger.info(f"已清理过期房间: code={room.room_code}")
 
         except Exception as e:
-            logging.error(f"清理过期房间异常: {e}")
+            logger.error(f"清理过期房间异常: {e}")
         finally:
             await asyncio.sleep(600)
+
+
+async def clean_expired_room_cache_files():
+    """定期清理到期的房间服务器缓存文件（房间仍存活，仅该文件 expires_at 到期）。
+
+    只处理显式设置了 expires_at 的记录；expires_at 为 NULL 表示"跟随房间生命周期"，
+    由 clean_expired_rooms 在房间回收时统一清理，此处不重复扫描。
+    """
+    while True:
+        try:
+            now = await get_now()
+            # NULL 不参与比较（SQLite 下 NULL < now 为假），天然只命中设置了到期时间的记录
+            expired = await RoomCachedFile.filter(expires_at__lt=now).all()
+            for entry in expired:
+                if entry.storage_key:
+                    await delete_room_file(entry.storage_key)
+                # 同步清空历史里同名文件消息的落盘标记：否则历史仍显示"可下载"，
+                # 实际文件已随本次清理删除，点击只会 404
+                await RoomMessage.filter(
+                    room_code=entry.room_code, msg_type="file", content=entry.transfer_id
+                ).update(storage_key="")
+                await entry.delete()
+            if expired:
+                logger.info(f"已清理到期房间缓存文件: {len(expired)} 个")
+            # 兜底回收上传中断残留的临时文件（崩溃时"写完临时文件但还没改名"的那批）。
+            # 同步文件 I/O 会阻塞事件循环，放到线程里执行。
+            orphan = await asyncio.to_thread(sweep_incoming)
+            if orphan:
+                logger.info(f"已回收房间缓存临时文件: {orphan} 个")
+        except Exception as e:
+            logger.error(f"清理房间缓存文件异常: {e}")
+        finally:
+            await asyncio.sleep(300)
 
 
 async def sweep_direct_connections():
@@ -274,6 +310,6 @@ async def sweep_direct_connections():
         try:
             await ws_manager.sweep_rooms()
         except Exception as e:
-            logging.error(f"清扫直连连接异常: {e}")
+            logger.error(f"清扫直连连接异常: {e}")
         finally:
             await asyncio.sleep(20)

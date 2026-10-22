@@ -90,6 +90,11 @@ DEFAULT_CONFIG = {
     "collectionDefaultExpireDays": 7,
     # 口令/码位数（文件分享码、收件箱三码、房间码统一长度，范围 4~12）
     "codeLength": 6,
+    # 共享域名：生成分享/取件链接（含下载直链、二维码、wget 命令）时使用的站点地址，
+    # 形如 "https://share.example.com"，留空表示使用当前访问地址。
+    # 适用于反向代理或内网部署时对外固定分享域名，避免链接带上内网地址。
+    # 注意：仅影响对外分享链接，API 请求与 WebSocket 仍连接实际访问地址。
+    "shareDomain": "",
     "trustedProxies": "",
     "cors_origins": "http://localhost:5173,http://127.0.0.1:5173",
     "directRelayEnabled": 1,
@@ -101,6 +106,17 @@ DEFAULT_CONFIG = {
     # 房间文件中转单文件大小上限（单位 MB；0=不限制，走 P2P 直连时不受此限）。
     # 独立于全局 uploadSize（文件柜普通上传），便于单独控制房间文件共享的容量占用。
     "directMaxRelaySize": 0,
+    # 是否允许房间文件缓存到服务器磁盘（1=允许）。关闭后房间文件只能走 P2P 多源转发。
+    "roomCacheEnabled": 1,
+    # 房间文件服务器缓存默认时长（单位小时；0 = 跟随房间生命周期，随房间过期一起清理）。
+    # 默认 3 天（72 小时）；需要其他时长可在房间「文件管理」中上传时手动选择。
+    "roomCacheDefaultHours": 72,
+    # 单个房间缓存文件大小上限（单位 MB；0 = 不限制）。用于防止磁盘被大文件占满。
+    "roomCacheMaxSize": 100,
+    # 单个房间的缓存总容量配额（单位 MB；0 = 不限制）。
+    # 房间内所有落盘文件累计超过后拒绝新上传，防止单个房间耗尽磁盘；
+    # 文件过期被清理后额度自动释放。
+    "roomCacheRoomQuota": 500,
     # 临时房间默认人员上限（创建时可在 1~该值 之间选择；0 表示不限制）
     "defaultMaxMembers": 10,
     # 共享视频流默认质量档位（low=流畅 / sd=标清 / hd=高清 / auto=按带宽自适应）

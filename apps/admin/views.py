@@ -13,11 +13,12 @@ from apps.admin.dependencies import (
 )
 from apps.admin.schemas import IDData, LoginData, UpdateConfigRequest, ExtendExpireRequest, UpdateFileRequest, UpdateRoomRequest
 from core.response import APIResponse
-from apps.base.models import FileCodes, KeyValue, CollectionBox, CollectionFile, Room
+from apps.base.models import FileCodes, KeyValue, CollectionBox, CollectionFile, Room, RoomMessage, RoomCachedFile
 from apps.base.utils import ip_limit
 from tortoise.expressions import Q
 from tortoise.functions import Count, Sum
 from apps.admin.dependencies import create_token
+from core.room_cache import build_download_query, delete_room_file
 from core.settings import settings
 from core.utils import get_now, verify_password, pagination
 from core.logger import logger
@@ -300,6 +301,62 @@ async def update_config(
     return APIResponse()
 
 
+@admin_api.get("/room/{room_id}/files")
+async def admin_room_cache_files(room_id: int):
+    """后台查看指定房间的缓存文件（管理员视角：落盘文件与仅 P2P 持有的条目都能看到）"""
+    room = await Room.filter(id=room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="房间不存在")
+
+    rows = await RoomCachedFile.filter(room_code=room.room_code).order_by("-id").limit(200)
+    files = []
+    for c in rows:
+        files.append({
+            "id": c.id,
+            "transfer_id": c.transfer_id,
+            "file_name": c.file_name or "",
+            "file_size": c.file_size or 0,
+            "uploader_name": c.uploader_name or "",
+            # 已落盘到服务器磁盘（后台可强制清理以释放空间）
+            "server_cached": bool(c.storage_key),
+            "expires_at": c.expires_at.isoformat() if c.expires_at else None,
+            "cached_at": c.cached_at.isoformat() if c.cached_at else None,
+            "download_url": (
+                f"/room/{room.room_code}/file/{c.transfer_id}/download?{build_download_query(room.room_code, c.transfer_id)}"
+                if c.storage_key else ""
+            ),
+        })
+    return APIResponse(detail={"room_code": room.room_code, "files": files})
+
+
+@admin_api.delete("/room/cache-file/{file_id}")
+async def admin_delete_room_cache_file(file_id: int):
+    """后台强制删除任意房间缓存文件。
+
+    房间成员侧的删除接口限制"仅上传者可删"，管理员不受该限制，
+    用于清理违规内容或占用空间的落盘文件（磁盘数据一并删除）。
+    """
+    entry = await RoomCachedFile.filter(id=file_id).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    room_code = entry.room_code
+    transfer_id = entry.transfer_id
+    if entry.storage_key:
+        await delete_room_file(entry.storage_key)
+    await entry.delete()
+    # 同步清空历史里同名文件消息的落盘标记：否则历史仍显示"可下载"、点击却 404
+    await RoomMessage.filter(
+        room_code=room_code, msg_type="file", content=transfer_id
+    ).update(storage_key="")
+    # 通知房间内在线成员移除该条目，避免入口里仍显示已删文件
+    await ws_manager.broadcast(room_code, {
+        "type": "room_cache_removed",
+        "transfer_id": transfer_id,
+    })
+    return APIResponse()
+
+
 @admin_api.get("/collection/list")
 async def collection_list(
     page: int = 1,
@@ -466,6 +523,11 @@ async def room_list(
             "expire_value": room.expire_value,
             "expired_at": room.expired_at.isoformat() if room.expired_at else None,
             "created_at": room.created_at.isoformat() if room.created_at else None,
+            # 后加功能信息：保存消息 / 文件缓存（含各自记录量，供后台展示）
+            "save_messages": bool(room.save_messages),
+            "cache_enabled": bool(room.cache_enabled),
+            "message_count": await RoomMessage.filter(room_code=room.room_code).count(),
+            "cached_count": await RoomCachedFile.filter(room_code=room.room_code).count(),
         })
 
     return APIResponse(detail={
@@ -619,13 +681,22 @@ async def file_update(file_id: int, data: UpdateFileRequest):
 
 @admin_api.patch("/room/{room_id}")
 async def room_update(room_id: int, data: UpdateRoomRequest):
-    """房间管理：修改人员上限（1~后台 defaultMaxMembers，不超上限）"""
+    """房间管理：修改人员上限（1~后台 defaultMaxMembers，不超上限）与功能开关（保存消息/文件缓存）"""
     room = await Room.filter(id=room_id).first()
     if not room:
         raise HTTPException(status_code=404, detail="房间不存在")
+    changed = False
     if data.max_members is not None:
         default_max = max(1, int(getattr(settings, "defaultMaxMembers", 10) or 10))
         room.max_members = max(1, min(int(data.max_members), default_max))
+        changed = True
+    if data.save_messages is not None:
+        room.save_messages = 1 if int(data.save_messages) else 0
+        changed = True
+    if data.cache_enabled is not None:
+        room.cache_enabled = 1 if int(data.cache_enabled) else 0
+        changed = True
+    if changed:
         await room.save()
     return APIResponse()
 

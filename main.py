@@ -25,7 +25,14 @@ from core.database import db_startup_lock, get_db_config, init_db
 from core.logger import logger
 from core.response import APIResponse
 from core.settings import settings, BASE_DIR, DEFAULT_CONFIG
-from core.tasks import delete_expire_files, clean_incomplete_uploads, clean_expired_collections, clean_expired_rooms, sweep_direct_connections
+from core.tasks import (
+    delete_expire_files,
+    clean_incomplete_uploads,
+    clean_expired_collections,
+    clean_expired_rooms,
+    clean_expired_room_cache_files,
+    sweep_direct_connections,
+)
 from core.utils import hash_password, is_password_hashed, verify_password
 
 
@@ -55,6 +62,7 @@ async def lifespan(app: FastAPI):
     chunk_cleanup_task = asyncio.create_task(clean_incomplete_uploads())
     collection_cleanup_task = asyncio.create_task(clean_expired_collections())
     room_cleanup_task = asyncio.create_task(clean_expired_rooms())
+    cache_cleanup_task = asyncio.create_task(clean_expired_room_cache_files())
     sweep_task = asyncio.create_task(sweep_direct_connections())
     logger.info("应用初始化完成")
 
@@ -67,8 +75,17 @@ async def lifespan(app: FastAPI):
         chunk_cleanup_task.cancel()
         collection_cleanup_task.cancel()
         room_cleanup_task.cancel()
+        cache_cleanup_task.cancel()
         sweep_task.cancel()
-        await asyncio.gather(task, chunk_cleanup_task, collection_cleanup_task, room_cleanup_task, sweep_task, return_exceptions=True)
+        await asyncio.gather(
+            task,
+            chunk_cleanup_task,
+            collection_cleanup_task,
+            room_cleanup_task,
+            cache_cleanup_task,
+            sweep_task,
+            return_exceptions=True,
+        )
         await Tortoise.close_connections()
         logger.info("应用已关闭")
 
@@ -306,6 +323,13 @@ async def get_config():
             "codeLength": getattr(settings, "codeLength", 6),
             # 前端 SPA 站点默认主题（light / dark / enterprise），供前端实时同步
             "spaTheme": getattr(settings, "spaTheme", "light"),
+            # 共享域名：对外分享链接使用的站点地址（留空 = 前端回退到当前访问地址）
+            "shareDomain": getattr(settings, "shareDomain", ""),
+            # 房间文件服务器缓存：前端据此判断能否缓存、以及超限文件降级为纯 P2P
+            "roomCacheEnabled": int(getattr(settings, "roomCacheEnabled", 1) or 0),
+            "roomCacheMaxSize": int(getattr(settings, "roomCacheMaxSize", 0) or 0),
+            # 兜底值与 core/settings.py DEFAULT_CONFIG 保持一致（72 小时 = 3 天）
+            "roomCacheDefaultHours": int(getattr(settings, "roomCacheDefaultHours", 72) or 0),
         }
     )
 

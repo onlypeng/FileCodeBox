@@ -12,8 +12,8 @@ from urllib.parse import quote, unquote
 
 from typing import Optional, Tuple, Union, List
 
-from fastapi import APIRouter, Form, UploadFile, File, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Form, UploadFile, File, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette import status
 from tortoise.expressions import F
 from tortoise.transactions import in_transaction
@@ -48,12 +48,27 @@ from apps.base.utils import (
 )
 from core.response import APIResponse
 from core.settings import settings
+from core.room_cache import (
+    build_download_query,
+    build_storage_key,
+    delete_room_file,
+    iter_file_range,
+    move_room_file,
+    parse_range_header,
+    resolve_path,
+    save_room_file,
+    verify_download,
+)
 from core.storage import storages, FileStorageInterface, create_zip_stream
 from core.utils import get_now, sanitize_filename, verify_select_token
 from core.websocket import ws_manager
 from core.tasks import CollectionEvents
 
-logger = logging.getLogger(__name__)
+# 必须用 core.logger 那个已配置 handler 的 'FileCodeBox' logger。
+# 此前写的是 logging.getLogger(__name__)（即 'apps.base.views'）：它没有任何 handler，
+# 级别回退到 root 的 WARNING —— 本文件所有 logger.info（去重命中、缓存清理等）
+# 在生产环境被静默丢弃，排查时看不到任何线索。
+logger = logging.getLogger("FileCodeBox")
 
 share_api = APIRouter(prefix="/share", tags=["分享"])
 
@@ -2216,6 +2231,514 @@ async def get_room_info(room_code: str, ip: str = Depends(ip_limit["error"])):
     return APIResponse(detail=await _build_room_response(room))
 
 
+@room_api.get("/history/{room_code}")
+async def get_room_history(room_code: str, limit: int = 100, before_id: int = 0):
+    """房间历史记录：save_messages=1 房间返回聊天消息与传输过文件的元信息（只读展示），
+    另附缓存文件列表（cache_enabled=1 房间，含在线可收取来源），供"历史文件"查看/收取。"""
+    room = await _get_room(room_code)
+    limit = max(1, min(int(limit), 200))
+
+    messages = []
+    if room.save_messages:
+        # 最近 limit 条（按 id 倒序取再反转，保证时间正序）
+        q = RoomMessage.filter(room_code=room.room_code)
+        if before_id > 0:
+            # 上滑加载更早的消息：只取比 before_id 更旧的一批（微信式分页）
+            q = q.filter(id__lt=before_id)
+        rows = await q.order_by("-id").limit(limit)
+        for m in reversed(rows):
+            # 文件消息自带缓存信息：storage_key 非空即可直接从服务器下载
+            download_url = ""
+            if (m.msg_type or "text") == "file" and m.storage_key:
+                download_url = (
+                    f"/room/{room.room_code}/file/{m.content}/download?"
+                    f"{build_download_query(room.room_code, m.content)}"
+                )
+            messages.append({
+                "id": m.id,
+                "sender": m.sender or "匿名",
+                "content": m.content or "",
+                "msg_type": m.msg_type or "text",
+                "file_name": m.file_name or "",
+                "file_size": m.file_size or 0,
+                # 服务器是否已缓存（历史文件可直接下载，无需发送方在线）
+                "server_cached": bool(m.storage_key),
+                "expires_at": m.expires_at.isoformat() if m.expires_at else None,
+                "download_url": download_url,
+                "ts": m.created_at.isoformat() if m.created_at else None,
+            })
+
+    files = []
+    cached = await RoomCachedFile.filter(room_code=room.room_code).order_by("-id").limit(limit)
+    for c in cached:
+        # server_cached / download_url 必须一并下发：少了它，前端只能去问在线成员，
+        # 服务器明明有缓存也会误报"暂无可用的在线缓存来源"
+        has_storage = bool(c.storage_key)
+        files.append({
+            "transfer_id": c.transfer_id,
+            "file_name": c.file_name or "",
+            "file_size": c.file_size or 0,
+            "file_hash": c.file_hash or "",
+            "holders": [h for h in (c.cache_holder_ids or "").split(",") if h],
+            "holder_names": [n for n in (c.holder_names or "").split(",") if n],
+            "server_cached": has_storage,
+            "expires_at": c.expires_at.isoformat() if c.expires_at else None,
+            "download_url": (
+                f"/room/{room.room_code}/file/{c.transfer_id}/download?{build_download_query(room.room_code, c.transfer_id)}"
+                if has_storage else ""
+            ),
+        })
+
+    return APIResponse(detail={
+        "room_code": room.room_code,
+        "save_messages": bool(room.save_messages),
+        "cache_enabled": bool(room.cache_enabled),
+        "messages": messages,
+        "files": files,
+    })
+
+
+def _check_file_type_allowed(file_name: str) -> None:
+    """校验扩展名是否在后台文件类型白名单内（空白名单 = 不限制）。
+
+    房间缓存上传与文件柜上传走不同路径，此前不受 fileTypeWhitelist 约束，
+    此处复用同一份配置，避免绕过白名单上传到服务器。
+    """
+    whitelist = str(getattr(settings, "fileTypeWhitelist", "") or "").strip()
+    if not whitelist:
+        return
+
+    allowed = {e.strip().lower().lstrip(".") for e in whitelist.split(",") if e.strip()}
+    name = file_name or ""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext not in allowed:
+        raise HTTPException(status_code=415, detail=f"不支持的文件类型：{ext or '无扩展名'}")
+
+
+# 房间级串行锁：同房间的缓存上传串行化，杜绝"先读后写"的配额/去重校验被并发绕过。
+# ws_manager 本身就是进程内状态（多进程部署本不支持），故进程内锁足以覆盖全部并发场景。
+_ROOM_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _room_cache_lock(code: str) -> asyncio.Lock:
+    """取房间锁（不存在则创建）。房间数有限，不回收也可接受。"""
+    lock = _ROOM_CACHE_LOCKS.get(code)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ROOM_CACHE_LOCKS[code] = lock
+    return lock
+
+
+# 定向发送（file_offer 的 targets）目标数上限：服务端按目标逐个 send_to_client，需收口
+MAX_OFFER_TARGETS = 32
+
+
+def _safe_int(value, default: int = 0, low: int = 0, high: int | None = None) -> int:
+    """把 WS 消息里的数值字段安全转成 int（并做上下界收敛）。
+
+    消息字段完全由客户端填写，直接 int() 遇到非数字会抛 ValueError；
+    而 WS 处理循环只捕获 WebSocketDisconnect，异常会直接中断该连接的处理循环。
+    """
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return default
+    if num < low:
+        return low
+    if high is not None and num > high:
+        return high
+    return num
+
+
+def _cache_entry_payload(c: RoomCachedFile, room_code: str = "") -> dict:
+    """缓存文件统一输出结构（列表/上传响应/广播复用同一份字段）。"""
+    return {
+        "transfer_id": c.transfer_id,
+        "file_name": c.file_name or "",
+        "file_size": c.file_size or 0,
+        # 服务端落盘时算出的内容哈希：客户端合并多源分片后据此校验完整性
+        "file_hash": c.file_hash or "",
+        "uploader_name": c.uploader_name or "",
+        "owner_id": c.owner_id or "",
+        "holders": [h for h in (c.cache_holder_ids or "").split(",") if h],
+        "holder_names": [n for n in (c.holder_names or "").split(",") if n],
+        # 是否已真实落盘到服务器（为 true 时可点击直接下载，无需 P2P、发送方无需在线）
+        "server_cached": bool(c.storage_key),
+        "expires_at": c.expires_at.isoformat() if c.expires_at else None,
+        "cached_at": c.cached_at.isoformat() if c.cached_at else None,
+        # 仅落盘文件下发下载直链，且带短期签名（默认 30 分钟），避免链接被转发后长期可访问
+        "download_url": (
+            f"/room/{room_code}/file/{c.transfer_id}/download?{build_download_query(room_code, c.transfer_id)}"
+            if c.storage_key and room_code
+            else ""
+        ),
+    }
+
+
+@room_api.get("/{room_code}/files")
+async def list_room_cache_files(room_code: str):
+    """房间缓存文件列表：含服务器落盘文件（可直接下载）与仅 P2P 持有的文件。"""
+    room = await _get_room(room_code)
+    cached = await RoomCachedFile.filter(room_code=room.room_code).order_by("-id").limit(200)
+    return APIResponse(detail={
+        "cache_enabled": bool(room.cache_enabled),
+        "server_cache_enabled": bool(getattr(settings, "roomCacheEnabled", 1)),
+        "files": [_cache_entry_payload(c, room.room_code) for c in cached],
+    })
+
+
+@room_api.post("/{room_code}/file/upload")
+async def upload_room_cache_file(
+    room_code: str,
+    file: UploadFile = File(...),
+    transfer_id: str = Form(""),
+    client_id: str = Form(""),
+    uploader_name: str = Form(""),
+    cache_hours: int = Form(0),
+    file_hash: str = Form(""),
+    ip: str = Depends(ip_limit["upload"]),
+):
+    """上传文件到房间服务器缓存（双通道中的"落盘"通道）。
+
+    cache_hours=0 表示跟随房间生命周期（随房间过期一起清理）；>0 表示指定小时数后过期。
+    默认通道仍是 P2P 直连，只有发送方主动选择"缓存到服务器"时才走这里。
+    """
+    room = await _get_room(room_code)
+
+    if not getattr(settings, "roomCacheEnabled", 1):
+        raise HTTPException(status_code=403, detail="服务器文件缓存未开启")
+    if not room.cache_enabled:
+        raise HTTPException(status_code=403, detail="该房间未启用文件缓存")
+
+    # 复用文件柜的文件类型白名单（房间缓存此前走独立路径，不受该限制约束）
+    _check_file_type_allowed(file.filename or "")
+    # 鉴权：必须是本房间当前在线成员（client_id 由服务端在 WS join 时签发，
+    # 未加入房间者无从得知）。此前无任何身份校验，任何拿到房间码的人都能往
+    # 服务器磁盘写文件并耗尽房间配额。
+    uploader_id = (client_id or "").strip()[:64]
+    if not uploader_id or not ws_manager.is_member_online(room.room_code, uploader_id):
+        raise HTTPException(status_code=403, detail="请先加入房间再上传")
+
+    # 同房间的配额校验 + 去重判定 + 落盘 + 登记必须在同一把锁内完成，
+    # 否则并发上传会各自读到旧的 used 值，配额上限形同虚设。
+    async with _room_cache_lock(room.room_code):
+
+        tid = (transfer_id or "").strip()[:64] or uuid.uuid4().hex[:16]
+        now = await get_now()
+        # 客户端声明的 file_hash 仅作参考日志，不再参与去重判定：
+        # 该值可被伪造，会让内容不同的文件被判为重复（缓存投毒）。
+        # 下方一律使用落盘时流式算出的服务端权威哈希。
+        declared_hash = (file_hash or "").strip().lower()[:64]
+
+        limit_mb = int(getattr(settings, "roomCacheMaxSize", 0) or 0)
+        max_bytes = limit_mb * 1024 * 1024 if limit_mb > 0 else 0
+
+        # ===== 房间总容量配额：写前按声明大小预估，落盘后再按实际大小复核 =====
+        quota_mb = int(getattr(settings, "roomCacheRoomQuota", 0) or 0)
+        used = 0
+        if quota_mb > 0:
+            for row in await RoomCachedFile.filter(room_code=room.room_code).all():
+                if row.storage_key and row.transfer_id != tid:
+                    used += row.file_size or 0
+            declared_size = int(file.size or 0)
+            if used + declared_size > quota_mb * 1024 * 1024:
+                logger.warning(
+                    f"房间缓存配额不足(预估): code={room.room_code} used={used} "
+                    f"incoming={declared_size} quota={quota_mb}MB"
+                )
+                raise HTTPException(status_code=413, detail="房间缓存空间已满，请先删除部分文件")
+
+        # ===== 先落临时文件，写入过程中流式算出内容哈希 =====
+        tmp_key = "_incoming/" + build_storage_key(room.room_code, tid, file.filename or "file")
+        incoming_size, digest = await save_room_file(tmp_key, file, max_bytes)
+        if declared_hash and declared_hash != digest:
+            logger.warning(
+                f"客户端声明哈希与内容不符，以服务端为准: code={room.room_code} "
+                f"declared={declared_hash[:12]} actual={digest[:12]}"
+            )
+
+        # ===== 去重：按服务端权威哈希查同房间已落盘且未过期的文件 =====
+        # 文件消息本身就是缓存记录（room_message.msg_type=file），因此用它做查重即可。
+        reused: RoomMessage | None = None
+        if digest:
+            candidate = (
+                await RoomMessage.filter(
+                    room_code=room.room_code, msg_type="file", file_hash=digest
+                )
+                .exclude(storage_key="")
+                .order_by("-id")
+                .first()
+            )
+            if candidate and candidate.storage_key:
+                not_expired = candidate.expires_at is None or candidate.expires_at > now
+                # 元数据声称已落盘，磁盘上却可能已被删除（如后台强制清理）：
+                # 只有文件真实存在才允许复用，否则视为未命中、走正常落盘，
+                # 避免返回一个指向空路径的"可下载"条目
+                on_disk = resolve_path(candidate.storage_key)
+                if not_expired and on_disk is not None and on_disk.is_file():
+                    reused = candidate
+                elif not_expired:
+                    logger.warning(
+                        f"房间缓存去重候选已丢失，改为重新落盘: "
+                        f"code={room.room_code} key={candidate.storage_key}"
+                    )
+
+        if reused is not None:
+            # 命中已有缓存：弃用刚写的临时文件，复用既有落盘、不额外占盘
+            await delete_room_file(tmp_key)
+            storage_key = reused.storage_key
+            size = reused.file_size or 0
+            deduped = True
+            logger.info(f"房间文件去重命中: code={room.room_code} hash={digest[:12]} 复用 {storage_key}")
+        else:
+            # 复核配额（按实际写入大小，声明大小可能缺失或被低估）
+            if quota_mb > 0 and used + incoming_size > quota_mb * 1024 * 1024:
+                await delete_room_file(tmp_key)
+                logger.warning(
+                    f"房间缓存配额不足(实际): code={room.room_code} used={used} "
+                    f"incoming={incoming_size} quota={quota_mb}MB"
+                )
+                raise HTTPException(status_code=413, detail="房间缓存空间已满，请先删除部分文件")
+            storage_key = build_storage_key(room.room_code, tid, file.filename or "file")
+            await move_room_file(tmp_key, storage_key)
+            size = incoming_size
+            deduped = False
+
+        expires_at = None
+        if cache_hours and int(cache_hours) > 0:
+            hours = max(1, min(int(cache_hours), 24 * 30))
+            expires_at = now + timedelta(hours=hours)
+
+        if reused is not None:
+            # 复用场景：过期时间"取较晚的"（续期），不缩短已有缓存的有效期
+            if expires_at and (reused.expires_at is None or expires_at > reused.expires_at):
+                reused.expires_at = expires_at
+                await reused.save(update_fields=["expires_at"])
+            expires_at = reused.expires_at
+
+        entry = await RoomCachedFile.filter(room_code=room.room_code, transfer_id=tid).first()
+        # 上传者自己也持有该文件（他本地就有原始文件）：一并登记为缓存来源，
+        # 否则 holders 永远为空 —— 发送方明明在线，别人却被告知"暂无可用的在线缓存来源"。
+        holders = {h for h in ((entry.cache_holder_ids or "").split(",") if entry else []) if h}
+        holder_names = {n for n in ((entry.holder_names or "").split(",") if entry else []) if n}
+        if client_id:
+            holders.add(client_id)
+            holder_names.add((uploader_name or "昵称")[:64])
+
+        if entry:
+            # 覆盖前回收旧落盘文件：storage_key 由 (room, tid, filename) 决定，同 tid
+            # 换名重传会落到新路径，旧文件将无人引用（forever 房间下永久泄漏）。
+            #
+            # 但去重会让多个条目共用同一份落盘（不同 tid、相同内容 → 同一 storage_key），
+            # 因此删除前必须确认没有别的条目还在引用它，否则会把别人的缓存文件删掉，
+            # 让那些条目的下载变成 404「缓存文件已丢失」。
+            old_key = (entry.storage_key or "").strip()
+            if old_key and old_key != storage_key:
+                others = await RoomCachedFile.filter(
+                    room_code=room.room_code, storage_key=old_key
+                ).exclude(id=entry.id).exists()
+                if not others:
+                    others = await RoomMessage.filter(
+                        room_code=room.room_code, storage_key=old_key
+                    ).exclude(content=tid).exists()
+                if not others:
+                    await delete_room_file(old_key)
+                else:
+                    logger.info(
+                        f"旧落盘文件仍被其他条目引用，保留: code={room.room_code} key={old_key}"
+                    )
+            entry.storage_key = storage_key
+            entry.file_name = (file.filename or "")[:255]
+            entry.file_size = size
+            entry.file_hash = digest
+            entry.uploader_name = (uploader_name or "")[:64]
+            entry.owner_id = (client_id or "")[:64]
+            entry.cached_at = now
+            entry.expires_at = expires_at
+            entry.cache_holder_ids = ",".join(sorted(holders))
+            entry.holder_names = ",".join(sorted(holder_names))
+            await entry.save()
+        else:
+            try:
+                entry = await RoomCachedFile.create(
+                    room_code=room.room_code,
+                    transfer_id=tid,
+                    owner_id=(client_id or "")[:64],
+                    file_name=(file.filename or "")[:255],
+                    file_size=size,
+                    file_hash=digest,
+                    uploader_name=(uploader_name or "")[:64],
+                    storage_key=storage_key,
+                    cached_at=now,
+                    expires_at=expires_at,
+                    cache_holder_ids=",".join(sorted(holders)),
+                    holder_names=",".join(sorted(holder_names)),
+                )
+            except Exception as e:
+                # 唯一索引兜底：(room_code, transfer_id) 已被并发创建（多进程部署）
+                # 时退回取用既有记录，避免直接 500
+                logger.warning(f"房间缓存记录创建冲突，回退取用: code={room.room_code} tid={tid} {e}")
+                entry = await RoomCachedFile.filter(
+                    room_code=room.room_code, transfer_id=tid
+                ).first()
+                if entry is None:
+                    raise HTTPException(status_code=409, detail="缓存记录创建冲突，请重试")
+
+        # ===== 消息与文件消息合一 =====
+        # 文件在 room_message 里同样占一条记录（msg_type=file），并直接挂上缓存元数据
+        # （storage_key / expires_at / file_hash）。历史展示只读这一张表，
+        # 不需要再把 room_cached_file 关联进来（那张表只留作 P2P 多源持有者索引）。
+        file_msg = await RoomMessage.filter(
+            room_code=room.room_code, msg_type="file", content=tid
+        ).first()
+        if file_msg is None:
+            file_msg = await RoomMessage.create(
+                room_code=room.room_code,
+                sender=(uploader_name or "匿名")[:64],
+                content=tid,
+                msg_type="file",
+                file_name=(file.filename or "")[:255],
+                file_size=size,
+                file_hash=digest,
+                storage_key=storage_key,
+                expires_at=expires_at,
+            )
+        else:
+            file_msg.sender = (uploader_name or file_msg.sender or "匿名")[:64]
+            file_msg.file_name = (file.filename or "")[:255]
+            file_msg.file_size = size
+            if digest:
+                file_msg.file_hash = digest
+            file_msg.storage_key = storage_key
+            file_msg.expires_at = expires_at
+            await file_msg.save()
+
+        payload = _cache_entry_payload(entry, room.room_code)
+        payload["deduped"] = deduped
+        # 广播给房间成员，实时更新"缓存文件"入口列表
+        await ws_manager.broadcast(room.room_code, {"type": "room_cache_added", "file": payload})
+        return APIResponse(detail=payload)
+
+
+@room_api.get("/{room_code}/file/{transfer_id}/link")
+async def get_room_cache_download_link(room_code: str, transfer_id: str):
+    """换取一条新的下载直链。
+
+    列表里下发的链接签名只有 30 分钟有效期，页面停留久了再点下载就会报
+    "下载链接无效或已过期"。点击下载时先调本接口换新链接即可避免。
+    """
+    room = await _get_room(room_code)
+    entry = await RoomCachedFile.filter(
+        room_code=room.room_code, transfer_id=transfer_id
+    ).first()
+    if not entry or not entry.storage_key:
+        raise HTTPException(status_code=404, detail="文件未缓存到服务器")
+    if entry.expires_at and entry.expires_at < await get_now():
+        raise HTTPException(status_code=410, detail="缓存已过期")
+
+    return APIResponse(detail={
+        "download_url": (
+            f"/room/{room.room_code}/file/{transfer_id}/download?"
+            f"{build_download_query(room.room_code, transfer_id)}"
+        ),
+    })
+
+
+@room_api.get("/{room_code}/file/{transfer_id}/download")
+async def download_room_cache_file(
+    request: Request, room_code: str, transfer_id: str, exp: str = "", sig: str = ""
+):
+    """直接下载房间服务器缓存文件（无需 P2P、发送方无需在线）。
+
+    链接带短期签名（exp/sig，由列表接口下发，默认 30 分钟有效）；签名无效或过期即拒绝，
+    避免仅凭"房间码 + transfer_id"被永久访问或转发。
+    """
+    if not verify_download(room_code, transfer_id, exp, sig):
+        raise HTTPException(status_code=403, detail="下载链接无效或已过期，请重新打开缓存文件列表")
+
+    room = await _get_room(room_code)
+    entry = await RoomCachedFile.filter(
+        room_code=room.room_code, transfer_id=transfer_id
+    ).first()
+    if not entry or not entry.storage_key:
+        raise HTTPException(status_code=404, detail="文件未缓存到服务器")
+
+    if entry.expires_at and entry.expires_at < await get_now():
+        raise HTTPException(status_code=410, detail="缓存已过期")
+
+    path = resolve_path(entry.storage_key)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="缓存文件已丢失")
+
+    file_size = path.stat().st_size
+    quoted = quote(entry.file_name or "file")
+    base_headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+        "Accept-Ranges": "bytes",
+    }
+
+    # 断点续传：支持 HTTP Range（单区间）。大文件下载中断后可从断点继续，
+    # 不必重头开始（浏览器/下载工具的中断续传依赖此能力）。
+    rng = parse_range_header(request.headers.get("range") if request else None, file_size)
+    if rng:
+        start, end = rng
+        return StreamingResponse(
+            iter_file_range(path, start, end),
+            status_code=206,
+            media_type="application/octet-stream",
+            headers={
+                **base_headers,
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Content-Length": str(end - start + 1),
+            },
+        )
+
+    return StreamingResponse(
+        iter_file_range(path, 0, max(0, file_size - 1)),
+        media_type="application/octet-stream",
+        headers={**base_headers, "Content-Length": str(file_size)},
+    )
+
+
+@room_api.delete("/{room_code}/file/{transfer_id}")
+async def delete_room_cache_file(room_code: str, transfer_id: str, client_id: str = ""):
+    """删除房间缓存文件：落盘的会删除磁盘数据，同时移除 P2P 持有者记录。
+
+    鉴权：client_id 必填且必须是本房间当前在线成员。client_id 由服务端在 WS join
+    时签发（uuid4 前 16 位），未加入房间者无从得知，因此"该 id 正保持本房间连接"
+    可作为成员凭证。此前 client_id 可缺省，校验被整段跳过 —— 任何匿名请求都能
+    删掉任意房间的缓存文件（含服务器磁盘数据）。
+    """
+    room = await _get_room(room_code)
+    client_id = (client_id or "").strip()[:64]
+    if not client_id or not ws_manager.is_member_online(room.room_code, client_id):
+        raise HTTPException(status_code=403, detail="请先加入房间再操作")
+
+    entry = await RoomCachedFile.filter(
+        room_code=room.room_code, transfer_id=transfer_id
+    ).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    if entry.owner_id and entry.owner_id != client_id:
+        raise HTTPException(status_code=403, detail="只有上传者可以删除该文件")
+
+    if entry.storage_key:
+        await delete_room_file(entry.storage_key)
+    await entry.delete()
+
+    # 同步清空历史里同名文件消息的落盘标记：否则历史仍显示"可下载"，点击却 404
+    await RoomMessage.filter(
+        room_code=room.room_code, msg_type="file", content=transfer_id
+    ).update(storage_key="")
+
+    await ws_manager.broadcast(room.room_code, {
+        "type": "room_cache_removed",
+        "transfer_id": transfer_id,
+    })
+    return APIResponse()
+
+
 # ============ 实时房间WebSocket端点（统一） ============
 # /ws/room 与旧路径 /ws/chat、/ws/transfer、/ws/direct 等价（兼容已分享链接）
 # 聊天消息不落库、无历史接口：文本仅在内存中实时转发（服务器不保存记录）
@@ -2312,7 +2835,17 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                         "transfer_id": c.transfer_id,
                         "file_name": c.file_name,
                         "file_size": c.file_size,
+                        "file_hash": c.file_hash or "",
                         "holders": [h for h in (c.cache_holder_ids or "").split(",") if h],
+                        "holder_names": [n for n in (c.holder_names or "").split(",") if n],
+                        # 服务器已落盘 → 前端可直接下载，不必依赖在线成员
+                        "server_cached": bool(c.storage_key),
+                        "expires_at": c.expires_at.isoformat() if c.expires_at else None,
+                        "download_url": (
+                            f"/room/{room.room_code}/file/{c.transfer_id}/download?"
+                            f"{build_download_query(room.room_code, c.transfer_id)}"
+                            if c.storage_key else ""
+                        ),
                     }
                     for c in cached
                 ]
@@ -2417,14 +2950,39 @@ async def websocket_room(websocket: WebSocket, room_code: str):
             # ============ 文件传输 / 媒体信令 ============
             if mtype == "file_offer":
                 # 文件发送请求 → 广播给其他所有成员（附上发送者 client_id 供对方回复）
-                await ws_manager.broadcast_exclude(room.room_code, websocket, {
+                # save_messages=1：把传输文件元信息落库，供房间历史文件展示（msg_type=file）
+                if room.save_messages and msg.get("transfer_id"):
+                    try:
+                        await RoomMessage.create(
+                            room_code=room.room_code,
+                            sender=nickname or "匿名",
+                            content=str(msg.get("transfer_id") or "")[:64],
+                            msg_type="file",
+                            file_name=str(msg.get("file_name") or "")[:255],
+                            file_size=int(msg.get("file_size") or 0),
+                        )
+                    except Exception:
+                        pass
+                offer_payload = {
                     "type": "file_offer",
                     "transfer_id": msg.get("transfer_id") or "",
                     "file_name": msg.get("file_name") or "",
                     "file_size": msg.get("file_size") or 0,
                     "sender": nickname or "匿名",
                     "from_id": client_id,
-                })
+                }
+                # 上限收口：服务端按 targets 逐个 send_to_client，不设限可被一条消息放大
+                targets = [
+                    t for t in (msg.get("targets") or []) if isinstance(t, str) and t
+                ][:MAX_OFFER_TARGETS]
+                if targets:
+                    # 定向发送：只投递给指定成员。房间内无关成员不再收到文件卡片——
+                    # 既省带宽，也避免把文件名暴露给未参与传输的成员。
+                    for target_id in targets:
+                        await ws_manager.send_to_client(room.room_code, target_id, offer_payload)
+                else:
+                    # 未指定 targets（旧客户端兼容 / 群发语义）→ 广播给其他所有成员
+                    await ws_manager.broadcast_exclude(room.room_code, websocket, offer_payload)
             # WebRTC 信令（P2P 直连协商）→ 定向转发给目标接收者（附上发送者 client_id）
             # crypto_setup：中继分片端到端加密的 ECDH 公钥交换，同样定向转发（密文与密钥均不经过服务端）
             # media_offer/media_answer：传屏幕/传视频的媒体协商信令，接收者主动拉流 → 定向转发给共享者
@@ -2542,7 +3100,7 @@ async def websocket_room(websocket: WebSocket, room_code: str):
 
             # ============ 房间文件缓存（cache_enabled） ============
             elif mtype == "file_cache_ready":
-                # 接收者完成接收并持有了文件 → 记录缓存（该 client_id 加入持有者集合）
+                # 接收者完成接收并持有了文件 → 记录缓存（该 client_id 加入持有者集合，并记昵称）
                 if room.cache_enabled:
                     transfer_id = (msg.get("transfer_id") or "")[:64]
                     if transfer_id:
@@ -2550,12 +3108,17 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                             room_code=room.room_code, transfer_id=transfer_id
                         ).first()
                         holders = set(
-                            (cached.cache_holder_ids or "").split(",") if cached else []
+                            h for h in ((cached.cache_holder_ids or "").split(",") if cached else []) if h
+                        )
+                        holder_names = set(
+                            n for n in ((cached.holder_names or "").split(",") if cached else []) if n
                         )
                         holders.add(client_id)
+                        holder_names.add(nickname or "匿名")
                         if cached:
                             cached.cache_holder_ids = ",".join(holders)
-                            await cached.save(update_fields=["cache_holder_ids"])
+                            cached.holder_names = ",".join(holder_names)
+                            await cached.save(update_fields=["cache_holder_ids", "holder_names"])
                         else:
                             await RoomCachedFile.create(
                                 room_code=room.room_code,
@@ -2564,6 +3127,7 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                                 file_name=(msg.get("file_name") or "")[:255],
                                 file_size=int(msg.get("file_size") or 0),
                                 cache_holder_ids=",".join(holders),
+                                holder_names=",".join(holder_names),
                             )
                         # 广播缓存列表更新（其他成员可从此缓存源收取）
                         await ws_manager.broadcast(room.room_code, {
@@ -2576,17 +3140,34 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                         })
             elif mtype == "file_cache_request":
                 # 成员请求从某个缓存持有者收取文件 → 通知持有者（发起 file_offer 给请求者）
+                # 支持多源加速分片：part_id + range_start/end 时，持有者只需重发该字节区间
                 if room.cache_enabled:
                     holder = (msg.get("holder_id") or "")[:64]
                     if holder:
-                        await ws_manager.send_to_client(room.room_code, holder, {
-                            "type": "file_cache_request",
-                            "transfer_id": (msg.get("transfer_id") or "")[:64],
-                            "file_name": (msg.get("file_name") or "")[:255],
-                            "file_size": int(msg.get("file_size") or 0),
-                            "requester_id": client_id,
-                            "requester_nickname": nickname or "匿名",
-                        })
+                        part_id = (msg.get("part_id") or "")[:64]
+                        r_start = _safe_int(msg.get("range_start"), 0, 0)
+                        r_end = _safe_int(msg.get("range_end"), 0, 0)
+                        # 分片区间非法（含 start > end 的退化区间，如 (0,0)）→ 直接忽略。
+                        # 放行会让持有端退化成"以分片 id 发送整个文件"：
+                        # 合并必然失败，且可被反复触发造成带宽放大。
+                        if part_id and r_end < r_start:
+                            logger.warning(
+                                f"房间缓存分片区间非法，忽略请求: code={room.room_code} "
+                                f"part={part_id} [{r_start}, {r_end}]"
+                            )
+                        else:
+                            await ws_manager.send_to_client(room.room_code, holder, {
+                                "type": "file_cache_request",
+                                "transfer_id": (msg.get("transfer_id") or "")[:64],
+                                "file_name": (msg.get("file_name") or "")[:255],
+                                "file_size": _safe_int(msg.get("file_size"), 0, 0),
+                                "requester_id": client_id,
+                                "requester_nickname": nickname or "匿名",
+                                # 多源分片（可选）：part_id 为该分片传输 id，range 为请求的字节区间
+                                "part_id": part_id,
+                                "range_start": r_start,
+                                "range_end": r_end,
+                            })
     except WebSocketDisconnect:
         pass
     finally:

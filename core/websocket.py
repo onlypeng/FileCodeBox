@@ -99,6 +99,20 @@ class ConnectionManager:
                 return c.get("client_id", "")
         return ""
 
+    def is_member_online(self, code: str, client_id: str) -> bool:
+        """校验 client_id 是否为该房间当前在线成员。
+
+        client_id 由服务端在 join 时签发（uuid4 前 16 位），未加入房间者无从得知，
+        因此"该 id 正在本房间保持 WebSocket 连接"可作为成员身份凭证，
+        用于房间 HTTP 接口（缓存文件上传/删除）的鉴权，阻断匿名越权调用。
+        """
+        if not code or not client_id:
+            return False
+        return any(
+            c.get("client_id") == client_id
+            for c in self.active_connections.get(code, [])
+        )
+
     async def broadcast(self, code: str, message: dict):
         """向房间内所有连接广播消息"""
         if code not in self.active_connections:

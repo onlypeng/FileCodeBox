@@ -75,6 +75,8 @@ class UpdateConfigRequest(BaseModel):
     codeLength: Optional[int] = None
     trustedProxies: Optional[str] = None
     cors_origins: Optional[str] = None
+    # 共享域名：对外分享链接使用的站点地址（留空 = 使用当前访问地址）
+    shareDomain: Optional[str] = None
     mediaDefaultQuality: Optional[str] = None
     directRelayEnabled: Optional[int] = None
     directRelaySpeedLimit: Optional[int] = None
@@ -105,5 +107,9 @@ class UpdateFileRequest(BaseModel):
 
 
 class UpdateRoomRequest(BaseModel):
-    """房间管理：修改人员上限（1~后台 defaultMaxMembers）"""
+    """房间管理：修改人员上限（1~后台 defaultMaxMembers）与功能开关（保存消息/文件缓存）"""
     max_members: Optional[int] = None
+    # 保存聊天消息/文件元信息到服务器（0/1）
+    save_messages: Optional[int] = None
+    # 启用房间文件缓存（已接收成员作为多源转发，0/1）
+    cache_enabled: Optional[int] = None

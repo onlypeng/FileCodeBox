@@ -68,9 +68,19 @@ docker run -d --restart=always \
 
 ```nginx
 location / {
+    # WebSocket 升级转发（实时房间 /ws/room、收件箱实时推送 /ws/collection 必需，
+    # 缺失时房间页会显示"已断开"、收件箱实时进度不更新）
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_pass http://localhost:12345;
+
+    # WebSocket 长连接需要较长的读/写超时（默认 60s 会中断空闲房间连接）
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
 }
 ```
 

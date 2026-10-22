@@ -242,6 +242,14 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # WebSocket 升级转发（实时房间 /ws/room、收件箱实时推送 /ws/collection 必需，
+        # 缺失时房间页显示"已断开"、实时进度不更新）
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
     
     # 静态资源缓存

@@ -214,11 +214,24 @@ class Room(models.Model):
 
 
 class RoomMessage(models.Model):
-    """房间聊天消息（save_messages=1 时落库，随房间过期/删除清理）"""
+    """房间历史记录（save_messages=1 时落库，随房间过期/删除清理）
+    msg_type ∈ text（聊天）/ file（传输过的文件元信息，历史展示用）"""
     id = fields.IntField(pk=True)
     room_code = fields.CharField(max_length=12, index=True)
     sender = fields.CharField(max_length=64, default="匿名")
+    # text：聊天内容；file：transfer_id（供历史文件与缓存文件关联）
     content = fields.TextField(default="")
+    msg_type = fields.CharField(max_length=16, default="text")
+    file_name = fields.CharField(max_length=255, default="")
+    file_size = fields.BigIntField(default=0)
+    # ===== 文件消息专用（msg_type=file）=====
+    # 消息与文件记录不再分家：文件消息本身就是这条记录，额外挂上缓存信息即可。
+    # 内容哈希（去重键）：同一房间内相同内容的文件只落盘一份，重复上传只续期
+    file_hash = fields.CharField(max_length=64, default="", index=True)
+    # 服务器落盘相对路径（相对 data/room_cache）；空串 = 未缓存到服务器
+    storage_key = fields.TextField(default="")
+    # 缓存过期时间；NULL = 跟随房间生命周期（房间过期/删除时统一回收）
+    expires_at = fields.DatetimeField(null=True)
     created_at = fields.DatetimeField(auto_now_add=True)
 
     class Meta:
@@ -235,6 +248,19 @@ class RoomCachedFile(models.Model):
     file_size = fields.BigIntField(default=0)
     # 记录文件已缓存的成员列表（逗号分隔的 client_id）；接收者完成接收后追加
     cache_holder_ids = fields.TextField(default="")
+    # 与 cache_holder_ids 对应的持有者昵称（逗号分隔），供"共享文件"展示用户名
+    holder_names = fields.TextField(default="")
+    # 服务器落盘相对路径（相对 data/room_cache）；空串 = 仅 P2P 转发、未占服务器磁盘
+    storage_key = fields.TextField(default="")
+    # 服务器缓存过期时间；NULL = 跟随房间生命周期（房间过期/删除时统一回收）
+    expires_at = fields.DatetimeField(null=True)
+    # 落盘时间（列表排序与展示）
+    cached_at = fields.DatetimeField(null=True)
+    # 上传者昵称（owner_id 存 client_id，重连后会变，展示用昵称更稳定）
+    uploader_name = fields.CharField(max_length=64, default="")
+    # 内容 SHA-256（服务端落盘时流式计算，非客户端声明值）：
+    # 下发给客户端用于校验"从多源收取并合并后的文件"是否完整
+    file_hash = fields.CharField(max_length=64, default="")
     created_at = fields.DatetimeField(auto_now_add=True)
 
     class Meta:
