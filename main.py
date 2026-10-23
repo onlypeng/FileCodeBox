@@ -33,6 +33,7 @@ from core.tasks import (
     clean_expired_room_cache_files,
     sweep_direct_connections,
 )
+from core.quota import check_global_storage_quota
 from core.utils import hash_password, is_password_hashed, verify_password
 
 
@@ -63,6 +64,7 @@ async def lifespan(app: FastAPI):
     collection_cleanup_task = asyncio.create_task(clean_expired_collections())
     room_cleanup_task = asyncio.create_task(clean_expired_rooms())
     cache_cleanup_task = asyncio.create_task(clean_expired_room_cache_files())
+    quota_task = asyncio.create_task(check_global_storage_quota())
     sweep_task = asyncio.create_task(sweep_direct_connections())
     logger.info("应用初始化完成")
 
@@ -76,6 +78,7 @@ async def lifespan(app: FastAPI):
         collection_cleanup_task.cancel()
         room_cleanup_task.cancel()
         cache_cleanup_task.cancel()
+        quota_task.cancel()
         sweep_task.cancel()
         await asyncio.gather(
             task,
@@ -83,6 +86,7 @@ async def lifespan(app: FastAPI):
             collection_cleanup_task,
             room_cleanup_task,
             cache_cleanup_task,
+            quota_task,
             sweep_task,
             return_exceptions=True,
         )

@@ -19,6 +19,7 @@ from tortoise.expressions import Q
 from tortoise.functions import Count, Sum
 from apps.admin.dependencies import create_token
 from core.room_cache import build_download_query, delete_room_file
+from core.quota import current_storage_usage
 from core.settings import settings, DEFAULT_CONFIG
 from core.utils import get_now, verify_password, pagination
 from core.logger import logger
@@ -87,6 +88,8 @@ async def dashboard():
 
 
 async def _dashboard_stats():
+    # 全局存储占用（文件柜累计 + 房间缓存目录）
+    storage_usage = await current_storage_usage()
     total_stats = await FileCodes.all().annotate(
         total_count=Count("id"), total_size=Sum("size")
     ).first()
@@ -241,6 +244,12 @@ async def _dashboard_stats():
             "openUpload": settings.openUpload,
             "enableChunk": settings.enableChunk,
             "maxSaveSeconds": _expired_retention_seconds(),
+            # 全局存储占用与配额（匿名开放上传时用于观察磁盘增长）
+            "storageUsedBytes": storage_usage["used_bytes"],
+            "storageQuotaMB": storage_usage["quota_mb"],
+            "storageQuotaPercent": storage_usage["percent"],
+            "storageQuotaExceeded": storage_usage["exceeded"],
+            "storageBreakdown": storage_usage["breakdown"],
             "topSuffixes": top_suffixes,
             "recentFiles": recent_files,
             "recentCollections": recent_collections,
