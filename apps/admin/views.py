@@ -20,6 +20,7 @@ from tortoise.functions import Count, Sum
 from apps.admin.dependencies import create_token
 from core.room_cache import build_download_query, delete_room_file
 from core.quota import current_storage_usage
+from core.file_dedup import is_file_referenced_elsewhere
 from core.settings import settings, DEFAULT_CONFIG
 from core.utils import get_now, verify_password, pagination
 from core.logger import logger
@@ -497,7 +498,11 @@ async def delete_collection(collection_id: int):
                 from core.storage import storages
                 file_storage = storages[settings.file_storage]()
                 try:
-                    await file_storage.delete_file(file_code)
+                    # 共享文件需先确认无其它记录引用，避免连带删除
+                    if not await is_file_referenced_elsewhere(
+                        file_code.file_path, file_code.uuid_file_name, file_code.id
+                    ):
+                        await file_storage.delete_file(file_code)
                 except Exception:
                     pass
                 await file_code.delete()

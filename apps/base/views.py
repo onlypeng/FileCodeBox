@@ -60,6 +60,7 @@ from core.room_cache import (
     verify_download,
 )
 from core.room_token import issue_member_token, verify_member_token
+from core.file_dedup import find_duplicate_file, is_file_referenced_elsewhere
 from core.storage import storages, FileStorageInterface, create_zip_stream
 from core.utils import get_now, sanitize_filename, verify_select_token
 from core.websocket import ws_manager
@@ -825,8 +826,26 @@ async def complete_upload(
     prefix, suffix = os.path.splitext(chunk_info.file_name)
 
     try:
-        # 合并文件并计算哈希
+        # 合并文件并计算哈希（服务端权威值）
         _, file_hash = await storage.merge_chunks(upload_id, chunk_info, save_path)
+
+        # ===== 秒传：同内容只存一份 =====
+        # 用服务端算出的哈希查已有未过期文件，命中则复用其落盘、丢弃本次合并结果。
+        # 之后删除记录前必须做引用检查（见 core/file_dedup.is_file_referenced_elsewhere），
+        # 否则删掉任一条记录都会把共享文件一起删掉。
+        dedup = await find_duplicate_file(file_hash, chunk_info.file_size)
+        if dedup is not None and (dedup.file_path, dedup.uuid_file_name) != (
+            path, f"{prefix}{suffix}"
+        ):
+            try:
+                await storage.delete_file_by_path(path, f"{prefix}{suffix}")
+            except Exception as e:
+                logger.warning(f"秒传丢弃重复文件失败（忽略）: {e}")
+            reuse_path, reuse_name = dedup.file_path, dedup.uuid_file_name
+            logger.info(f"文件柜秒传命中: hash={file_hash[:12]} 复用 {reuse_path}/{reuse_name}")
+        else:
+            reuse_path, reuse_name = path, f"{prefix}{suffix}"
+
         # 创建文件记录
         expired_at, expired_count, used_count, code = await get_expire_info(
             data.expire_value, data.expire_style
@@ -841,8 +860,8 @@ async def complete_upload(
             expired_at=expired_at,
             expired_count=expired_count,
             used_count=used_count,
-            file_path=path,
-            uuid_file_name=f"{prefix}{suffix}",
+            file_path=reuse_path,
+            uuid_file_name=reuse_name,
             prefix=prefix,
             suffix=suffix,
             expire_style=data.expire_style,

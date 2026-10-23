@@ -15,6 +15,7 @@ from apps.base.utils import ip_limit, get_chunk_file_path_name
 from core.config import refresh_settings
 from core.settings import settings, data_root
 from core.room_cache import delete_room_dir, delete_room_file, sweep_incoming
+from core.file_dedup import is_file_referenced_elsewhere
 from core.storage import FileStorageInterface, storages
 from core.utils import get_now
 from core.websocket import ws_manager
@@ -76,7 +77,14 @@ async def delete_expire_files():
                 if retention is not None and expired_point is not None and expired_point + retention > now:
                     continue
                 try:
-                    await file_storage.delete_file(exp)
+                    # 秒传会让多条记录共享同一份物理文件，删除前必须确认
+                    # 没有别的记录还在引用它，否则会连带删掉别人的文件
+                    if not await is_file_referenced_elsewhere(
+                        exp.file_path, exp.uuid_file_name, exp.id
+                    ):
+                        await file_storage.delete_file(exp)
+                    else:
+                        logger.info(f"文件仍被其它记录引用，仅删除记录: code={exp.code}")
                 except Exception as e:
                     logger.error(f"删除过期文件失败 code={exp.code}: {e}")
                 try:
@@ -222,7 +230,13 @@ async def _delete_collection_with_files(box) -> None:
             file_code = await FileCodes.filter(id=cf.file_code_id).first()
             if file_code:
                 try:
-                    await file_storage.delete_file(file_code)
+                    # 同上：共享文件需先确认无其它记录引用
+                    if not await is_file_referenced_elsewhere(
+                        file_code.file_path, file_code.uuid_file_name, file_code.id
+                    ):
+                        await file_storage.delete_file(file_code)
+                    else:
+                        logger.info(f"文件仍被其它记录引用，仅删除记录: code={file_code.code}")
                 except Exception as e:
                     logger.error(f"删除收件箱文件失败 code={file_code.code}: {e}")
                 try:

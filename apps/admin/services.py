@@ -1,6 +1,8 @@
 from core.storage import FileStorageInterface, storages
 from core.settings import settings
 from core.config import _sync_ip_limits
+from core.file_dedup import is_file_referenced_elsewhere
+from core.logger import logger
 from apps.base.models import FileCodes, KeyValue
 from fastapi import HTTPException
 from core.utils import hash_password, is_password_hashed
@@ -14,7 +16,14 @@ class FileService:
         file_code = await FileCodes.filter(id=file_id).first()
         if not file_code:
             raise HTTPException(status_code=404, detail="文件不存在")
-        await self.file_storage.delete_file(file_code)
+        # 秒传会让多条记录共享同一份物理文件：仍有其它记录引用时只删记录，
+        # 否则会把别人的文件一起删掉（表现为下载 404）
+        if not await is_file_referenced_elsewhere(
+            file_code.file_path, file_code.uuid_file_name, file_code.id
+        ):
+            await self.file_storage.delete_file(file_code)
+        else:
+            logger.info(f"文件仍被其它记录引用，仅删除记录: code={file_code.code}")
         await file_code.delete()
 
     async def list_files(self, page: int, size: int, keyword: str = "", status: str = ""):
