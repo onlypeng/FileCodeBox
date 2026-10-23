@@ -19,7 +19,7 @@ from tortoise.expressions import Q
 from tortoise.functions import Count, Sum
 from apps.admin.dependencies import create_token
 from core.room_cache import build_download_query, delete_room_file
-from core.settings import settings
+from core.settings import settings, DEFAULT_CONFIG
 from core.utils import get_now, verify_password, pagination
 from core.logger import logger
 from core.websocket import ws_manager
@@ -27,6 +27,17 @@ from core.websocket import ws_manager
 admin_api = APIRouter(
     prefix="/admin", tags=["管理"], dependencies=[Depends(admin_required)]
 )
+
+
+def _using_default_password() -> bool:
+    """是否仍在使用默认管理员口令。
+
+    默认口令是公开常量，仅靠启动日志 warning 不足以阻止它长期留在线上，
+    因此登录后返回该标记，前端据此强制弹出改密弹窗；后端中间件也会
+    拦截除"改密所必需"之外的后台接口。
+    """
+    default_token = str(DEFAULT_CONFIG.get("admin_token") or "")
+    return bool(default_token) and verify_password(default_token, settings.admin_token)
 
 
 @admin_api.post("/login")
@@ -38,13 +49,20 @@ async def login(data: LoginData, ip: str = Depends(ip_limit["error"])):
 
     token = create_token({"is_admin": True})
     logger.info(f"管理后台登录成功: ip={ip}")
-    return APIResponse(detail={"token": token, "token_type": "Bearer"})
+    return APIResponse(detail={
+        "token": token,
+        "token_type": "Bearer",
+        "must_change_password": _using_default_password(),
+    })
 
 
 @admin_api.get("/verify")
 async def verify():
     """校验当前 Token 是否有效（前端路由守卫/页面刷新时调用）"""
-    return APIResponse(detail={"valid": True})
+    return APIResponse(detail={
+        "valid": True,
+        "must_change_password": _using_default_password(),
+    })
 
 
 @admin_api.post("/logout")

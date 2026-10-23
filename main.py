@@ -219,6 +219,27 @@ async def refresh_settings_middleware(request, call_next):
         _config_cache["last_refresh"] = now
     return await call_next(request)
 
+# 仍在使用默认管理员口令时，只放行"能改密码"所必需的后台接口，其余一律拒绝。
+# 目的：默认口令是公开常量，仅靠启动日志 warning 不足以阻止它长期留在线上。
+_PASSWORD_CHANGE_ALLOWLIST = ("/admin/login", "/admin/verify", "/admin/logout", "/admin/config")
+
+
+@app.middleware("http")
+async def force_password_change_middleware(request, call_next):
+    path = request.url.path or ""
+    if not path.startswith("/admin/"):
+        return await call_next(request)
+    if any(path.startswith(p) for p in _PASSWORD_CHANGE_ALLOWLIST):
+        return await call_next(request)
+
+    if verify_password(str(DEFAULT_CONFIG.get("admin_token") or ""), settings.admin_token):
+        return JSONResponse(
+            status_code=403,
+            content={"code": 403, "message": "请先修改默认管理员密码", "detail": None},
+        )
+    return await call_next(request)
+
+
 # 挂载动态 CORS 中间件（白名单运行时读取 settings.cors_origins，后台修改即时生效）
 app.add_middleware(DynamicCORSMiddleware)
 
