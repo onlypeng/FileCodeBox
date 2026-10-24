@@ -34,6 +34,7 @@ from core.tasks import (
     sweep_direct_connections,
 )
 from core.quota import check_global_storage_quota
+from core.capabilities import capability_report
 from core.utils import hash_password, is_password_hashed, verify_password
 
 
@@ -67,6 +68,16 @@ async def lifespan(app: FastAPI):
     quota_task = asyncio.create_task(check_global_storage_quota())
     sweep_task = asyncio.create_task(sweep_direct_connections())
     logger.info("应用初始化完成")
+    # 部署形态提示：说明当前数据库类型下能否多进程部署，避免运维按多 worker 起服务踩坑
+    try:
+        report = capability_report()
+        logger.info(
+            f"部署形态: 数据库={report['db_type']} 多进程支持={report['multi_worker_supported']}"
+        )
+        for reason in report["multi_worker_blockers"]:
+            logger.warning(f"多进程部署限制: {reason}")
+    except Exception as e:
+        logger.warning(f"生成部署形态提示失败: {e}")
 
     try:
         yield

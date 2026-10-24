@@ -1,4 +1,5 @@
 from tortoise import connections
+from core.db_compat import column_exists
 from core.logger import logger
 
 
@@ -16,13 +17,7 @@ async def migrate():
             ("file_name", "VARCHAR(255) DEFAULT ''"),
             ("file_size", "BIGINT DEFAULT 0"),
         ):
-            exists = await conn.execute_query(
-                "SELECT COUNT(*) AS c FROM pragma_table_info('room_message') WHERE name = ?",
-                [column],
-            )
-            rows = exists[1] if len(exists) > 1 else exists[0]
-            count = rows[0]["c"] if rows else 0
-            if count == 0:
+            if not await column_exists('room_message', column):
                 await conn.execute_query(f"ALTER TABLE room_message ADD COLUMN {column} {ddl}")
                 logger.info(f"Migration 025: room_message 新增字段 {column}")
         logger.info("Migration 025: 房间历史记录字段就绪")

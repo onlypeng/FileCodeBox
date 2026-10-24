@@ -1,4 +1,5 @@
 from tortoise import connections
+from core.db_compat import table_exists
 from core.logger import logger
 
 
@@ -50,11 +51,12 @@ async def create_roommessage_table():
 async def migrate_rooms():
     """把旧的 chatroom / transferroom / directroom 数据合并进 room 表"""
     conn = connections.get("default")
-    # 先查旧表是否存在（全新安装时可能没有）
-    tables = await conn.execute_query(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('chatroom','transferroom','directroom')"
-    )
-    exist = {row[0] for row in tables[1]}
+    # 先查旧表是否存在（全新安装时可能没有）——跨库判断，不用 sqlite_master
+    exist = {
+        t
+        for t in ("chatroom", "transferroom", "directroom")
+        if await table_exists(t)
+    }
 
     for table, mode in (("chatroom", "chat"), ("transferroom", "transfer"), ("directroom", "direct")):
         if table not in exist:
@@ -74,10 +76,11 @@ async def migrate_rooms():
 async def migrate_messages():
     """把旧的 chatmessage / directmessage 数据合并进 roommessage 表"""
     conn = connections.get("default")
-    tables = await conn.execute_query(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('chatmessage','directmessage','chatroom','directroom')"
-    )
-    exist = {row[0] for row in tables[1]}
+    exist = {
+        t
+        for t in ("chatmessage", "directmessage", "chatroom", "directroom")
+        if await table_exists(t)
+    }
     if "chatmessage" in exist and "chatroom" in exist:
         await conn.execute_query(
             """

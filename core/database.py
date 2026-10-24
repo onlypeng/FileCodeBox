@@ -16,18 +16,48 @@ _STARTUP_LOCK_FILE = os.path.join(data_root, "filecodebox.startup.lock")
 
 
 def get_db_config() -> dict:
+    """按后台配置的 dbType 生成连接配置。
+
+    - sqlite（默认）：本地文件，单写者，仅支持单进程部署
+    - postgres：tortoise.backends.asyncpg
+    - mysql：tortoise.backends.mysql（需 asyncmy / aiomysql）
+
+    多进程能力由 core.capabilities 按类型判定，不在连接层硬编码业务限制。
+    """
+    from core.settings import settings
+
+    db_type = str(getattr(settings, "dbType", "sqlite") or "sqlite").strip().lower()
+
+    if db_type == "postgres":
+        credentials = {
+            "host": getattr(settings, "dbHost", "127.0.0.1") or "127.0.0.1",
+            "port": int(getattr(settings, "dbPort", 5432) or 5432),
+            "user": getattr(settings, "dbUser", "") or "",
+            "password": getattr(settings, "dbPassword", "") or "",
+            "database": getattr(settings, "dbName", "filecodebox") or "filecodebox",
+            "schema": getattr(settings, "dbSchema", "public") or "public",
+        }
+        engine = "tortoise.backends.asyncpg"
+    elif db_type == "mysql":
+        credentials = {
+            "host": getattr(settings, "dbHost", "127.0.0.1") or "127.0.0.1",
+            "port": int(getattr(settings, "dbPort", 3306) or 3306),
+            "user": getattr(settings, "dbUser", "") or "",
+            "password": getattr(settings, "dbPassword", "") or "",
+            "database": getattr(settings, "dbName", "filecodebox") or "filecodebox",
+        }
+        engine = "tortoise.backends.mysql"
+    else:
+        credentials = {
+            "file_path": _DB_FILE,
+            "journal_mode": "WAL",
+            "busy_timeout": 10000,
+            "foreign_keys": "ON",
+        }
+        engine = "tortoise.backends.sqlite"
+
     return {
-        "connections": {
-            "default": {
-                "engine": "tortoise.backends.sqlite",
-                "credentials": {
-                    "file_path": _DB_FILE,
-                    "journal_mode": "WAL",
-                    "busy_timeout": 10000,
-                    "foreign_keys": "ON",
-                },
-            }
-        },
+        "connections": {"default": {"engine": engine, "credentials": credentials}},
         "apps": {
             "models": {
                 "models": ["apps.base.models"],

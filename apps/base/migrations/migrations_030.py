@@ -1,4 +1,5 @@
 from tortoise import connections
+from core.db_compat import column_exists, index_exists
 from core.logger import logger
 
 # 新增列定义：(列名, DDL 片段)
@@ -21,13 +22,7 @@ async def migrate():
     conn = connections.get("default")
     try:
         for column, ddl in _NEW_COLUMNS:
-            exists = await conn.execute_query(
-                "SELECT COUNT(*) AS c FROM pragma_table_info('room_cached_file') WHERE name = ?",
-                [column],
-            )
-            rows = exists[1] if len(exists) > 1 else exists[0]
-            count = rows[0]["c"] if rows else 0
-            if count == 0:
+            if not await column_exists('room_cached_file', column):
                 await conn.execute_query(ddl)
                 logger.info(f"Migration 030: room_cached_file 新增字段 {column}")
 
@@ -48,11 +43,7 @@ async def migrate():
         logger.info("Migration 030: room_cached_file 内容哈希回填完成")
 
         # 查询索引：按 (room_code, file_hash) 过滤
-        idx = await conn.execute_query(
-            "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='index' AND name='idx_room_cached_file_hash'"
-        )
-        idx_rows = idx[1] if len(idx) > 1 else idx[0]
-        if (idx_rows[0]["c"] if idx_rows else 0) == 0:
+        if not await index_exists('idx_room_cached_file_hash'):
             await conn.execute_query(
                 "CREATE INDEX IF NOT EXISTS idx_room_cached_file_hash"
                 " ON room_cached_file (room_code, file_hash)"

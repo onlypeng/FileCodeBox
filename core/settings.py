@@ -121,6 +121,18 @@ DEFAULT_CONFIG = {
     # + 房间缓存目录占用。超过后不阻止上传，但会持续告警并在后台显示占比；
     # 匿名开放上传（openUpload）时尤其需要设一个值，否则磁盘可能被慢慢写满而无提示。
     "globalStorageQuotaMB": 0,
+    # ===== 数据库 =====
+    # 数据库类型：sqlite（默认，单进程）/ postgres / mysql。
+    # 切换类型时连接参数（dbHost/dbPort/dbUser/dbPassword/dbName）需一并配置。
+    # SQLite 为单写者且房间状态在进程内，仅支持单进程部署；
+    # Postgres / MySQL 才允许多 worker（见 core/capabilities）。
+    "dbType": "sqlite",
+    "dbHost": "127.0.0.1",
+    "dbPort": 0,  # 0 = 用各类型的默认端口（postgres 5432 / mysql 3306）
+    "dbUser": "",
+    "dbPassword": "",
+    "dbName": "filecodebox",
+    "dbSchema": "public",
     # 临时房间默认人员上限（创建时可在 1~该值 之间选择；0 表示不限制）
     "defaultMaxMembers": 10,
     # 共享视频流默认质量档位（low=流畅 / sd=标清 / hd=高清 / auto=按带宽自适应）

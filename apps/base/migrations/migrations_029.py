@@ -1,4 +1,5 @@
 from tortoise import connections
+from core.db_compat import index_exists
 from core.logger import logger
 
 # 唯一索引：同一房间内同一 transfer_id 只允许一条缓存记录
@@ -32,12 +33,7 @@ async def migrate():
             logger.info(f"Migration 029: 清理重复缓存记录 {dup_groups} 组")
 
         # 2) 建唯一索引（幂等）
-        idx = await conn.execute_query(
-            "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='index' AND name=?",
-            [_IDX_NAME],
-        )
-        idx_rows = idx[1] if len(idx) > 1 else idx[0]
-        if (idx_rows[0]["c"] if idx_rows else 0) == 0:
+        if not await index_exists(_IDX_NAME):
             await conn.execute_query(
                 f"CREATE UNIQUE INDEX {_IDX_NAME} ON room_cached_file (room_code, transfer_id)"
             )

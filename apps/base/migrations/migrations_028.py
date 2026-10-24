@@ -1,4 +1,5 @@
 from tortoise import connections
+from core.db_compat import column_exists, index_exists
 from core.logger import logger
 
 # 新增列定义：(列名, DDL 片段)
@@ -25,22 +26,12 @@ async def migrate():
     conn = connections.get("default")
     try:
         for column, ddl in _NEW_COLUMNS:
-            exists = await conn.execute_query(
-                "SELECT COUNT(*) AS c FROM pragma_table_info('room_message') WHERE name = ?",
-                [column],
-            )
-            rows = exists[1] if len(exists) > 1 else exists[0]
-            count = rows[0]["c"] if rows else 0
-            if count == 0:
+            if not await column_exists('room_message', column):
                 await conn.execute_query(ddl)
                 logger.info(f"Migration 028: room_message 新增字段 {column}")
 
         # file_hash 建索引：去重查询按 (room_code, file_hash) 过滤
-        idx = await conn.execute_query(
-            "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='index' AND name='idx_room_message_file_hash'"
-        )
-        idx_rows = idx[1] if len(idx) > 1 else idx[0]
-        if (idx_rows[0]["c"] if idx_rows else 0) == 0:
+        if not await index_exists('idx_room_message_file_hash'):
             await conn.execute_query(
                 "CREATE INDEX IF NOT EXISTS idx_room_message_file_hash ON room_message (room_code, file_hash)"
             )
