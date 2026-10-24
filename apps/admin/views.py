@@ -20,6 +20,7 @@ from tortoise.functions import Count, Sum
 from apps.admin.dependencies import create_token
 from core.room_cache import build_download_query, delete_room_file
 from core.quota import current_storage_usage
+from core.netcheck import check_turn_servers
 from core.file_dedup import is_file_referenced_elsewhere
 from core.settings import settings, DEFAULT_CONFIG
 from core.utils import get_now, verify_password, pagination
@@ -77,6 +78,22 @@ async def logout():
     """
     logger.info("管理后台退出登录")
     return APIResponse()
+
+
+@admin_api.get("/network/turn-check")
+async def turn_check():
+    """TURN 连通性自检。
+
+    TURN 配置错误（域名解析失败、端口未放行、协议不匹配）在服务端没有任何征兆，
+    只有用户报告"传文件一直卡住"才会被发现。此接口供后台主动探测。
+
+    仅验证端口可达，不验证凭据是否正确——凭据问题需在真实协商中暴露。
+    """
+    try:
+        return APIResponse(detail=await check_turn_servers())
+    except Exception as e:
+        logger.error(f"TURN 连通性自检失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="自检失败，请稍后再试")
 
 
 @admin_api.get("/dashboard")
