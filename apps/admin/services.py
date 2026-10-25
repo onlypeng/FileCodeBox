@@ -2,6 +2,7 @@ from core.storage import FileStorageInterface, storages
 from core.settings import settings
 from core.config import _sync_ip_limits
 from core.file_dedup import is_file_referenced_elsewhere
+from core.audit import record
 from core.logger import logger
 from apps.base.models import FileCodes, KeyValue
 from fastapi import HTTPException
@@ -24,6 +25,8 @@ class FileService:
             await self.file_storage.delete_file(file_code)
         else:
             logger.info(f"文件仍被其它记录引用，仅删除记录: code={file_code.code}")
+        await record("delete", target_type="filecode", target_id=str(file_code.code),
+                     result="success", detail="后台删除文件", actor="admin")
         await file_code.delete()
 
     async def list_files(self, page: int, size: int, keyword: str = "", status: str = ""):

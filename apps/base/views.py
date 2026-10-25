@@ -61,6 +61,7 @@ from core.room_cache import (
 )
 from core.room_token import issue_member_token, verify_member_token
 from core.file_dedup import find_duplicate_file, is_file_referenced_elsewhere
+from core.audit import record
 from core.storage import storages, FileStorageInterface, create_zip_stream
 from core.utils import get_now, sanitize_filename, verify_select_token
 from core.websocket import ws_manager
@@ -231,6 +232,8 @@ async def share_file(
             sort_order=0,
         )
         await ip_limit["upload"].add_ip(ip)
+        await record("upload", target_type="filecode", target_id=code,
+                     result="success", detail=f.filename, ip=ip)
         return APIResponse(detail={"code": code, "name": f.filename})
 
     # 多文件模式
@@ -299,6 +302,8 @@ async def share_file(
         await FileItem.create(file_code=file_code, **item_data)
 
     await ip_limit["upload"].add_ip(ip)
+    await record("upload", target_type="filecode", target_id=code,
+                 result="success", detail=f"{len(upload_files)}个文件", ip=ip)
     return APIResponse(detail={"code": code, "name": f"{len(upload_files)}个文件", "is_multi_file": True})
 
 
@@ -491,6 +496,8 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
     if file_code.is_multi_file:
         if not await update_file_usage(file_code):
             return APIResponse(code=410, detail="文件已过期")
+        await record("retrieve", target_type="filecode", target_id=data.code,
+                     detail=f"多文件共 {file_code.size} 字节", ip=ip)
         items = await FileItem.filter(file_code=file_code).order_by("sort_order")
         return APIResponse(
             detail={
@@ -518,6 +525,8 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
 
     if not await update_file_usage(file_code):
         return APIResponse(code=410, detail="文件已过期")
+    await record("retrieve", target_type="filecode", target_id=data.code,
+                 detail=file_code.prefix + file_code.suffix, ip=ip)
     # 文本分享（内容在 remark，无文件路径）→ text 返回 remark 内容；否则返回文件下载 URL
     text_content = file_code.remark if (not file_code.file_path and file_code.remark) else await file_storage.get_file_url(file_code)
     return APIResponse(
@@ -541,6 +550,8 @@ async def download_file(key: str, code: str, ip: str = Depends(ip_limit["error"]
     file_storage: FileStorageInterface = storages[settings.file_storage]()
     if not await verify_select_token(key, code):
         await ip_limit["error"].add_ip(ip)
+        await record("download", target_type="filecode", target_id=code,
+                     result="denied", detail="下载鉴权失败", ip=ip)
         raise HTTPException(status_code=403, detail="下载鉴权失败")
     # 取件次数（count 模式）在 select 阶段已扣减，此处不重复扣减；
     # token 自带有效期（SELECT_TOKEN_TTL），超窗后需重新取件。故此处仅校验：
@@ -561,7 +572,11 @@ async def download_file(key: str, code: str, ip: str = Depends(ip_limit["error"]
     # 文本分享（内容在 remark，无文件路径）→ 直接返回文本内容；否则走文件响应
     if not file_code.file_path and file_code.remark:
         from fastapi.responses import PlainTextResponse
+        await record("download", target_type="filecode", target_id=code,
+                     detail="文本内容", ip=ip)
         return PlainTextResponse(file_code.remark, media_type="text/plain; charset=utf-8")
+    await record("download", target_type="filecode", target_id=code,
+                 detail=file_code.prefix + file_code.suffix, ip=ip)
     return await file_storage.get_file_response(file_code)
 
 
@@ -872,6 +887,8 @@ async def complete_upload(
         # 清理数据库中的分片记录
         await UploadChunk.filter(upload_id=upload_id).delete()
         await ip_limit["upload"].add_ip(ip)
+        await record("upload", target_type="filecode", target_id=code,
+                     result="success", detail=chunk_info.file_name, ip=ip)
         return APIResponse(detail={"code": code, "name": chunk_info.file_name})
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -2653,6 +2670,8 @@ async def upload_room_cache_file(
 
         payload = _cache_entry_payload(entry, room.room_code)
         payload["deduped"] = deduped
+        await record("room_cache_upload", target_type="room", target_id=room.room_code,
+                     result="success", detail=entry.file_name or "", ip=ip)
         # 广播给房间成员，实时更新"缓存文件"入口列表
         await ws_manager.broadcast(room.room_code, {"type": "room_cache_added", "file": payload})
         return APIResponse(detail=payload)
@@ -2774,6 +2793,8 @@ async def delete_room_cache_file(room_code: str, transfer_id: str, client_id: st
         "type": "room_cache_removed",
         "transfer_id": transfer_id,
     })
+    await record("room_cache_delete", target_type="room", target_id=room.room_code,
+                 result="success", detail=transfer_id)
     return APIResponse()
 
 

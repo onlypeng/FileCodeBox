@@ -10,7 +10,7 @@ from typing import Optional
 
 from tortoise.expressions import Q
 
-from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFile, Room, RoomMessage, RoomCachedFile
+from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFile, Room, RoomMessage, RoomCachedFile, AuditLog
 from apps.base.utils import ip_limit, get_chunk_file_path_name
 from core.config import refresh_settings
 from core.settings import settings, data_root
@@ -316,6 +316,27 @@ async def clean_expired_room_cache_files():
             logger.error(f"清理房间缓存文件异常: {e}")
         finally:
             await asyncio.sleep(300)
+
+
+async def clean_expired_audit_logs():
+    """定期清理超过保留期的审计日志。
+
+    下载类操作会持续写审计，长期运行若不清理 audit_log 表会无限增长。
+    auditLogRetentionDays = 0 时不清理（由运维自行归档）。
+    """
+    while True:
+        try:
+            days = int(getattr(settings, "auditLogRetentionDays", 90) or 0)
+            if days > 0:
+                cutoff = await get_now() - datetime.timedelta(days=days)
+                deleted = await AuditLog.filter(created_at__lt=cutoff).delete()
+                if deleted:
+                    logger.info(f"已清理过期审计日志: {deleted} 条（保留 {days} 天）")
+        except Exception as e:
+            logger.error(f"清理审计日志异常: {e}")
+        finally:
+            # 每天检查一次即可
+            await asyncio.sleep(3600)
 
 
 async def sweep_direct_connections():

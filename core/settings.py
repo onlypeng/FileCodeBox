@@ -121,6 +121,9 @@ DEFAULT_CONFIG = {
     # + 房间缓存目录占用。超过后不阻止上传，但会持续告警并在后台显示占比；
     # 匿名开放上传（openUpload）时尤其需要设一个值，否则磁盘可能被慢慢写满而无提示。
     "globalStorageQuotaMB": 0,
+    # 审计日志保留天数（0 = 不清理）。下载类操作会持续写入审计，
+    # 长期运行需设一个保留期，否则 audit_log 表无限增长。
+    "auditLogRetentionDays": 90,
     # ===== 数据库 =====
     # 数据库类型：sqlite（默认，单进程）/ postgres / mysql。
     # 切换类型时连接参数（dbHost/dbPort/dbUser/dbPassword/dbName）需一并配置。

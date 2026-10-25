@@ -281,6 +281,33 @@ class IPLimit(models.Model):
         unique_together = (("bucket", "ip"),)
 
 
+class AuditLog(models.Model):
+    """审计日志：记录"谁在何时对什么做了什么、结果如何"。
+
+    合规与安全事件溯源需要它（例如：某个取件码被哪个 IP 取走过、管理员何时改过配置）。
+    写入统一走 core/audit.record()，该接口保证**不因审计失败影响主流程**。
+    """
+    id = fields.IntField(pk=True)
+    # 动作：upload / retrieve / download / delete / login / login_failed /
+    #      config_update / room_cache_upload / room_cache_delete ...
+    action = fields.CharField(max_length=32, index=True)
+    # 对象类型：filecode / collection / room / admin / system
+    target_type = fields.CharField(max_length=32, default="", index=True)
+    # 对象标识：取件码 / 收件箱码 / 房间码 / 文件 id（系统级操作可为空）
+    target_id = fields.CharField(max_length=64, default="", index=True)
+    # 结果：success / failed / denied
+    result = fields.CharField(max_length=16, default="success")
+    # 补充说明（失败原因、文件名等）
+    detail = fields.CharField(max_length=255, default="")
+    ip = fields.CharField(max_length=64, default="")
+    # 操作者标识（管理员操作记 admin，普通操作留空）
+    actor = fields.CharField(max_length=64, default="")
+    created_at = fields.DatetimeField(auto_now_add=True, index=True)
+
+    class Meta:
+        table = "audit_log"
+
+
 file_codes_pydantic = pydantic_model_creator(FileCodes, name="FileCodes")
 upload_chunk_pydantic = pydantic_model_creator(UploadChunk, name="UploadChunk")
 key_value_pydantic = pydantic_model_creator(KeyValue, name="KeyValue")

@@ -13,13 +13,14 @@ from apps.admin.dependencies import (
 )
 from apps.admin.schemas import IDData, LoginData, UpdateConfigRequest, ExtendExpireRequest, UpdateFileRequest, UpdateRoomRequest
 from core.response import APIResponse
-from apps.base.models import FileCodes, KeyValue, CollectionBox, CollectionFile, Room, RoomMessage, RoomCachedFile
+from apps.base.models import FileCodes, KeyValue, CollectionBox, CollectionFile, Room, RoomMessage, RoomCachedFile, AuditLog
 from apps.base.utils import ip_limit
 from tortoise.expressions import Q
 from tortoise.functions import Count, Sum
 from apps.admin.dependencies import create_token
 from core.room_cache import build_download_query, delete_room_file
 from core.quota import current_storage_usage
+from core.audit import record
 from core.netcheck import check_turn_servers
 from core.file_dedup import is_file_referenced_elsewhere
 from core.settings import settings, DEFAULT_CONFIG
@@ -48,10 +49,13 @@ async def login(data: LoginData, ip: str = Depends(ip_limit["error"])):
     if not verify_password(data.password, settings.admin_token):
         await ip_limit["error"].add_ip(ip)
         logger.warning(f"管理后台登录失败: ip={ip}")
+        await record("login_failed", target_type="admin", result="denied",
+                     detail="密码错误", ip=ip)
         raise HTTPException(status_code=401, detail="密码错误")
 
     token = create_token({"is_admin": True})
     logger.info(f"管理后台登录成功: ip={ip}")
+    await record("login", target_type="admin", result="success", ip=ip, actor="admin")
     return APIResponse(detail={
         "token": token,
         "token_type": "Bearer",
@@ -78,6 +82,53 @@ async def logout():
     """
     logger.info("管理后台退出登录")
     return APIResponse()
+
+
+@admin_api.get("/audit")
+async def audit_list(
+    page: int = 1,
+    size: int = 20,
+    action: str = "",
+    target_id: str = "",
+    result: str = "",
+):
+    """审计日志查询（按时间倒序）。
+
+    合规场景需要回答"某个取件码被谁在何时取走过""管理员何时改过配置"。
+    支持按动作 / 对象标识 / 结果过滤。
+    """
+    page, offset = pagination(page, size)
+
+    qs = AuditLog.all()
+    if action:
+        qs = qs.filter(action=action[:32])
+    if target_id:
+        qs = qs.filter(target_id=target_id[:64])
+    if result:
+        qs = qs.filter(result=result[:16])
+
+    total = await qs.count()
+    rows = await qs.order_by("-id").offset(offset).limit(size)
+
+    return APIResponse(detail={
+        "total": total,
+        "page": page,
+        "size": size,
+        "items": [
+            {
+                "id": r.id,
+                "action": r.action,
+                "target_type": r.target_type,
+                "target_id": r.target_id,
+                "result": r.result,
+                "detail": r.detail,
+                "ip": r.ip,
+                "actor": r.actor,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    })
 
 
 @admin_api.get("/network/turn-check")
@@ -343,6 +394,16 @@ async def update_config(
     # 只取非None的字段
     update_data = {k: v for k, v in data.model_dump().items() if v is not None}
     await config_service.update_config(update_data)
+    # 改管理员密码属于高敏操作，单独留痕（不记录具体口令）
+    if "admin_token" in update_data:
+        await record("config_update", target_type="admin", target_id="password",
+                     result="success", detail="修改管理员密码", actor="admin")
+    else:
+        # 其余配置只记录变更项名称，不记录取值（配置里可能含密钥类字段）
+        fields = ",".join(sorted(update_data.keys()))
+        if fields:
+            await record("config_update", target_type="system",
+                         detail=fields[:255], actor="admin")
     return APIResponse()
 
 
