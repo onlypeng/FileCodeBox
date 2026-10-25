@@ -1,1 +1,0 @@
-import{$ as a,r as s,aq as r,l as n,ar as u,as as d}from"./index-gSLo2CO0.js";const k=a("admin",()=>{const e=s(r()),t=n(()=>!!e.value);return{token:e,hasToken:t,setToken:o=>{e.value=o,u(o)},logout:()=>{e.value="",d()}}});export{k as u};

@@ -168,3 +168,4 @@ themes/
 # 注意：frontend_dist 本身**必须**入库 —— Dockerfile 直接复制它作为前端产物，
 # 一旦忽略会导致镜像里没有前端。只忽略这个隔离目录。
 frontend_dist/assets_old/
+frontend_dist/assets_old*/
