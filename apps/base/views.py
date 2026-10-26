@@ -48,7 +48,7 @@ from apps.base.utils import (
     get_chunk_file_path_name,
 )
 from core.response import APIResponse
-from core.settings import settings
+from core.settings import settings, data_root
 from core.room_cache import (
     build_download_query,
     build_storage_key,
@@ -208,6 +208,9 @@ async def share_file(
         file_size = await validate_file_size(f, settings.uploadSize)
         path, suffix, prefix, uuid_file_name, save_path = await get_file_path_name(f)
         await file_storage.save_file(f, save_path)
+        # 落盘后按实际内容算哈希：接收端据此校验完整性，秒传也复用它。
+        # 与分片上传一致，哈希一律由服务端算，不采信客户端声明值。
+        file_hash = await _sha256_saved_file(save_path)
         file_code = await FileCodes.create(
             code=code,
             prefix=prefix,
@@ -215,6 +218,7 @@ async def share_file(
             uuid_file_name=uuid_file_name,
             file_path=path,
             size=file_size,
+            file_hash=file_hash,
             remark=remark or None,
             expired_at=expired_at,
             expired_count=expired_count,
@@ -473,6 +477,8 @@ async def get_file_info(code: str, ip: str = Depends(ip_limit["error"])):
             "size": file_code.size,
             "text": text_content,
             "remark": file_code.remark or None,
+            # 与 select 一致：下发权威哈希供接收端校验（多文件 zip 不下发）
+            "file_hash": file_code.file_hash or "",
             "created_at": file_code.created_at.isoformat() if file_code.created_at else None,
             "expired_at": file_code.expired_at.isoformat() if file_code.expired_at else None,
             "expire_style": file_code.expire_style,
@@ -537,6 +543,9 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
             "size": file_code.size,
             "text": text_content,
             "remark": file_code.remark or None,
+            # 服务端落盘时流式算出的权威哈希，供接收端下载后校验完整性。
+            # 多文件分支不下发：打包 zip 的内容哈希不固定，无法作为校验基准。
+            "file_hash": file_code.file_hash or "",
             "created_at": file_code.created_at.isoformat() if file_code.created_at else None,
             "expired_at": file_code.expired_at.isoformat() if file_code.expired_at else None,
             "expire_style": file_code.expire_style,
@@ -2386,6 +2395,36 @@ def _is_room_member(room_code: str, client_id: str, member_token: str = "") -> b
     if ws_manager.is_member_online(room_code, client_id):
         return True
     return verify_member_token(room_code, client_id, member_token)
+
+
+async def _sha256_saved_file(save_path: str) -> str:
+    """计算已落盘文件的 SHA-256（权威值，供接收端校验与秒传复用）。
+
+    分片上传的哈希由 merge_chunks 在合并时流式算出；单文件上传没有这条路径，
+    导致 FileCodes.file_hash 为空、接收端拿不到校验基准。这里补上。
+
+    仅在本地存储下计算：外部存储（S3/WebDAV 等）拿不到本地文件路径，
+    返回空串即可（前端会跳过校验，不影响功能）。
+    """
+    if settings.file_storage != "local" or not save_path:
+        return ""
+
+    def _calc(full: str) -> str:
+        h = hashlib.sha256()
+        with open(full, "rb") as fp:
+            for chunk in iter(lambda: fp.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    try:
+        full = str(data_root / save_path)
+        if not os.path.exists(full):
+            return ""
+        # 同步磁盘 I/O：放进线程避免阻塞事件循环
+        return await asyncio.to_thread(_calc, full)
+    except Exception as e:
+        logger.warning(f"计算文件哈希失败（不影响上传）: {e}")
+        return ""
 
 
 async def _room_cached_bytes(room_code: str, exclude_tid: str = "") -> int:
