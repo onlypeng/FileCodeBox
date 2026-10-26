@@ -43,6 +43,32 @@ async def _expired_point(obj) -> Optional[datetime.datetime]:
     return getattr(obj, "created_at", None)
 
 
+def _prune_empty_dirs(root: str) -> int:
+    """删除目录下的空文件夹（含递归后变空的父目录）。
+
+    同步实现，由调用方用 asyncio.to_thread 包起来，避免阻塞事件循环。
+    """
+    removed = 0
+    if not os.path.isdir(root):
+        return removed
+    base = os.path.abspath(root)
+    # topdown=False：先处理子目录，这样子目录被删后变空的父目录也能一并清掉
+    for dirpath, dirs, files in os.walk(root, topdown=False):
+        # 根目录本身不删：它是存储根，删掉后并发写入会出问题
+        if os.path.abspath(dirpath) == base:
+            continue
+        # 用实际内容判断：walk 给的 dirs/files 是遍历时的快照，
+        # 子目录可能已在本次循环中被删，照快照判断会漏掉"刚变空的父目录"
+        try:
+            if not os.listdir(dirpath):
+                os.rmdir(dirpath)
+                removed += 1
+        except OSError:
+            # 刚被占用/并发删除：忽略，下次清理再处理
+            pass
+    return removed
+
+
 async def delete_expire_files():
     """清理过期文件/分享记录（含文件实体）
 
@@ -54,10 +80,10 @@ async def delete_expire_files():
             await refresh_settings()
             file_storage: FileStorageInterface = storages[settings.file_storage]()
             # 遍历 share目录下的所有文件夹，删除空的文件夹，并判断父目录是否为空，如果为空也删除
+            # os.walk 是同步磁盘 I/O，文件多时会阻塞事件循环（期间所有请求都排队），
+            # 因此放进线程执行
             if settings.file_storage == "local":
-                for root, dirs, files in os.walk(f"{data_root}/share/data"):
-                    if not dirs and not files:
-                        os.rmdir(root)
+                await asyncio.to_thread(_prune_empty_dirs, f"{data_root}/share/data")
             await ip_limit["error"].remove_expired_ip()
             await ip_limit["upload"].remove_expired_ip()
             retention = await _retention_delta()

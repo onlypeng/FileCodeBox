@@ -131,6 +131,15 @@ class FileStorageInterface:
         return None
 
 
+def _rmtree_quiet(path) -> str:
+    """删除目录树，失败时返回错误信息而非抛出（供 asyncio.to_thread 调用）。"""
+    try:
+        shutil.rmtree(path)
+        return ""
+    except Exception as e:
+        return str(e)
+
+
 class SystemFileStorage(FileStorageInterface):
     def __init__(self):
         self.chunk_size = 256 * 1024
@@ -261,10 +270,11 @@ class SystemFileStorage(FileStorageInterface):
         """
         chunk_dir = (self.root_path / save_path).parent / 'chunks' / upload_id
         if chunk_dir.exists():
-            try:
-                shutil.rmtree(chunk_dir)
-            except Exception as e:
-                logger.info(f"清理本地分片目录失败: {e}")
+            # rmtree 是同步磁盘 I/O：分片多时（大文件切成上百片）会阻塞事件循环，
+            # 期间所有请求都在排队，因此放进线程执行
+            err = await asyncio.to_thread(_rmtree_quiet, chunk_dir)
+            if err:
+                logger.info(f"清理本地分片目录失败: {err}")
         # 清理父级 chunks 目录（如果为空）
         chunks_parent = chunk_dir.parent
         if chunks_parent.exists() and not any(chunks_parent.iterdir()):
