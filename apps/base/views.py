@@ -16,6 +16,7 @@ from fastapi import APIRouter, Form, UploadFile, File, Depends, HTTPException, R
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette import status
 from tortoise.expressions import F
+from tortoise.functions import Sum
 from tortoise.transactions import in_transaction
 
 from apps.admin.dependencies import share_required_login
@@ -2387,6 +2388,30 @@ def _is_room_member(room_code: str, client_id: str, member_token: str = "") -> b
     return verify_member_token(room_code, client_id, member_token)
 
 
+async def _room_cached_bytes(room_code: str, exclude_tid: str = "") -> int:
+    """统计房间已落盘缓存的字节数。
+
+    原实现是"取出全部行再逐行累加"，房间文件多时会把整表拉进内存再算一遍；
+    配额判断只需要一个总数，交给 SQL 聚合即可。
+
+    exclude_tid 用于排除本次重传的条目本身（重传不重复计入占用）。
+    """
+    try:
+        qs = RoomCachedFile.filter(room_code=room_code).exclude(storage_key="")
+        if exclude_tid:
+            qs = qs.exclude(transfer_id=exclude_tid)
+        rows = await qs.annotate(total=Sum("file_size")).values("total")
+        return int(rows[0]["total"] or 0) if rows else 0
+    except Exception as e:
+        # 聚合失败不能让上传直接 500：退回逐行累加（结果一致，只是慢）
+        logger.warning(f"统计房间缓存占用失败，回退逐行累加: {e}")
+        used = 0
+        for row in await RoomCachedFile.filter(room_code=room_code).all():
+            if row.storage_key and row.transfer_id != exclude_tid:
+                used += row.file_size or 0
+        return used
+
+
 def _safe_int(value, default: int = 0, low: int = 0, high: int | None = None) -> int:
     """把 WS 消息里的数值字段安全转成 int（并做上下界收敛）。
 
@@ -2490,11 +2515,8 @@ async def upload_room_cache_file(
 
         # ===== 房间总容量配额：写前按声明大小预估，落盘后再按实际大小复核 =====
         quota_mb = int(getattr(settings, "roomCacheRoomQuota", 0) or 0)
-        used = 0
+        used = await _room_cached_bytes(room.room_code, exclude_tid=tid)
         if quota_mb > 0:
-            for row in await RoomCachedFile.filter(room_code=room.room_code).all():
-                if row.storage_key and row.transfer_id != tid:
-                    used += row.file_size or 0
             declared_size = int(file.size or 0)
             if used + declared_size > quota_mb * 1024 * 1024:
                 logger.warning(
