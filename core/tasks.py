@@ -15,6 +15,7 @@ from apps.base.utils import ip_limit, get_chunk_file_path_name
 from core.config import refresh_settings
 from core.settings import settings, data_root
 from core.room_cache import delete_room_dir, delete_room_file, sweep_incoming
+from core.db_compat import db_type
 from core.file_dedup import is_file_referenced_elsewhere
 from core.storage import FileStorageInterface, storages
 from core.utils import get_now
@@ -336,6 +337,28 @@ async def clean_expired_audit_logs():
             logger.error(f"清理审计日志异常: {e}")
         finally:
             # 每天检查一次即可
+            await asyncio.sleep(3600)
+
+
+async def sqlite_wal_checkpoint():
+    """定期执行 SQLite WAL checkpoint（仅 SQLite 生效）。
+
+    SQLite 在 WAL 模式下会把写入先放进 `-wal` 文件，默认每 1000 页自动
+    checkpoint 一次；但写入繁忙或存在长读事务时 checkpoint 会被推迟，
+    `-wal` 会持续增长且不会自动回收。TRUNCATE 模式把内容写回主库并截断
+    `-wal`，让"备份 data 目录"真的拿到完整数据（否则只拷 .db 会丢近期写入）。
+    """
+    while True:
+        try:
+            if db_type() == "sqlite":
+                from tortoise import connections
+
+                conn = connections.get("default")
+                await conn.execute_query("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception as e:
+            logger.error(f"SQLite WAL checkpoint 失败: {e}")
+        finally:
+            # 每小时一次即可：checkpoint 本身有 I/O 成本
             await asyncio.sleep(3600)
 
 

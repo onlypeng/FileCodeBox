@@ -662,6 +662,19 @@ cp -r dist/* ../FileCodeBox/frontend_dist/
 <summary><b>如何备份数据？</b></summary>
 
 备份 `data` 目录即可，其中包含数据库和上传的文件。
+
+需要注意三点：
+
+1. **必须在服务停止或刚做过 checkpoint 后备份**。数据库使用 SQLite WAL 模式，
+   近期写入可能还在 `data/filecodebox.db-wal` 里没写回主库，只拷 `.db` 文件会丢数据。
+   直接备份整个 `data` 目录（`*.db` + `*.db-wal` + `*.db-shm`）是安全的；
+   服务运行时每小时会自动执行一次 `wal_checkpoint(TRUNCATE)`，checkpoint 之后
+   `-wal` 会被截断，此时单独拷 `.db` 也完整。
+2. **`data/.room_cache_download_secret` 必须一起备份**。它是房间文件下载链接的
+   签名密钥，首次启动时随机生成；丢失或删除会让**已下发的所有下载链接失效**
+   （已有文件不受影响，重新取链接即可）。
+3. 若配置了外部存储（S3 / WebDAV / OneDrive 等），上传的文件不在 `data` 目录里，
+   需按对应存储另行备份。
 </details>
 
 <details>

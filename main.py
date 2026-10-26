@@ -33,6 +33,7 @@ from core.tasks import (
     clean_expired_room_cache_files,
     sweep_direct_connections,
     clean_expired_audit_logs,
+    sqlite_wal_checkpoint,
 )
 from core.quota import check_global_storage_quota
 from core.capabilities import capability_report
@@ -69,6 +70,7 @@ async def lifespan(app: FastAPI):
     quota_task = asyncio.create_task(check_global_storage_quota())
     sweep_task = asyncio.create_task(sweep_direct_connections())
     audit_cleanup_task = asyncio.create_task(clean_expired_audit_logs())
+    wal_task = asyncio.create_task(sqlite_wal_checkpoint())
     logger.info("应用初始化完成")
     # 部署形态提示：说明当前数据库类型下能否多进程部署，避免运维按多 worker 起服务踩坑
     try:
@@ -94,6 +96,7 @@ async def lifespan(app: FastAPI):
         quota_task.cancel()
         sweep_task.cancel()
         audit_cleanup_task.cancel()
+        wal_task.cancel()
         await asyncio.gather(
             task,
             chunk_cleanup_task,
@@ -103,6 +106,7 @@ async def lifespan(app: FastAPI):
             quota_task,
             sweep_task,
             audit_cleanup_task,
+            wal_task,
             return_exceptions=True,
         )
         await Tortoise.close_connections()
