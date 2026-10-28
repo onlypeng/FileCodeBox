@@ -124,6 +124,19 @@ DEFAULT_CONFIG = {
     # 审计日志保留天数（0 = 不清理）。下载类操作会持续写入审计，
     # 长期运行需设一个保留期，否则 audit_log 表无限增长。
     "auditLogRetentionDays": 90,
+    # ===== 病毒扫描（可选） =====
+    # 默认关闭：未配置钩子时零开销。启用后上传落盘会回调外部扫描服务。
+    "virusScanEnabled": False,
+    # 扫描钩子，两种形态：
+    #   命令（本地）："clamscan --no-summary {file}" —— 返回码 0 干净 / 1 感染
+    #   HTTP：        "https://scan.example.com/check" —— POST 文件，返回
+    #                 {"infected": true/false, "reason": "..."}
+    "virusScanHook": "",
+    # 单次扫描超时（秒，1~300）
+    "virusScanTimeoutSec": 30,
+    # 扫描服务不可用/超时时的策略：True = 放行并告警（扫描是辅助能力，不该让
+    # 上传功能整体不可用）；False = 拒绝上传（安全优先于可用性）
+    "virusScanFailOpen": True,
     # ===== 数据库 =====
     # 数据库类型：sqlite（默认，单进程）/ postgres / mysql。
     # 切换类型时连接参数（dbHost/dbPort/dbUser/dbPassword/dbName）需一并配置。

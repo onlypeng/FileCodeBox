@@ -213,6 +213,8 @@ async def share_file(
         file_size = await validate_file_size(f, settings.uploadSize)
         path, suffix, prefix, uuid_file_name, save_path = await get_file_path_name(f)
         await file_storage.save_file(f, save_path)
+        # 落盘后过安全扫描（未启用则直接返回），命中则拒绝并删除已落盘文件
+        await _scan_guard(save_path)
         # 落盘后按实际内容算哈希：接收端据此校验完整性，秒传也复用它。
         # 与分片上传一致，哈希一律由服务端算，不采信客户端声明值。
         file_hash = await _sha256_saved_file(save_path)
@@ -2449,6 +2451,40 @@ def _is_room_member(room_code: str, client_id: str, member_token: str = "") -> b
     if ws_manager.is_member_online(room_code, client_id):
         return True
     return verify_member_token(room_code, client_id, member_token)
+
+
+async def _scan_guard(save_path: str) -> None:
+    """落盘后过一遍病毒扫描钩子；未启用或已通过则直接返回。
+
+    命中恶意内容时抛 403；扫描"没得出结论"时按 virusScanFailOpen 决定
+    放行还是拒绝（默认放行并告警）。
+    """
+    if settings.file_storage != "local" or not save_path:
+        # 外部存储拿不到本地文件路径，跳过
+        return
+
+    from core.scan import scan_file, should_block_when_scan_failed
+
+    full = str(data_root / save_path)
+    clean, detail, ran = await scan_file(full)
+    if not ran:
+        return
+    if clean and not detail:
+        return
+    def _discard() -> None:
+        # 拦截时必须删除已落盘文件，否则被判定为恶意的文件会一直留在磁盘上
+        try:
+            os.remove(full)
+        except OSError as e:
+            logger.error(f"删除被拦截的上传文件失败 {full}: {e}")
+
+    if not clean:
+        logger.warning(f"上传文件被安全扫描拦截: {detail}")
+        await asyncio.to_thread(_discard)
+        raise HTTPException(status_code=403, detail=f"文件未通过安全扫描：{detail}")
+    if should_block_when_scan_failed(detail):
+        await asyncio.to_thread(_discard)
+        raise HTTPException(status_code=403, detail=f"文件安全扫描未完成：{detail}")
 
 
 def _new_owner_token() -> str:

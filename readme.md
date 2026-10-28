@@ -701,6 +701,38 @@ cp -r dist/* ../FileCodeBox/frontend_dist/
 服务器中转时可调整 `directRelayChunkSize`（分片大小，默认 64KB）与 `directRelaySpeedLimit`（限速）；单次中转文件过大可调 `directMaxRelaySize`（默认不限制）。多摄像头共享同时开流数量受浏览器/设备能力限制，桌面端最多同时共享 4 路。
 </details>
 
+<details>
+<summary><b>如何接入病毒扫描？</b></summary>
+
+本项目的定位是自建轻量分享，**不内置扫描引擎**，但留了钩子：上传落盘后回调外部扫描服务，命中则拒绝并删除文件。默认关闭，未配置时零开销。
+
+在后台「系统配置」中设置：
+
+| 配置项 | 说明 |
+|---|---|
+| `virusScanEnabled` | 是否启用（默认关闭） |
+| `virusScanHook` | 扫描钩子，见下方两种形态 |
+| `virusScanTimeoutSec` | 单次扫描超时，默认 30 秒（1~300） |
+| `virusScanFailOpen` | 扫描服务不可用时的策略，默认 `true` 放行并告警 |
+
+钩子的两种形态：
+
+- **本地命令**（沿用 clamscan 约定：返回码 0 = 干净，1 = 感染）
+  ```
+  clamscan --no-summary {file}
+  ```
+  `{file}` 会被替换成待扫描文件路径。命令**不经 shell**执行，文件名不会被当作命令行解析。
+- **HTTP 接口**
+  ```
+  https://scan.example.com/check
+  ```
+  以 multipart 上传文件（字段名 `file`），约定返回 `{"infected": false, "reason": ""}`。
+
+关于 `virusScanFailOpen`：扫描是辅助能力，默认在扫描器挂掉/超时时**放行并记告警**，避免扫描服务故障导致整个上传功能不可用。若你的场景安全优先于可用性，把它设为 `false`，此时扫描没得出结论会直接拒绝上传。
+
+注意：外部存储（S3 / WebDAV / OneDrive）下拿不到本地文件路径，扫描会自动跳过。
+</details>
+
 ---
 
 ## 📜 免责声明
