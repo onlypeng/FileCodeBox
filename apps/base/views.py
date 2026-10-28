@@ -274,10 +274,23 @@ async def share_file(
 
     # 验证通过后再保存文件
     saved_paths = []
+
+    async def _rollback_saved() -> None:
+        """回滚本次已保存的文件（保存失败或被安全扫描拦截时）。"""
+        for sp in saved_paths:
+            try:
+                temp_code = FileCodes(file_path=path, uuid_file_name=os.path.basename(sp))
+                await file_storage.delete_file(temp_code)
+            except Exception:
+                pass
+
     try:
         for f, file_size, filename, prefix, suffix, save_path, idx in validated_files:
             await file_storage.save_file(f, save_path)
             saved_paths.append(save_path)
+            # 逐个过安全扫描（未启用则直接返回）。命中会抛 403，
+            # 由下面 except HTTPException 原样透传并回滚，避免被误转成 500
+            await _scan_guard(save_path)
             file_items_data.append({
                 "file_name": f"{prefix}{suffix}",
                 "file_size": file_size,
@@ -285,15 +298,12 @@ async def share_file(
                 "uuid_file_name": filename,
                 "sort_order": idx,
             })
+    except HTTPException:
+        # 扫描拦截等带明确状态码的失败：原样抛出（不要吞成 500）
+        await _rollback_saved()
+        raise
     except Exception as e:
-        # 保存失败时回滚已保存的文件
-        for sp in saved_paths:
-            try:
-                # 构造临时 FileCodes 对象用于删除
-                temp_code = FileCodes(file_path=path, uuid_file_name=os.path.basename(sp))
-                await file_storage.delete_file(temp_code)
-            except Exception:
-                pass
+        await _rollback_saved()
         raise HTTPException(status_code=500, detail="文件保存失败，请重试")
 
     owner_token = _new_owner_token()
@@ -929,6 +939,11 @@ async def complete_upload(
         expired_at, expired_count, used_count, code = await get_expire_info(
             data.expire_value, data.expire_style
         )
+        # 落盘后过安全扫描：秒传命中时复用的是共享文件，拦截也不能删它
+        if (reuse_path, reuse_name) == (path, f"{prefix}{suffix}"):
+            await _scan_guard(save_path)
+        else:
+            await _scan_guard(f"{reuse_path}/{reuse_name}", allow_delete=False)
         owner_token = _new_owner_token()
         await FileCodes.create(
             code=code,
@@ -2453,11 +2468,14 @@ def _is_room_member(room_code: str, client_id: str, member_token: str = "") -> b
     return verify_member_token(room_code, client_id, member_token)
 
 
-async def _scan_guard(save_path: str) -> None:
+async def _scan_guard(save_path: str, allow_delete: bool = True) -> None:
     """落盘后过一遍病毒扫描钩子；未启用或已通过则直接返回。
 
     命中恶意内容时抛 403；扫描"没得出结论"时按 virusScanFailOpen 决定
     放行还是拒绝（默认放行并告警）。
+
+    allow_delete=False 用于**秒传复用的共享文件**：那条物理文件还被别的记录
+    引用着，本次上传被拦截可以拒绝，但绝不能把它删掉。
     """
     if settings.file_storage != "local" or not save_path:
         # 外部存储拿不到本地文件路径，跳过
@@ -2473,6 +2491,10 @@ async def _scan_guard(save_path: str) -> None:
         return
     def _discard() -> None:
         # 拦截时必须删除已落盘文件，否则被判定为恶意的文件会一直留在磁盘上
+        if not allow_delete:
+            # 共享文件：不删（别的记录还在引用），只拒绝本次上传
+            logger.warning(f"安全扫描命中但文件被多条记录共享，保留文件: {full}")
+            return
         try:
             os.remove(full)
         except OSError as e:

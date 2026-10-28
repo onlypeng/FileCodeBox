@@ -89,6 +89,31 @@ class UpdateConfigRequest(BaseModel):
     expiredRetentionStyle: Optional[str] = None
     expiredRetentionValue: Optional[int] = None
     directTurnServers: Optional[List[dict]] = None
+    # ===== 房间文件缓存 =====
+    # 启用房间文件缓存（0/1）
+    roomCacheEnabled: Optional[int] = None
+    # 单文件大小上限（MB）
+    roomCacheMaxSize: Optional[int] = None
+    # 单房间总容量配额（MB）
+    roomCacheRoomQuota: Optional[int] = None
+    # 缓存文件默认保留时长（小时）
+    roomCacheDefaultHours: Optional[int] = None
+    # ===== 全局容量配额（F2）：0=不限制，达到阈值时后台告警 =====
+    globalStorageQuotaMB: Optional[int] = None
+    # ===== 审计日志保留天数（0=不清理） =====
+    auditLogRetentionDays: Optional[int] = None
+    # ===== 病毒扫描钩子 =====
+    virusScanEnabled: Optional[int] = None
+    virusScanHook: Optional[str] = None
+    virusScanTimeoutSec: Optional[int] = None
+    # 扫描服务不可用时是否放行（1=放行并告警，0=拒绝上传）
+    virusScanFailOpen: Optional[int] = None
+    # 可选主题列表（与 directTurnServers 同为结构化列表）
+    themesChoices: Optional[List[dict]] = None
+
+    # 注意：dbType / dbHost / dbPort / dbName / dbUser / dbPassword / dbSchema
+    # **故意不放进白名单**——数据库连接属于基础设施配置，需通过环境变量/配置文件
+    # 设定并重启生效；在后台改既不生效也容易让人误以为已切换。
 
 
 class ExtendExpireRequest(BaseModel):
