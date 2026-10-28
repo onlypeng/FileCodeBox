@@ -4,6 +4,8 @@ from typing import Optional
 
 class SelectFileModel(BaseModel):
     code: str
+    # 提取口令（二次口令）：分享创建时可选设置，未设置时忽略该字段
+    access_code: str = ""
 
 
 class RevokeFileModel(BaseModel):
@@ -23,6 +25,8 @@ class CompleteUploadModel(BaseModel):
     expire_value: int
     expire_style: str
     remark: str = ""
+    # 提取口令（二次口令），可选；为空表示不需要
+    access_code: str = ""
 
 
 # 预签名上传相关模型
@@ -33,6 +37,11 @@ class PresignUploadInitRequest(BaseModel):
     expire_value: int = 1
     expire_style: str = "day"
     remark: str = ""
+
+
+class PresignConfirmRequest(BaseModel):
+    """直传确认请求：只有二次口令需要客户端在确认时补上（其余取会话里的值）。"""
+    access_code: str = ""
 
 
 # 收件箱相关模型

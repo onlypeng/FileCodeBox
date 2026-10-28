@@ -39,6 +39,7 @@ from apps.base.schemas import (
     InitChunkUploadModel,
     CompleteUploadModel,
     PresignUploadInitRequest,
+    PresignConfirmRequest,
     CreateCollectionRequest,
     UpdateCollectionConfigRequest,
     CreateRoomRequest,
@@ -67,7 +68,14 @@ from core.room_token import issue_member_token, verify_member_token
 from core.file_dedup import find_duplicate_file, is_file_referenced_elsewhere
 from core.audit import record
 from core.storage import storages, FileStorageInterface, create_zip_stream
-from core.utils import get_now, sanitize_filename, verify_select_token
+from core.utils import (
+    get_now,
+    get_select_token,
+    hash_password,
+    sanitize_filename,
+    verify_password,
+    verify_select_token,
+)
 from core.websocket import ws_manager
 from core.tasks import CollectionEvents
 
@@ -154,6 +162,7 @@ async def share_file(
     expire_value: int = Form(default=1, gt=0),
     expire_style: str = Form(default="day"),
     remark: str = Form(default=""),
+    access_code: str = Form(default=""),
     file: Optional[UploadFile] = File(None),
     files: List[UploadFile] = File(default=[]),
     ip: str = Depends(ip_limit["upload"]),
@@ -163,6 +172,9 @@ async def share_file(
 
     # 校验文件备注长度（与文本分享 maxTextLength 一致）
     _validate_remark(remark)
+
+    # 可选二次口令：非空则落哈希，取件时必须同时提供
+    access_code_hash = _hash_access_code(access_code)
 
     file_storage: FileStorageInterface = storages[settings.file_storage]()
 
@@ -190,6 +202,7 @@ async def share_file(
             expire_style=expire_style,
             expire_value=expire_value,
             owner_token=owner_token,
+            access_code_hash=access_code_hash,
         )
         await ip_limit["upload"].add_ip(ip)
         return APIResponse(detail={"code": code, "owner_token": owner_token})
@@ -235,6 +248,7 @@ async def share_file(
             expire_style=expire_style,
             expire_value=expire_value,
             owner_token=owner_token,
+            access_code_hash=access_code_hash,
         )
         # 为单文件也创建 FileItem 记录
         await FileItem.create(
@@ -322,6 +336,7 @@ async def share_file(
         expire_style=expire_style,
         expire_value=expire_value,
         owner_token=owner_token,
+        access_code_hash=access_code_hash,
     )
 
     for item_data in file_items_data:
@@ -412,7 +427,7 @@ async def check_code_type(code: str, ip: str = Depends(ip_limit["error"])):
 
 
 @share_api.get("/select/")
-async def get_code_file(code: str, ip: str = Depends(ip_limit["error"])):
+async def get_code_file(code: str, access_code: str = "", ip: str = Depends(ip_limit["error"])):
     file_storage: FileStorageInterface = storages[settings.file_storage]()
     has, file_code = await get_code_file_by_code(code)
     if not has:
@@ -420,6 +435,11 @@ async def get_code_file(code: str, ip: str = Depends(ip_limit["error"])):
         return APIResponse(code=404, detail=file_code)
 
     assert isinstance(file_code, FileCodes)
+
+    # 二次口令：未通过则不进入任何"消耗次数/返回内容"的分支
+    await _require_access_code(file_code, access_code, ip)
+    protected = bool(file_code.access_code_hash or "")
+    access_key = await get_select_token(file_code.code) if protected else ""
 
     # 多文件模式：返回文件列表
     if file_code.is_multi_file:
@@ -432,6 +452,7 @@ async def get_code_file(code: str, ip: str = Depends(ip_limit["error"])):
             "size": file_code.size,
             "remark": file_code.remark or None,
             "is_multi_file": True,
+            "access_key": access_key,
             "items": [
                 {
                     "id": item.id,
@@ -448,10 +469,19 @@ async def get_code_file(code: str, ip: str = Depends(ip_limit["error"])):
 
 
 @share_api.get("/select/info/")
-async def get_file_info(code: str, ip: str = Depends(ip_limit["error"])):
+async def get_file_info(
+    code: str,
+    access_code: str = "",
+    owner_token: str = "",
+    ip: str = Depends(ip_limit["error"]),
+):
     """只读查询文件分享详情（不消耗取件次数）：
     返回与 select_file 相同结构 + expired_count（实时剩余次数），供记录查看刷新；
-    已过期返回 410，不存在返回 404。"""
+    已过期返回 410，不存在返回 404。
+
+    设了二次口令的分享：只有发起者本人（持 owner_token）或提供正确口令时才回详情，
+    否则只回"需要口令"与过期状态 —— 否则知道取件码就能把文件名/大小探出来。
+    """
     code = _validate_code(code)
     has, file_code = await get_code_file_by_code(code)
     if not has:
@@ -460,6 +490,19 @@ async def get_file_info(code: str, ip: str = Depends(ip_limit["error"])):
 
     assert isinstance(file_code, FileCodes)
 
+    protected = bool(file_code.access_code_hash or "")
+    is_owner = bool(
+        protected
+        and owner_token
+        and file_code.owner_token
+        and hmac.compare_digest(owner_token, file_code.owner_token)
+    )
+    access_ok = (
+        not protected
+        or is_owner
+        or await _verify_access_code(file_code, access_code)
+    )
+
     # 次数模式次数用尽 / 时间型已过期
     if file_code.expired_count == 0 or (
         file_code.expired_count < 0
@@ -467,6 +510,27 @@ async def get_file_info(code: str, ip: str = Depends(ip_limit["error"])):
         and file_code.expired_at < await get_now()
     ):
         return APIResponse(code=410, detail="文件已过期")
+
+    if not access_ok:
+        # 只回"需要口令"与过期状态：文件名、大小、哈希、子项一律不下发
+        return APIResponse(
+            detail={
+                "code": file_code.code,
+                "name": "",
+                "size": 0,
+                "text": "",
+                "remark": None,
+                "require_access_code": True,
+                "file_hash": "",
+                "created_at": file_code.created_at.isoformat() if file_code.created_at else None,
+                "expired_at": file_code.expired_at.isoformat() if file_code.expired_at else None,
+                "expire_style": file_code.expire_style,
+                "expire_value": file_code.expire_value,
+                "expired_count": file_code.expired_count,
+                "is_multi_file": False,
+                "items": [],
+            }
+        )
 
     if file_code.is_multi_file:
         items = await FileItem.filter(file_code=file_code).order_by("sort_order")
@@ -477,6 +541,7 @@ async def get_file_info(code: str, ip: str = Depends(ip_limit["error"])):
                 "size": file_code.size,
                 "text": "",
                 "remark": file_code.remark or None,
+                "require_access_code": protected,
                 "is_multi_file": True,
                 "created_at": file_code.created_at.isoformat() if file_code.created_at else None,
                 "expired_at": file_code.expired_at.isoformat() if file_code.expired_at else None,
@@ -503,6 +568,7 @@ async def get_file_info(code: str, ip: str = Depends(ip_limit["error"])):
             "size": file_code.size,
             "text": text_content,
             "remark": file_code.remark or None,
+            "require_access_code": protected,
             # 与 select 一致：下发权威哈希供接收端校验（多文件 zip 不下发）
             "file_hash": file_code.file_hash or "",
             "created_at": file_code.created_at.isoformat() if file_code.created_at else None,
@@ -525,6 +591,13 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
 
     assert isinstance(file_code, FileCodes)
 
+    # 二次口令：口令未通过时不扣取件次数、也不下发任何文件信息
+    await _require_access_code(file_code, data.access_code, ip)
+    protected = bool(file_code.access_code_hash or "")
+    # 多文件下载走 /download/item 与 /zip，这两个入口只认取件码；
+    # 口令通过后下发短期 token，前端带上它才允许下载（否则知道码即可绕过口令）
+    access_key = await get_select_token(file_code.code) if protected else ""
+
     # 多文件模式：返回文件列表信息
     if file_code.is_multi_file:
         if not await update_file_usage(file_code):
@@ -540,6 +613,7 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
                 "text": "",
                 "remark": file_code.remark or None,
                 "is_multi_file": True,
+                "access_key": access_key,
                 "created_at": file_code.created_at.isoformat() if file_code.created_at else None,
                 "expired_at": file_code.expired_at.isoformat() if file_code.expired_at else None,
                 "expire_style": file_code.expire_style,
@@ -882,6 +956,9 @@ async def complete_upload(
     # 校验文件备注长度（与文本分享 maxTextLength 一致）
     _validate_remark(data.remark)
 
+    # 可选二次口令（分片上传在"完成"时给出，无需在上传会话里落库）
+    access_code_hash = _hash_access_code(data.access_code)
+
     # 获取上传基本信息
     chunk_info = await UploadChunk.filter(upload_id=upload_id, chunk_index=-1).first()
     if not chunk_info:
@@ -962,6 +1039,7 @@ async def complete_upload(
             expire_style=data.expire_style,
             expire_value=data.expire_value,
             owner_token=owner_token,
+            access_code_hash=access_code_hash,
         )
         # 清理临时文件
         await storage.clean_chunks(upload_id, save_path)
@@ -1069,7 +1147,10 @@ async def presign_upload_init(
     "/upload/proxy/{upload_id}", dependencies=[Depends(share_required_login)]
 )
 async def presign_upload_proxy(
-    upload_id: str, file: UploadFile = File(...), ip: str = Depends(ip_limit["upload"])
+    upload_id: str,
+    file: UploadFile = File(...),
+    access_code: str = Form(default=""),
+    ip: str = Depends(ip_limit["upload"]),
 ):
     """代理模式上传，服务器转存到存储后端"""
     session = await _get_valid_session(upload_id, expected_mode="proxy")
@@ -1091,6 +1172,7 @@ async def presign_upload_proxy(
         session.expire_value,
         session.expire_style,
         remark=session.remark or None,
+        access_code_hash=_hash_access_code(access_code),
     )
 
     await session.delete()
@@ -1101,7 +1183,11 @@ async def presign_upload_proxy(
 @presign_api.post(
     "/upload/confirm/{upload_id}", dependencies=[Depends(share_required_login)]
 )
-async def presign_upload_confirm(upload_id: str, ip: str = Depends(ip_limit["upload"])):
+async def presign_upload_confirm(
+    upload_id: str,
+    data: Optional[PresignConfirmRequest] = None,
+    ip: str = Depends(ip_limit["upload"]),
+):
     """直传确认，客户端完成S3直传后调用获取分享码"""
     session = await _get_valid_session(upload_id, expected_mode="direct")
 
@@ -1132,6 +1218,7 @@ async def presign_upload_confirm(upload_id: str, ip: str = Depends(ip_limit["upl
         session.expire_value,
         session.expire_style,
         remark=session.remark or None,
+        access_code_hash=_hash_access_code((data.access_code if data else "")),
     )
 
     await session.delete()
@@ -1188,7 +1275,7 @@ async def presign_upload_cancel(upload_id: str):
 
 
 @share_api.get("/download/item/{item_id}")
-async def download_single_file(item_id: int, code: str, ip: str = Depends(ip_limit["error"])):
+async def download_single_file(item_id: int, code: str, key: str = "", ip: str = Depends(ip_limit["error"])):
     """下载多文件分享中的单个文件"""
     file_item = await FileItem.filter(id=item_id).first()
     if not file_item:
@@ -1199,6 +1286,13 @@ async def download_single_file(item_id: int, code: str, ip: str = Depends(ip_lim
     if not file_code or file_code.code != code:
         await ip_limit["error"].add_ip(ip)
         raise HTTPException(403, "取件码不匹配")
+
+    # 二次口令保护的分享：本入口只认取件码，必须再校验 select 阶段下发的 token
+    if file_code.access_code_hash and not await verify_select_token(key, code):
+        await ip_limit["error"].add_ip(ip)
+        await record("download", target_type="filecode", target_id=code,
+                     result="denied", detail="缺少提取口令 token", ip=ip)
+        raise HTTPException(403, "需要提取口令")
 
     if await file_code.is_expired():
         raise HTTPException(404, "文件已过期")
@@ -1252,7 +1346,7 @@ async def download_single_file(item_id: int, code: str, ip: str = Depends(ip_lim
 
 
 @share_api.get("/zip/{code}")
-async def download_zip(code: str, ip: str = Depends(ip_limit["error"])):
+async def download_zip(code: str, key: str = "", ip: str = Depends(ip_limit["error"])):
     """流式打包下载文件（单文件分享同样支持打包）"""
     has, file_code = await get_code_file_by_code(code)
     if not has:
@@ -1263,6 +1357,13 @@ async def download_zip(code: str, ip: str = Depends(ip_limit["error"])):
         raise HTTPException(404, "文件不存在")
 
     assert isinstance(file_code, FileCodes)
+
+    # 二次口令保护的分享：打包入口同样要 token，否则知道码即可整包拖走
+    if file_code.access_code_hash and not await verify_select_token(key, file_code.code):
+        await ip_limit["error"].add_ip(ip)
+        await record("download", target_type="filecode", target_id=file_code.code,
+                     result="denied", detail="打包下载缺少提取口令 token", ip=ip)
+        raise HTTPException(403, "需要提取口令")
 
     # 单文件分享也创建了 FileItem 记录，因此同样可以打包下载
     items = await FileItem.filter(file_code=file_code).order_by("sort_order")
@@ -1303,6 +1404,62 @@ def _validate_code(code: str) -> str:
     if not _CODE_PATTERN.match(code):
         raise HTTPException(status_code=400, detail="码格式错误，必须为4-12位大写字母和数字")
     return code
+
+
+_ACCESS_CODE_MIN_LEN = 2
+_ACCESS_CODE_MAX_LEN = 32
+
+
+def _hash_access_code(raw: str) -> Optional[str]:
+    """把可选的提取口令转成待入库哈希；空串表示该分享不启用二次口令。
+
+    存 PBKDF2 哈希而非明文：库被拖走时口令不可逆推。迭代次数沿用管理员口令那套
+    参数，等于给在线爆破加了"每次尝试都要算一次 KDF"的成本。
+    """
+    code = (raw or "").strip()
+    if not code:
+        return None
+    if not (_ACCESS_CODE_MIN_LEN <= len(code) <= _ACCESS_CODE_MAX_LEN):
+        raise HTTPException(
+            status_code=400,
+            detail=f"提取口令长度需为{_ACCESS_CODE_MIN_LEN}-{_ACCESS_CODE_MAX_LEN}位",
+        )
+    return hash_password(code)
+
+
+async def _verify_access_code(file_code: FileCodes, raw: str) -> bool:
+    """校验提取口令。未设置口令（存量分享）恒为 True。"""
+    stored = file_code.access_code_hash or ""
+    if not stored:
+        return True
+    provided = (raw or "").strip()
+    if not provided:
+        return False
+    # PBKDF2 是同步 CPU 计算（约几十毫秒），放线程池避免阻塞事件循环
+    return await asyncio.to_thread(verify_password, provided, stored)
+
+
+async def _require_access_code(file_code: FileCodes, raw: str, ip: str) -> None:
+    """口令校验失败时拒绝，并计入错误限流。
+
+    刻意**不**消耗取件次数：否则攻击者猜错几次就能把别人的分享额度烧光，
+    变成拒绝服务手段。次数只在口令校验通过后由 update_file_usage 扣减。
+    """
+    if await _verify_access_code(file_code, raw):
+        return
+    await ip_limit["error"].add_ip(ip)
+    provided = bool((raw or "").strip())
+    await record(
+        "retrieve",
+        target_type="filecode",
+        target_id=file_code.code,
+        result="denied",
+        detail="提取口令错误" if provided else "缺少提取口令",
+        ip=ip,
+    )
+    raise HTTPException(
+        status_code=403, detail="提取口令错误，请重新输入" if provided else "该分享需要提取口令"
+    )
 
 
 def _expire_to_seconds(expire_style: str, expire_value: int) -> int:

@@ -86,6 +86,7 @@ FileCodeBox 是一个轻量级的文件分享工具，基于 **FastAPI + Vue3** 
 - 提取码错误次数限制
 - 文件自动过期清理
 - 管理员口令 PBKDF2 哈希存储
+- 提取口令（二次口令）可选启用，与取件码分离
 - 敏感配置（S3/WebDAV 凭据）加密存储
 
 </td>
@@ -302,6 +303,20 @@ python main.py
 - 支持单文件、多文件（默认最多 20 个）批量分享；多文件分享可打包 ZIP 下载，也可单独下载某一文件。
 - 有效期支持 `天 / 小时 / 分钟 / 下载次数 / 永久`（具体以后台 `expireStyle` 配置为准），并可附加备注。
 - 分片上传启用后，大文件按后台配置的 `uploadChunkSize`（默认 5MB）分片上传，支持断点续传与 SHA256 校验。
+- **提取口令（可选）**：发件时可额外设一个 2-32 位的口令。设置后取件码与口令缺一不可——取件码通常经聊天/邮件明文流转，口令走另一条信道（口头、电话），即使取件码泄露也取不到文件。口令以 PBKDF2 哈希存储（`filecodes.access_code_hash`），接口只判断对错、不回显原文；口令校验失败不计入该分享的取件次数（避免猜错就烧掉别人的额度），但会计入失败限流并写审计日志。
+
+```bash
+# 发一个带提取口令的文件
+curl -F "file=@a.txt" -F "expire_value=1" -F "expire_style=day" \
+     -F "access_code=pass2026" http://127.0.0.1:12345/share/file/
+
+# 取件：未带口令 → 403「该分享需要提取口令」；口令错误 → 403「提取口令错误」
+curl -H "Content-Type: application/json" \
+     -d '{"code":"XXXXXX","access_code":"pass2026"}' \
+     http://127.0.0.1:12345/share/select/
+```
+
+设有口令的分享，`/share/download/item/{id}` 与 `/share/zip/{code}` 还需带上取件阶段下发的 `access_key`（短期 token），避免绕过口令直接按取件码下载。
 
 ### 收件箱（文件收集）
 

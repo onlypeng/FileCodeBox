@@ -32,6 +32,9 @@ class FileCodes(models.Model):
     # 发起者凭证：上传成功时下发，凭它可提前作废（无账号体系下的最小权限设计）。
     # 只有持有该凭证的人能撤销，仅知道取件码的人不行。
     owner_token = fields.CharField(max_length=64, null=True)
+    # 提取口令（二次口令）的 PBKDF2 哈希。空值 = 只需取件码即可取件（存量分享行为不变）。
+    # 取件码常在聊天/邮件里明文传输，二次口令作为独立信道，泄露取件码不足以取件。
+    access_code_hash = fields.CharField(max_length=200, null=True)
     upload_id = fields.CharField(max_length=36, null=True)
     is_multi_file = fields.BooleanField(default=False)
 
