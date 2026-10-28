@@ -29,6 +29,9 @@ class FileCodes(models.Model):
     created_at = fields.DatetimeField(auto_now_add=True)
     file_hash = fields.CharField(max_length=64, null=True)
     is_chunked = fields.BooleanField(default=False)
+    # 发起者凭证：上传成功时下发，凭它可提前作废（无账号体系下的最小权限设计）。
+    # 只有持有该凭证的人能撤销，仅知道取件码的人不行。
+    owner_token = fields.CharField(max_length=64, null=True)
     upload_id = fields.CharField(max_length=36, null=True)
     is_multi_file = fields.BooleanField(default=False)
 

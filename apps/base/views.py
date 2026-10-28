@@ -1,9 +1,11 @@
 import asyncio
 import datetime
 import hashlib
+import hmac
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from collections import deque
@@ -33,6 +35,7 @@ from apps.base.models import (
 )
 from apps.base.schemas import (
     SelectFileModel,
+    RevokeFileModel,
     InitChunkUploadModel,
     CompleteUploadModel,
     PresignUploadInitRequest,
@@ -173,6 +176,7 @@ async def share_file(
         expired_at, expired_count, used_count, code = await get_expire_info(
             expire_value, expire_style
         )
+        owner_token = _new_owner_token()
         file_code = await FileCodes.create(
             code=code,
             prefix="",
@@ -185,9 +189,10 @@ async def share_file(
             is_multi_file=False,
             expire_style=expire_style,
             expire_value=expire_value,
+            owner_token=owner_token,
         )
         await ip_limit["upload"].add_ip(ip)
-        return APIResponse(detail={"code": code})
+        return APIResponse(detail={"code": code, "owner_token": owner_token})
 
     if not upload_files:
         raise HTTPException(status_code=400, detail="未选择文件")
@@ -211,6 +216,7 @@ async def share_file(
         # 落盘后按实际内容算哈希：接收端据此校验完整性，秒传也复用它。
         # 与分片上传一致，哈希一律由服务端算，不采信客户端声明值。
         file_hash = await _sha256_saved_file(save_path)
+        owner_token = _new_owner_token()
         file_code = await FileCodes.create(
             code=code,
             prefix=prefix,
@@ -226,6 +232,7 @@ async def share_file(
             is_multi_file=False,
             expire_style=expire_style,
             expire_value=expire_value,
+            owner_token=owner_token,
         )
         # 为单文件也创建 FileItem 记录
         await FileItem.create(
@@ -239,7 +246,7 @@ async def share_file(
         await ip_limit["upload"].add_ip(ip)
         await record("upload", target_type="filecode", target_id=code,
                      result="success", detail=f.filename, ip=ip)
-        return APIResponse(detail={"code": code, "name": f.filename})
+        return APIResponse(detail={"code": code, "name": f.filename, "owner_token": owner_token})
 
     # 多文件模式
     total_size = 0
@@ -287,6 +294,7 @@ async def share_file(
                 pass
         raise HTTPException(status_code=500, detail="文件保存失败，请重试")
 
+    owner_token = _new_owner_token()
     file_code = await FileCodes.create(
         code=code,
         prefix="",
@@ -301,6 +309,7 @@ async def share_file(
         is_multi_file=True,
         expire_style=expire_style,
         expire_value=expire_value,
+        owner_token=owner_token,
     )
 
     for item_data in file_items_data:
@@ -309,7 +318,12 @@ async def share_file(
     await ip_limit["upload"].add_ip(ip)
     await record("upload", target_type="filecode", target_id=code,
                  result="success", detail=f"{len(upload_files)}个文件", ip=ip)
-    return APIResponse(detail={"code": code, "name": f"{len(upload_files)}个文件", "is_multi_file": True})
+    return APIResponse(detail={
+        "code": code,
+        "name": f"{len(upload_files)}个文件",
+        "is_multi_file": True,
+        "owner_token": owner_token,
+    })
 
 
 async def get_code_file_by_code(
@@ -553,6 +567,44 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
             "expired_count": file_code.expired_count,
         }
     )
+
+
+@share_api.post("/revoke")
+async def revoke_file(data: RevokeFileModel, ip: str = Depends(ip_limit["error"])):
+    """提前作废自己发起的分享（"我的分享"里的撤销）。
+
+    无账号体系，凭证就是上传时下发的 owner_token：仅知道取件码的人无法撤销。
+    删除前检查物理文件是否仍被其它记录引用（秒传会让多条记录共享同一份文件）。
+    """
+    code = _validate_code(data.code)
+    file_code = await FileCodes.filter(code=code).first()
+    if not file_code:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    token = (data.owner_token or "").strip()
+    stored = file_code.owner_token or ""
+    # 常量时间比较，避免通过响应时间逐字节猜凭证
+    if not stored or not token or not hmac.compare_digest(stored, token):
+        await ip_limit["error"].add_ip(ip)
+        await record("revoke", target_type="filecode", target_id=code,
+                     result="denied", detail="发起者凭证不匹配", ip=ip)
+        raise HTTPException(status_code=403, detail="凭证无效，无法撤销该分享")
+
+    file_storage: FileStorageInterface = storages[settings.file_storage]()
+    if not await is_file_referenced_elsewhere(file_code.file_path, file_code.uuid_file_name, file_code.id):
+        try:
+            await file_storage.delete_file(file_code)
+        except Exception as e:
+            logger.error(f"撤销分享时删除文件失败 code={code}: {e}")
+    else:
+        logger.info(f"撤销分享：文件仍被其它记录引用，仅删除记录 code={code}")
+
+    await FileItem.filter(file_code=file_code).delete()
+    await file_code.delete()
+
+    await record("revoke", target_type="filecode", target_id=code,
+                 result="success", detail=file_code.prefix + file_code.suffix, ip=ip)
+    return APIResponse()
 
 
 @share_api.get("/download")
@@ -875,6 +927,7 @@ async def complete_upload(
         expired_at, expired_count, used_count, code = await get_expire_info(
             data.expire_value, data.expire_style
         )
+        owner_token = _new_owner_token()
         await FileCodes.create(
             code=code,
             file_hash=file_hash,  # 使用合并后计算的哈希
@@ -891,6 +944,7 @@ async def complete_upload(
             suffix=suffix,
             expire_style=data.expire_style,
             expire_value=data.expire_value,
+            owner_token=owner_token,
         )
         # 清理临时文件
         await storage.clean_chunks(upload_id, save_path)
@@ -899,7 +953,7 @@ async def complete_upload(
         await ip_limit["upload"].add_ip(ip)
         await record("upload", target_type="filecode", target_id=code,
                      result="success", detail=chunk_info.file_name, ip=ip)
-        return APIResponse(detail={"code": code, "name": chunk_info.file_name})
+        return APIResponse(detail={"code": code, "name": chunk_info.file_name, "owner_token": owner_token})
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -2395,6 +2449,15 @@ def _is_room_member(room_code: str, client_id: str, member_token: str = "") -> b
     if ws_manager.is_member_online(room_code, client_id):
         return True
     return verify_member_token(room_code, client_id, member_token)
+
+
+def _new_owner_token() -> str:
+    """生成发起者凭证。
+
+    无账号体系下用它标识"这条分享是我发起的"：随取件码一并返回给发起者，
+    凭它可提前作废。仅知道取件码的人拿不到，也无法撤销。
+    """
+    return secrets.token_urlsafe(24)
 
 
 async def _sha256_saved_file(save_path: str) -> str:

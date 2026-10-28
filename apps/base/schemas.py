@@ -6,6 +6,12 @@ class SelectFileModel(BaseModel):
     code: str
 
 
+class RevokeFileModel(BaseModel):
+    """提前作废一条分享：需要发起者凭证，仅知道取件码不足以撤销。"""
+    code: str
+    owner_token: str = ""
+
+
 class InitChunkUploadModel(BaseModel):
     file_name: str
     chunk_size: int = Field(default=5 * 1024 * 1024, gt=0)
