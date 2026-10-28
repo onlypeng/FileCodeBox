@@ -10,3 +10,6 @@ uvicorn==0.40.0
 websockets==17.0.1
 tortoise-orm==0.25.3
 python-multipart==0.0.21
+
+# 多实例部署（配置 REDIS_URL / redisUrl）时另需安装：pip install redis
+# 单实例是默认形态、不需要它，故不在此固定版本，避免给默认部署增加依赖。

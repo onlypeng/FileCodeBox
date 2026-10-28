@@ -21,6 +21,9 @@ from apps.base.models import KeyValue
 from apps.base.utils import ip_limit
 from apps.base.views import share_api, chunk_api, presign_api, collection_api, delivery_api, ws_api, room_api, compat_room_api
 from core.config import ensure_settings_row, refresh_settings
+from core import cluster
+from core.cluster import LocalHub, build_hub
+from core.websocket import ws_manager
 from core.database import db_startup_lock, get_db_config, init_db
 from core.logger import logger
 from core.response import APIResponse
@@ -38,6 +41,11 @@ from core.tasks import (
 from core.quota import check_global_storage_quota
 from core.capabilities import capability_report
 from core.utils import hash_password, is_password_hashed, verify_password
+
+
+# 集群协调件（配置 redisUrl 时是 RedisHub，否则 LocalHub）。模块级保存是为了在
+# lifespan 收尾时能优雅下线（发 bye 事件让其它实例立刻摘掉本实例成员）
+_cluster_hub = None
 
 
 @asynccontextmanager
@@ -61,6 +69,21 @@ async def lifespan(app: FastAPI):
             name="assets",
         )
 
+    # 集群协调：配置了 redisUrl 才启用（默认单实例，零依赖）。
+    # 连接失败不阻断启动：本服务的主体是文件存取，不该因为协调件抖动就整体不可用；
+    # 此时回落单实例并在能力报告里如实标注（多 worker 判定仍为不支持，不会误导运维）。
+    global _cluster_hub
+    try:
+        redis_url = os.getenv("REDIS_URL") or getattr(settings, "redisUrl", "")
+        _cluster_hub = build_hub(redis_url)
+        await _cluster_hub.start()
+    except Exception as e:
+        logger.error(f"集群协调初始化失败，回落单实例模式: {e}")
+        _cluster_hub = LocalHub()
+    cluster.hub = _cluster_hub
+    ws_manager.use_hub(_cluster_hub)
+    await ws_manager.start()
+
     # 启动后台任务
     task = asyncio.create_task(delete_expire_files())
     chunk_cleanup_task = asyncio.create_task(clean_incomplete_uploads())
@@ -80,6 +103,18 @@ async def lifespan(app: FastAPI):
         )
         for reason in report["multi_worker_blockers"]:
             logger.warning(f"多进程部署限制: {reason}")
+        for note in report.get("multi_worker_notes") or []:
+            logger.info(f"多进程部署注意: {note}")
+        # 明确的配置矛盾要喊出来：按多 worker 起了服务，但支撑条件没齐，
+        # 表现为"房间内消息只对同一进程的人可见"，不提前提示极难排查
+        workers = int(os.getenv("WORKERS") or getattr(settings, "serverWorkers", 1) or 1)
+        if workers > 1 and not report["multi_worker_supported"]:
+            logger.error(
+                f"检测到 WORKERS={workers}，但当前部署形态不支持多进程——"
+                "房间实时消息、在线人数、房间配额都会按进程各自计算。"
+                "请按 readme「多进程 / 多实例部署」改用 postgres/mysql 并配置 REDIS_URL，"
+                "或将 WORKERS 改回 1"
+            )
     except Exception as e:
         logger.warning(f"生成部署形态提示失败: {e}")
 
@@ -88,6 +123,13 @@ async def lifespan(app: FastAPI):
     finally:
         # 清理操作
         logger.info("正在关闭应用...")
+        # 先下线集群协调（发 bye 让其它实例立即摘掉本实例成员），再停本地任务
+        try:
+            await ws_manager.stop()
+            if _cluster_hub is not None:
+                await _cluster_hub.close()
+        except Exception as e:
+            logger.warning(f"关闭集群协调异常: {e}")
         task.cancel()
         chunk_cleanup_task.cancel()
         collection_cleanup_task.cancel()

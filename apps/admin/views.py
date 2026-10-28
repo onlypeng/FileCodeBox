@@ -205,13 +205,12 @@ async def _dashboard_stats():
     ).count()
     today_rooms = await Room.filter(created_at__gte=today_start).count()
 
-    # 在线房间数（ws_manager 中存在活跃连接的房间）
+    # 在线房间数（含其它实例上的成员；单实例下等价于本地连接表）
     online_rooms = 0
-    if ws_manager.active_connections:
+    live_rooms = ws_manager.active_rooms()
+    if live_rooms:
         active_room_codes = set(await Room.all().values_list("room_code", flat=True))
-        online_rooms = sum(
-            1 for code in ws_manager.active_connections if code in active_room_codes
-        )
+        online_rooms = sum(1 for code in live_rooms if code in active_room_codes)
 
     # 扩展统计（文件健康度）
     # 过期判定与模型 is_expired 保持一致：
@@ -627,7 +626,7 @@ async def room_list(
             "room_code": room.room_code,
             "title": room.title,
             "max_members": room.max_members,
-            "online_count": len(ws_manager.active_connections.get(room.room_code, [])),
+            "online_count": ws_manager.room_size(room.room_code),
             "is_expired": await room.is_expired(),
             "expire_style": room.expire_style,
             "expire_value": room.expire_value,
@@ -654,14 +653,8 @@ async def delete_room(room_id: int):
     room = await Room.filter(id=room_id).first()
     if not room:
         raise HTTPException(status_code=404, detail="房间不存在")
-    # 清理该房间的在线连接
-    for conn in list(ws_manager.active_connections.get(room.room_code, [])):
-        try:
-            await conn["ws"].close(code=4001, reason="房间已被删除")
-        except Exception:
-            pass
-    ws_manager.active_connections.pop(room.room_code, None)
-    ws_manager.file_targets.pop(room.room_code, None)
+    # 清理该房间的在线连接（含其它实例上的成员：多实例时只关本地会留下幽灵连接）
+    await ws_manager.kick_room(room.room_code, reason="房间已被删除")
     await room.delete()
 
 

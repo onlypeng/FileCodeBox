@@ -77,6 +77,7 @@ from core.utils import (
     verify_select_token,
 )
 from core.websocket import ws_manager
+from core import cluster
 from core.tasks import CollectionEvents
 
 # 必须用 core.logger 那个已配置 handler 的 'FileCodeBox' logger。
@@ -2379,8 +2380,10 @@ async def websocket_collection(websocket: WebSocket, code: str):
     room_code = collection.collection_code
     # 等待客户端发送第一条消息获取昵称
     await ws_manager.connect(room_code, websocket, nickname="")
-    # 连接数上限：超过则拒绝（与房间 max_members 模式一致，connect 后再校验以完成握手）
-    if len(ws_manager.active_connections.get(room_code, [])) > COLLECTION_WS_MAX_CONNECTIONS:
+    # 连接数上限：超过则拒绝（与房间 max_members 模式一致，connect 后再校验以完成握手）。
+    # 用 room_size 而非直接读 active_connections：多实例下人数要含其它实例上的成员，
+    # 否则每个实例各算各的，上限被放大 N 倍。
+    if ws_manager.room_size(room_code) > COLLECTION_WS_MAX_CONNECTIONS:
         await ws_manager.send_personal(room_code, websocket, {"type": "room_full"})
         await websocket.close(code=1013, reason="房间已满")
         return
@@ -2392,11 +2395,10 @@ async def websocket_collection(websocket: WebSocket, code: str):
             msg_data = json.loads(first_msg)
             if isinstance(msg_data, dict) and msg_data.get("type") == "join":
                 nickname = msg_data.get("nickname", "")
-                # 更新昵称
-                for conn in ws_manager.active_connections.get(room_code, []):
-                    if conn["ws"] is websocket:
-                        conn["nickname"] = nickname
-                        break
+                # 更新昵称（并同步给其它实例，否则远端成员列表全是"匿名"）
+                await ws_manager.refresh_presence(
+                    room_code, ws_manager.get_client_id(room_code, websocket), nickname
+                )
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -2418,7 +2420,7 @@ async def websocket_collection(websocket: WebSocket, code: str):
             except (json.JSONDecodeError, ValueError):
                 pass  # 忽略非JSON消息（如ping）
     except WebSocketDisconnect:
-        left_nickname = ws_manager.disconnect(room_code, websocket)
+        left_nickname = await ws_manager.disconnect(room_code, websocket)
         # 广播用户离开
         online_users = ws_manager.get_online_users(room_code)
         await ws_manager.broadcast(room_code, {
@@ -2591,17 +2593,29 @@ def _check_file_type_allowed(file_name: str) -> None:
 
 
 # 房间级串行锁：同房间的缓存上传串行化，杜绝"先读后写"的配额/去重校验被并发绕过。
-# ws_manager 本身就是进程内状态（多进程部署本不支持），故进程内锁足以覆盖全部并发场景。
-_ROOM_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
+# 走集群锁而不是进程内 asyncio.Lock：多实例时每个实例各锁各的，配额会被同时读到旧值。
+# 未配置 Redis（单实例）时集群锁自动退化为进程内锁，行为与改造前一致。
+def _room_cache_lock(code: str):
+    """取房间锁上下文（不存在则创建）。房间数有限，不回收也可接受。"""
+    return cluster.hub.lock(f"room-cache:{code}", ttl_ms=30000, wait_ms=20000)
 
 
-def _room_cache_lock(code: str) -> asyncio.Lock:
-    """取房间锁（不存在则创建）。房间数有限，不回收也可接受。"""
-    lock = _ROOM_CACHE_LOCKS.get(code)
-    if lock is None:
-        lock = asyncio.Lock()
-        _ROOM_CACHE_LOCKS[code] = lock
-    return lock
+# 跨实例中继不可用提示的节流表：key -> 上次提示时刻（monotonic）。
+# 中继按帧循环，不节流会把提示刷成风暴。
+_RELAY_HINTED: dict[str, float] = {}
+RELAY_HINT_COOLDOWN = 60.0
+
+
+def _relay_cross_instance_hint(room_code: str, client_id: str) -> bool:
+    now = time.monotonic()
+    key = f"{room_code}:{client_id}"
+    last = _RELAY_HINTED.get(key)
+    if last is not None and now - last < RELAY_HINT_COOLDOWN:
+        return False
+    if len(_RELAY_HINTED) > 4096:
+        _RELAY_HINTED.clear()
+    _RELAY_HINTED[key] = now
+    return True
 
 
 # 定向发送（file_offer 的 targets）目标数上限：服务端按目标逐个 send_to_client，需收口
@@ -3158,6 +3172,8 @@ async def websocket_room(websocket: WebSocket, room_code: str):
     # 接受连接并加入房间：client_id 由服务端签发（客户端自报的 id 仅在未被占用时允许沿用，
     # 用于断线重连复用身份；占用中则重新签发，防止冒用他人 id）
     client_id = await ws_manager.connect(room.room_code, websocket, nickname="")
+    # connect 阶段签发的 id：客户端若沿用持久 id，需要把这条临时身份从集群里撤销
+    issued_id = client_id
     ws_conn = next(
         (c for c in ws_manager.active_connections.get(room.room_code, []) if c["ws"] is websocket),
         None,
@@ -3179,19 +3195,19 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                     client_id = persisted_id
                 if ws_conn:
                     ws_conn["nickname"] = nickname
-                # 同 id 旧连接（断线残留/多标签页）→ 顶替并关闭
-                for old in list(ws_manager.active_connections.get(room.room_code, [])):
-                    if old is not ws_conn and old.get("client_id") == client_id:
-                        try:
-                            await old["ws"].close(code=1000, reason="replaced")
-                        except Exception:
-                            pass
-                        ws_manager.active_connections[room.room_code].remove(old)
+                # 同 id 旧连接（断线残留/多标签页/其它实例上的同名连接）→ 顶替并关闭
+                await ws_manager.replace_client(room.room_code, client_id, keep_ws=websocket)
+                # 沿用了持久 id 时，connect 阶段签发的临时 id 已广播出去，必须撤销
+                if client_id != issued_id:
+                    await ws_manager.drop_presence(room.room_code, issued_id)
+                # 昵称此时才确定，同步给其它实例（否则远端成员显示"匿名"）
+                await ws_manager.refresh_presence(room.room_code, client_id, nickname)
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # 房间人数上限校验：超过 max_members 拒绝加入
-        if room.max_members > 0 and len(ws_manager.active_connections.get(room.room_code, [])) > room.max_members:
+        # 房间人数上限校验：超过 max_members 拒绝加入（人数含其它实例上的成员，
+        # 否则多实例下每个实例各自放行 max_members 个，上限被放大 N 倍）
+        if room.max_members > 0 and ws_manager.room_size(room.room_code) > room.max_members:
             await ws_manager.send_personal(room.room_code, websocket, {"type": "room_full"})
             await websocket.close(code=1013, reason="房间已满")
             return
@@ -3264,6 +3280,9 @@ async def websocket_room(websocket: WebSocket, room_code: str):
             "members": ws_manager.get_members(room.room_code),
         })
 
+        # 当前正在中继的传输 id：二进制帧本身不带 id（省帧开销），
+        # 由紧随其前的 file_chunk 文本帧告知，这里记下来供"跨实例无法中继"提示使用
+        active_transfer_id = ""
         while True:
             message = await websocket.receive()
             mtype = message.get("type")
@@ -3277,8 +3296,21 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                     continue
                 target_ids = ws_manager.get_file_targets(room.room_code, client_id)
                 if target_ids:
+                    delivered = False
                     for target_id in target_ids:
-                        await ws_manager.send_bytes_to_client(room.room_code, target_id, data)
+                        if await ws_manager.send_bytes_to_client(room.room_code, target_id, data):
+                            delivered = True
+                    if not delivered and getattr(cluster.hub, "distributed", False):
+                        # 多实例下接收方可能挂在别的进程。二进制帧刻意不走 pub/sub
+                        # （单帧最大 256KB，base64 后吞吐放大 1.4 倍、延迟不可控），
+                        # 正确做法是接入层按房间做会话亲和。这里明确告知发送方，
+                        # 而不是让文件传到一半静默卡住。
+                        if _relay_cross_instance_hint(room.room_code, client_id):
+                            await ws_manager.send_to_client(room.room_code, client_id, {
+                                "type": "relay_failed",
+                                "transfer_id": active_transfer_id,
+                                "reason": "接收方不在当前实例，多实例部署需按房间做会话亲和",
+                            })
                     # 中转限速（KB/s，0 表示不限速）
                     relay_limit = getattr(settings, "directRelaySpeedLimit", 0) or 0
                     if relay_limit > 0:
@@ -3455,6 +3487,7 @@ async def websocket_room(websocket: WebSocket, room_code: str):
             elif mtype == "file_chunk":
                 # 分片头（接收端据此把紧随的二进制帧路由到对应传输任务）
                 # 媒体中转：广播给该发送者的全部目标；文件传输：单目标
+                active_transfer_id = msg.get("transfer_id") or active_transfer_id
                 for target in ws_manager.get_file_targets(room.room_code, client_id):
                     await ws_manager.send_to_client(room.room_code, target, {
                         "type": "file_chunk",
@@ -3571,7 +3604,7 @@ async def websocket_room(websocket: WebSocket, room_code: str):
     except WebSocketDisconnect:
         pass
     finally:
-        left_nickname = ws_manager.disconnect(room.room_code, websocket)
+        left_nickname = await ws_manager.disconnect(room.room_code, websocket)
         # 广播用户离开（附 from_id，供其余成员清理该离开者的共享/媒体）
         await ws_manager.broadcast(room.room_code, {
             "type": "user_left",
@@ -3588,8 +3621,10 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                 "type": "media_cancel",
                 "from_id": client_id,
             })
-        # 次数模式：房间从"有人"变为"无人"计一次会话；次数扣尽后房间过期
-        if room.expire_style == "count" and room.room_code not in ws_manager.active_connections:
+        # 次数模式：房间从"有人"变为"无人"计一次会话；次数扣尽后房间过期。
+        # 判定用 room_size（含其它实例成员），否则多实例下每个实例都以为"最后一个人走了"，
+        # 一次会话被扣 N 次。
+        if room.expire_style == "count" and ws_manager.room_size(room.room_code) == 0:
             await Room.filter(id=room.id, expired_count__gt=0).update(
                 expired_count=F("expired_count") - 1
             )

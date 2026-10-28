@@ -149,6 +149,12 @@ DEFAULT_CONFIG = {
     "dbPassword": "",
     "dbName": "filecodebox",
     "dbSchema": "public",
+    # ===== 多实例协调（可选） =====
+    # Redis 连接串，用于多 worker 部署时同步房间成员与广播文本信令。
+    # 留空 = 单实例模式（默认，无需任何外部依赖）；形如 "redis://127.0.0.1:6379/0"。
+    # 注意：改这里需要重启生效（订阅连接不能热切换）；二进制文件中继仍要求
+    # 同一房间的 WebSocket 连接粘在同一个实例上（接入层会话亲和），见 core/cluster。
+    "redisUrl": "",
     # 临时房间默认人员上限（创建时可在 1~该值 之间选择；0 表示不限制）
     "defaultMaxMembers": 10,
     # 共享视频流默认质量档位（low=流畅 / sd=标清 / hd=高清 / auto=按带宽自适应）

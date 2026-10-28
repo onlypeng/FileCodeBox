@@ -111,9 +111,10 @@ class UpdateConfigRequest(BaseModel):
     # 可选主题列表（与 directTurnServers 同为结构化列表）
     themesChoices: Optional[List[dict]] = None
 
-    # 注意：dbType / dbHost / dbPort / dbName / dbUser / dbPassword / dbSchema
-    # **故意不放进白名单**——数据库连接属于基础设施配置，需通过环境变量/配置文件
+    # 注意：dbType / dbHost / dbPort / dbName / dbUser / dbPassword / dbSchema / redisUrl
+    # **故意不放进白名单**——数据库与 Redis 连接属于基础设施配置，需通过环境变量/配置文件
     # 设定并重启生效；在后台改既不生效也容易让人误以为已切换。
+    # redisUrl 支持 REDIS_URL 环境变量覆盖（容器部署推荐用环境变量）。
 
 
 class ExtendExpireRequest(BaseModel):
