@@ -22,20 +22,20 @@ FileCodeBox supports two sharing methods:
 ### Text Size Limit
 
 ::: warning Note
-The maximum content size for text sharing is **222KB** (227,328 bytes). If content exceeds this limit, it's recommended to use file sharing instead.
+The maximum length for text sharing is **200000 characters** (config key `maxTextLength`, counted in characters). Use file sharing for larger content.
 :::
 
-Text content size is calculated using UTF-8 encoding. Chinese characters typically occupy 3 bytes.
+> Note: **there is no `/share/text/` endpoint**. Text-only sharing uses `/share/file/` with only a `remark` field and no file; the server enforces `maxTextLength`.
 
 ### API Endpoint
 
-**POST** `/share/text/`
+**POST** `/share/file/`
 
 Request parameters:
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `text` | string | Yes | Text content to share |
+| `remark` | string | Yes | Text content to share (no file field = text-only share) |
 | `expire_value` | int | No | Expiration value, default 1 |
 | `expire_style` | string | No | Expiration method, default `day` |
 

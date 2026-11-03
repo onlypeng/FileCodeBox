@@ -134,12 +134,12 @@ curl -X POST "http://localhost:12345/share/file/" \
   -F "expire_value=10" \
   -F "expire_style=count"
 
-# 分享文本
-curl -X POST "http://localhost:12345/share/text/" \
-  -F "text=这是要分享的文本内容"
+# 纯文本分享（不传文件，只传 remark）
+curl -X POST "http://localhost:12345/share/file/" \
+  -F "remark=这是要分享的文本内容"
 
-# 通过取件码下载文件
-curl -L "http://localhost:12345/share/select/?code=取件码" -o downloaded_file
+# 通过取件码下载（key 由 POST /share/select/ 返回）
+curl -L "http://localhost:12345/share/download?code=取件码&key=<key>" -o downloaded_file
 ```
 
 ::: tip 需要认证时
@@ -158,10 +158,10 @@ curl -X POST "http://localhost:12345/share/file/" \
   -H "Authorization: Bearer xxx.xxx.xxx" \
   -F "file=@/path/to/file.pdf"
 
-# 3. 使用 token 分享文本
-curl -X POST "http://localhost:12345/share/text/" \
+# 3. 使用 token 分享纯文本
+curl -X POST "http://localhost:12345/share/file/" \
   -H "Authorization: Bearer xxx.xxx.xxx" \
-  -F "text=这是要分享的文本内容"
+  -F "remark=这是要分享的文本内容"
 ```
 :::
 

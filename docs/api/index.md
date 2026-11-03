@@ -1,719 +1,279 @@
-# FileCodeBox API 文档
+# API 参考
 
-## API 版本: 2.1.0
+> 本页按**当前仓库实际注册的路由**整理（后端 `apps/base/views.py`、`apps/admin/views.py`）。
+> 若与其它资料不一致，以代码为准。路由前缀在 `main.py` 中挂载。
 
-## 目录
-- [通用说明](#通用说明)
-- [认证](#认证)
-- [分享接口](#分享接口)
-- [分片上传接口](#分片上传接口)
-- [预签名上传接口](#预签名上传接口)
-- [收件箱与投递接口](#收件箱与投递接口)
-- [跨设备聊天接口](#跨设备聊天接口)
-- [直连传输与直连快传接口](#直连传输与直连快传接口)
-- [管理接口](#管理接口)
-- [错误响应](#错误响应)
-- [状态码说明](#状态码说明)
+## 约定
 
-## 通用说明
+### 响应格式
 
-所有业务接口的响应统一为以下结构：
+所有业务响应统一为：
 
 ```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {}
-}
+{ "code": 200, "message": "ok", "detail": { } }
 ```
 
-- `code`：业务状态码（`200` 表示成功）
-- `message`：状态描述
-- `detail`：具体返回数据
+`detail` 的内容随接口变化。文件下载类接口直接返回二进制流，不套这层结构。
 
-部分接口（分享/上传类）在后台关闭游客上传（`openUpload=0`）时，需要携带管理员 Token 访问。
+### 状态码与业务码
 
-## 认证
+| 值 | 含义 |
+|----|------|
+| `200` | 成功 |
+| `400` | 参数错误（过期类型非法、备注超限等） |
+| `403` | 鉴权失败（取件码不匹配、提取口令缺失/错误、无管理员权限） |
+| `404` | 资源不存在 |
+| `410` | 分享已过期（时间到或次数用尽）——与 404 语义不同，不要合并处理 |
+| `423` | 触发失败限流 |
 
-部分接口需要在请求头中携带 `Authorization` 进行认证：
+### 鉴权
 
-```
-Authorization: Bearer <token>
-```
+| 方式 | 适用范围 |
+|------|---------|
+| 无需鉴权 | 取件、投件、房间只读信息（受 `openUpload` 影响） |
+| `Authorization: Bearer <JWT>` | 所有 `/admin/*`（`POST /admin/login` 除外）；`openUpload=0` 时的上传接口 |
+| 取件码 `code` | 取件、下载 |
+| 提取口令 `access_code` | 设置了二次口令的分享 |
+| `owner_token` | 撤销分享、发起者查看自己的分享详情 |
+| 成员令牌 | 房间写接口（要求「当前在线 **或** 持有成员令牌」） |
 
-### 获取 Token
+### 有效期
 
-```bash
-curl -X POST "http://localhost:12345/admin/login" \
-  -H "Content-Type: application/json" \
-  -d '{"password": "FileCodeBox2023"}'
-```
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "token": "xxx.xxx.xxx",
-    "token_type": "Bearer"
-  }
-}
-```
+`expire_style` 可选：`day` / `hour` / `minute` / `count`（下载次数）/ `forever`。
+`expire_value` 为对应数值；`count` 模式下为次数。
 
 ---
 
-## 分享接口
+## 分享与取件 `/share`
 
-### 分享文本
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/share/file/` | 上传文件 / 多文件 / 纯文本分享 |
+| `GET` | `/share/check_code/` | 识别码类型（文件码/管理码/投件码/取件码/房间码） |
+| `GET` | `/share/select/` | 查询分享信息（不消耗取件次数） |
+| `GET` | `/share/select/info/` | 只读详情 + 实时剩余次数，供记录刷新 |
+| `POST` | `/share/select/` | 正式取件（**消耗取件次数**），返回带签名 `key` 的下载地址 |
+| `POST` | `/share/revoke` | 撤销分享（需 `owner_token`） |
+| `GET` | `/share/download` | 下载单文件（`code` + `key`） |
+| `GET` | `/share/download/item/{item_id}` | 下载多文件分享中的单个文件 |
+| `GET` | `/share/zip/{code}` | 打包下载（单文件分享同样支持） |
 
-**POST** `/share/text/`
+### `POST /share/file/`
 
-分享文本内容，获取分享码（单次不超过 222KB）。
+一次接口同时承载三种分享方式，靠「有没有文件」区分：
 
-**请求参数：**
+| 场景 | 参数 |
+|------|------|
+| 单文件 | `file` + 可选 `remark` |
+| 多文件 | 多个 `files` + 可选 `remark`（上限 `maxMultiFileCount`，默认 20） |
+| **纯文本** | **只传 `remark`，不传任何文件** |
 
-| 参数名 | 类型 | 必填 | 默认值 | 描述 |
-|-------|------|------|--------|------|
-| text | string | 是 | - | 要分享的文本内容 |
-| expire_value | integer | 否 | 1 | 过期时间值 |
-| expire_style | string | 否 | "day" | 过期时间单位(day/hour/minute/count/forever) |
+> 历史文档里出现过的 `/share/text/` **并不存在**。纯文本分享走的就是 `/share/file/`，
+> 只是没有文件字段；内容由 `remark` 承载，长度受 `maxTextLength`（默认 200000 字符）约束。
 
-**cURL 示例：**
+通用表单字段：
 
-```bash
-# 游客上传（openUpload=1 时）
-curl -X POST "http://localhost:12345/share/text/" \
-  -F "text=这是要分享的文本内容" \
-  -F "expire_value=1" \
-  -F "expire_style=day"
-
-# 需要认证时（openUpload=0 时）
-curl -X POST "http://localhost:12345/share/text/" \
-  -H "Authorization: Bearer xxx.xxx.xxx" \
-  -F "text=这是要分享的文本内容"
-```
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "code": "ABC123"
-  }
-}
-```
-
-### 分享文件
-
-**POST** `/share/file/`
-
-上传并分享文件（支持单文件与多文件批量），获取分享码。
-
-**请求参数：**
-
-| 参数名 | 类型 | 必填 | 默认值 | 描述 |
-|-------|------|------|--------|------|
-| file | file | 否* | - | 单文件模式上传的文件 |
-| files | file | 否* | - | 多文件模式，可重复提交多个 `files` |
-| expire_value | integer | 否 | 1 | 过期时间值 |
-| expire_style | string | 否 | "day" | 过期时间单位(day/hour/minute/count/forever) |
-| remark | string | 否 | "" | 备注说明 |
-
-> `file` 与 `files` 至少提供一种；多文件数量受后台 `maxSendFiles` 限制（默认 20）。
-
-**cURL 示例：**
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `expire_value` | int | `1` | 有效期数值 |
+| `expire_style` | str | `day` | `day` / `hour` / `minute` / `count` / `forever` |
+| `remark` | str | `""` | 备注；无文件时即为分享内容本身 |
+| `access_code` | str | 空 | 提取口令（2–32 位），服务端只存 PBKDF2 哈希 |
 
 ```bash
-# 上传单个文件（默认1天有效期）
 curl -X POST "http://localhost:12345/share/file/" \
-  -F "file=@/path/to/file.txt"
+  -F "file=@./a.txt" \
+  -F "expire_value=1" -F "expire_style=day" \
+  -F "access_code=pass2026"
 
-# 指定 7 天有效期
-curl -X POST "http://localhost:12345/share/file/" \
-  -F "file=@/path/to/file.txt" \
-  -F "expire_value=7" \
-  -F "expire_style=day"
-
-# 指定下载 10 次后过期
-curl -X POST "http://localhost:12345/share/file/" \
-  -F "file=@/path/to/file.txt" \
-  -F "expire_value=10" \
-  -F "expire_style=count"
-
-# 多文件批量上传
-curl -X POST "http://localhost:12345/share/file/" \
-  -F "files=@a.txt" \
-  -F "files=@b.txt" \
-  -F "remark=批量文件"
-
-# 需要认证时
-curl -X POST "http://localhost:12345/share/file/" \
-  -H "Authorization: Bearer xxx.xxx.xxx" \
-  -F "file=@/path/to/file.txt"
+# 纯文本分享
+curl -X POST "http://localhost:12345/share/file/" -F "remark=要分享的文本内容"
 ```
 
-**响应示例：**
+响应 `detail`：`{ "code": "ABCD12", "owner_token": "..." }`。
+`owner_token` 是发起者凭证，请自行保存，撤销分享与查看自己的分享详情需要它。
+
+### `POST /share/select/`
+
+请求体（JSON）：
 
 ```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "code": "ABC123",
-    "name": "example.txt",
-    "is_multi_file": false
-  }
-}
+{ "code": "ABCD12", "access_code": "pass2026" }
 ```
 
-### 检查码类型
+行为要点：
 
-**GET** `/share/check_code/`
+- 未通过提取口令时返回 `403`，**不消耗取件次数**（避免猜错即成拒绝服务），但计入失败限流并写审计
+- 口令保护的分享，响应里会带 `access_key`；后续 `/share/download/item` 与 `/share/zip` 必须带上它
+  才能下载（这两个入口原本只认取件码，会被用来绕开口令）
+- 次数型分享在通过校验后才扣次数
 
-自动识别码的类型：`file` / `collection` / `retrieve` / `delivery` / `chat` / `transfer` / `direct` / `unknown`。
+### `GET /share/select/info/`
 
-**请求参数：**
+只读查询，**不消耗取件次数**，返回结构与 `select` 一致并附 `expired_count`。
+对未通过提取口令的调用方**只返回「需要口令」与过期状态**，不下发文件名、大小、哈希；
+发起者带 `owner_token` 可看全量。
 
-| 参数名 | 类型 | 必填 | 描述 |
-|-------|------|------|------|
-| code | string | 是 | 任意 6 位码 |
+### `GET /share/download`
 
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "type": "collection",
-    "code": "ABC123",
-    "title": "项目文件收集"
-  }
-}
-```
-
-### 取件（查询文件信息 / 下载）
-
-**GET** `/share/select/`
-
-单文件/文本码：直接返回文件内容或文本；多文件码：返回文件列表。
-
-**请求参数：**
-
-| 参数名 | 类型 | 必填 | 描述 |
-|-------|------|------|------|
-| code | string | 是 | 文件分享码 |
-
-**cURL 示例：**
-
-```bash
-# 通过取件码下载文件
-curl -L "http://localhost:12345/share/select/?code=ABC123" -o downloaded_file
-```
-
-**POST** `/share/select/`
-
-以 JSON 返回文件/文本信息与下载地址（多文件返回子文件列表）。
-
-**请求体：**
-
-```json
-{ "code": "ABC123" }
-```
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "code": "ABC123",
-    "name": "example.txt",
-    "size": 1024,
-    "text": "/share/download?key=xxx&code=ABC123",
-    "created_at": "2026-08-11T10:00:00+08:00",
-    "expired_at": "2026-08-18T10:00:00+08:00",
-    "expire_style": "day",
-    "expire_value": 7
-  }
-}
-```
-
-### 下载文件
-
-**GET** `/share/download`
-
-下载分享的文件（需要取件接口返回的签名 `key`）。
-
-**请求参数：**
-
-| 参数名 | 类型 | 必填 | 描述 |
-|-------|------|------|------|
-| key | string | 是 | 下载签名密钥 |
-| code | string | 是 | 文件分享码 |
-
-### 下载多文件中的单个文件
-
-**GET** `/share/download/item/{item_id}`
-
-**请求参数：**
-
-| 参数名 | 类型 | 必填 | 描述 |
-|-------|------|------|------|
-| item_id | integer | 是 | 路径参数，文件项 ID |
-| code | string | 是 | 多文件分享码 |
-
-### 打包下载
-
-**GET** `/share/zip/{code}`
-
-将分享的文件（含多文件）打包为 ZIP 流式下载。
-
-**请求参数：**
-
-| 参数名 | 类型 | 必填 | 描述 |
-|-------|------|------|------|
-| code | string | 是 | 文件分享码 |
+`?code=...&key=<select 返回的签名 key>`。支持 HTTP Range（206 断点续传，由 Starlette `FileResponse` 提供）。
+签名 `key` 有时效，过期请重新取件。
 
 ---
 
-## 分片上传接口
+## 分片上传 `/chunk`
 
-分片上传适用于大文件，支持断点续传（通过文件哈希自动检测未完成会话）。
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/chunk/upload/init/` | 创建上传会话，返回 `upload_id` 与分片参数 |
+| `POST` | `/chunk/upload/chunk/{upload_id}/{chunk_index}` | 上传单个分片 |
+| `GET` | `/chunk/upload/status/{upload_id}` | 查询已上传分片，用于断点续传 |
+| `POST` | `/chunk/upload/complete/{upload_id}` | 合并分片并生成分享码 |
+| `DELETE` | `/chunk/upload/{upload_id}` | 放弃会话，清理临时分片 |
 
-### 初始化上传
+分片的**提取口令、有效期、备注在 `complete` 阶段提交**，不需要在上传会话里传递。
+合并时服务端流式计算权威 SHA-256，不采信客户端声明值（防缓存投毒）。
 
-**POST** `/chunk/upload/init/`
+## 预签名上传 `/presign`
 
-**请求体：**
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/presign/upload/init` | 创建直传会话 |
+| `PUT` | `/presign/upload/proxy/{upload_id}` | 代理上传（服务端转存到存储后端） |
+| `POST` | `/presign/upload/confirm/{upload_id}` | 客户端完成 S3 直传后确认，换取分享码 |
+| `GET` | `/presign/upload/status/{upload_id}` | 查询会话状态 |
+| `DELETE` | `/presign/upload/{upload_id}` | 取消会话 |
 
-```json
-{
-  "file_name": "big.zip",
-  "chunk_size": 5242880,
-  "file_size": 104857600,
-  "file_hash": "sha256 完整文件哈希"
-}
-```
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "existed": false,
-    "upload_id": "xxx",
-    "chunk_size": 5242880,
-    "total_chunks": 20,
-    "uploaded_chunks": []
-  }
-}
-```
-
-> `existed=true` 表示存在断点续传会话，`uploaded_chunks` 列出已上传的分片索引。
-
-### 上传分片
-
-**POST** `/chunk/upload/chunk/{upload_id}/{chunk_index}`
-
-multipart 表单上传单个分片（`chunk` 字段）。重复上传已存在的分片会返回 `skipped: true`。
-
-### 查询进度
-
-**GET** `/chunk/upload/status/{upload_id}`
-
-返回已上传分片索引与进度百分比。
-
-### 合并完成
-
-**POST** `/chunk/upload/complete/{upload_id}`
-
-**请求体：**
-
-```json
-{
-  "expire_value": 1,
-  "expire_style": "day",
-  "remark": ""
-}
-```
-
-合并所有分片并生成分享码。**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "code": "ABC123",
-    "name": "big.zip"
-  }
-}
-```
-
-### 取消上传
-
-**DELETE** `/chunk/upload/{upload_id}`
-
-取消上传并清理已保存的临时分片。
+同样支持 `access_code` / `expire_value` / `expire_style` / `remark`（在 proxy 或 confirm 阶段）。
 
 ---
 
-## 预签名上传接口
+## 收件箱 `/collection` 与投递 `/delivery`
 
-S3 存储下生成预签名直传 URL（浏览器直接上传到对象存储）；其他存储自动降级为服务器代理上传。会话有效期 15 分钟。
+### 收件箱
 
-### 初始化上传
-
-**POST** `/presign/upload/init`
-
-**请求体：**
-
-```json
-{
-  "file_name": "photo.jpg",
-  "file_size": 10485760,
-  "expire_value": 1,
-  "expire_style": "day",
-  "remark": ""
-}
-```
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "upload_id": "xxx",
-    "upload_url": "https://bucket.s3...（直传）或 /presign/upload/proxy/xxx（代理）",
-    "mode": "direct",
-    "expires_in": 900
-  }
-}
-```
-
-### 代理模式上传
-
-**PUT** `/presign/upload/proxy/{upload_id}`
-
-multipart 表单上传文件（`file` 字段）。文件大小须与初始化声明一致（误差 ≤ 1KB）。
-
-### 直传模式确认
-
-**POST** `/presign/upload/confirm/{upload_id}`
-
-客户端完成 S3 直传后调用，校验文件存在与大小后生成分享码。
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "code": "ABC123",
-    "name": "photo.jpg"
-  }
-}
-```
-
-### 查询 / 取消会话
-
-- `GET /presign/upload/status/{upload_id}`：查询会话状态
-- `DELETE /presign/upload/{upload_id}`：取消会话（直传模式会删除已上传对象）
-
----
-
-## 收件箱与投递接口
-
-收件箱（文件收集）包含三个独立口令：**管理码**（collection_code）、**投件码**（delivery_code）、**取件码**（retrieve_code）。所有码均为 6 位大写字母+数字。
-
-### 创建收件箱
-
-**POST** `/collection/create/`
-
-**请求体：**
-
-```json
-{
-  "title": "项目文件收集",
-  "description": "请上传项目相关文件",
-  "password": "",
-  "max_files": 20,
-  "expire_style": "day",
-  "expire_value": 7,
-  "delivery_expire_style": "day",
-  "delivery_expire_value": 7,
-  "retrieve_expire_style": "day",
-  "retrieve_expire_value": 7,
-  "delivery_count": -1
-}
-```
-
-- `delivery_count`：最大投递次数，`-1` 表示不限
-- 投件码/取件码过期时间不能超过收件箱过期时间
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "collection_code": "ABC123",
-    "delivery_code": "DEF456",
-    "retrieve_code": "GHI789",
-    "title": "项目文件收集",
-    "max_files": 20,
-    "expired_at": "...",
-    "delivery_expired_at": "...",
-    "retrieve_expired_at": "..."
-  }
-}
-```
-
-### 管理收件箱
-
-**GET** `/collection/manage/{collection_code}`
-
-管理码视角，返回收件箱信息、三码及全部文件列表。
-
-### 取件
-
-**GET** `/collection/retrieve/{retrieve_code}`
-
-取件码视角，只读返回文件列表（不暴露管理码与投件码）。
-
-### 投件码查看
-
-**GET** `/collection/manage-by-delivery/{delivery_code}`
-
-投件码视角，查看已投递的文件列表。
-
-### 更新收件箱配置
-
-**PATCH** `/collection/update/{collection_code}`
-
-仅可更新投件码/取件码有效期与最大文件数（收件箱过期时间创建后不可更改）。
-
-**请求体（可部分提交）：**
-
-```json
-{
-  "delivery_expire_style": "day",
-  "delivery_expire_value": 3,
-  "retrieve_expire_style": "day",
-  "retrieve_expire_value": 3,
-  "max_files": 50
-}
-```
-
-### 下载 / 打包 / 删除文件
-
-- **GET** `/collection/download/{file_id}?code=管理码或取件码`：下载单个文件
-- **GET** `/collection/zip/{code}`：打包下载收件箱全部文件（管理码或取件码）
-- **DELETE** `/collection/delete/{file_id}?code=管理码`：删除文件（仅管理码可删除）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/collection/create/` | 创建收件箱，返回投件码 / 取件码 / 管理码 |
+| `PATCH` | `/collection/update/{collection_code}` | 修改设置（最大文件数、有效期等） |
+| `GET` | `/collection/status/{collection_code}` | 状态查询 |
+| `GET` | `/collection/manage/{collection_code}` | 管理视角列表（管理码） |
+| `GET` | `/collection/manage-by-delivery/{delivery_code}` | 凭投件码查管理信息 |
+| `GET` | `/collection/retrieve/{retrieve_code}` | 取件视角列表（取件码） |
+| `GET` | `/collection/download/{file_id}` | 下载单个投件 |
+| `GET` | `/collection/zip/{code}` | 打包下载 |
+| `DELETE` | `/collection/delete/{file_id}` | 删除投件 |
 
 ### 投递
 
-**GET** `/delivery/{delivery_code}`：获取投递页信息（标题、容量、已投递数等，不暴露文件列表）。
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/delivery/{delivery_code}` | 获取投件页信息 |
+| `POST` | `/delivery/upload/` | 整包投递 |
+| `POST` | `/delivery/chunk/init/` | 分片投递初始化 |
+| `POST` | `/delivery/chunk/complete/` | 分片投递完成 |
+| `POST` | `/delivery/chunk/cancel/` | 取消分片投递 |
 
-**POST** `/delivery/upload/`
-
-投递文件到收件箱。
-
-**请求参数（multipart 表单）：**
-
-| 参数名 | 类型 | 必填 | 描述 |
-|-------|------|------|------|
-| delivery_code | string | 是 | 投件码 |
-| file | file | 是 | 要投递的文件 |
-| uploader_name | string | 否 | 投递者署名 |
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "id": 1,
-    "filename": "report.pdf",
-    "file_size": 2048,
-    "status": "completed"
-  }
-}
-```
-
-### 收件箱实时推送（WebSocket）
-
-**WS** `/ws/collection/{code}`
-
-使用管理码或投件码连接，第一条消息发送 `{"type":"join","nickname":"昵称"}` 注册身份。服务端推送的事件类型：`user_joined` / `user_left` / `file_uploading` / `file_progress` / `file_completed` / `file_delivery_failed` / `file_deleted`。
+投件码与取件码分离：提交者拿投件码只能上传，收集者拿管理码/取件码才能查看和打包。
 
 ---
 
-## 跨设备聊天接口
+## 实时房间 `/room` 与 `/ws`
 
-### 创建房间
+### HTTP
 
-**POST** `/chat/create/`
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/room/create/` | 创建房间 |
+| `GET` | `/room/info/{room_code}` | 房间信息 |
+| `GET` | `/room/history/{room_code}` | 历史消息（断线重连补拉） |
+| `GET` | `/room/{room_code}/files` | 房间缓存文件列表 |
+| `POST` | `/room/{room_code}/file/upload` | 上传缓存文件（受配额约束） |
+| `GET` | `/room/{room_code}/file/{transfer_id}/link` | 换签名下载链接 |
+| `GET` | `/room/{room_code}/file/{transfer_id}/download` | 下载缓存文件 |
+| `DELETE` | `/room/{room_code}/file/{transfer_id}` | 删除缓存文件 |
 
-**请求体：**
+### WebSocket
 
-```json
-{
-  "title": "闲聊",
-  "expire_style": "day",
-  "expire_value": 1
-}
-```
+| 路径 | 用途 |
+|------|------|
+| `/ws/collection/{code}` | 收件箱实时推送 |
+| `/ws/room/{room_code}` | 跨设备聊天 |
+| `/ws/direct/{room_code}` | 直连快传 |
+| `/ws/transfer/{room_code}` | 文件传输 |
 
-**响应示例：**
+房间写接口要求「当前在线 **或** 持有成员令牌」，令牌由 WS join 时服务端签发。
 
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "room_code": "ABC123",
-    "title": "闲聊",
-    "expired_at": "..."
-  }
-}
-```
+### 兼容端点
 
-### 房间信息 / 历史消息
+`POST /transfer/create/`、`POST /direct/create/`、`GET /transfer/info/{room_code}`、
+`GET /direct/info/{room_code}` 保留供旧客户端使用。
+**`/chat/*` 系列端点已下线**，聊天统一走 `/room` 与 `/ws/room/{room_code}`。
 
-- **GET** `/chat/info/{room_code}`：房间信息（加入页展示）
-- **GET** `/chat/history/{room_code}?before_id=0`：最近消息（新加入/断线重连同步）
+### 多实例下的限制
 
-### 实时聊天（WebSocket）
-
-**WS** `/ws/chat/{room_code}`
-
-第一条消息发送 `{"type":"join","nickname":"昵称"}`。文本消息帧：`{"type":"chat_message","content":"..."}`（单条 ≤ 64KB）；打字状态帧：`{"type":"typing","is_typing":true}`。服务端广播：`chat_message` / `typing` / `user_joined` / `user_left`。
+文本信令跨实例同步；**二进制文件分片刻意不跨实例转发**（单帧 ≤256KB，pub/sub 会放大约 1.4 倍且延迟不可控）。
+接入层需按房间码做会话亲和，否则发送方会收到 `relay_failed`。详见 `readme.md` 的多实例章节。
 
 ---
 
-## 直连传输与直连快传接口
+## 管理后台 `/admin`
 
-两个模块均基于 WebSocket + WebRTC，服务器中转兜底且**不落盘**（单帧二进制 ≤ 4MB）。
+> 除 `POST /admin/login` 外，全部需要 `Authorization: Bearer <JWT>`。
+> `admin_api` 在 router 级别挂了 `admin_required` 依赖——**漏挂一处就是未授权访问漏洞，且功能测试不会暴露**。
 
-### 直连传输（纯文件）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/admin/login` | 登录，返回 JWT（唯一免鉴权接口） |
+| `GET` | `/admin/verify` | 校验 Token 有效性（只读，无副作用） |
+| `POST` | `/admin/logout` | 退出（JWT 无状态，仅客户端丢弃 Token） |
+| `GET` | `/admin/dashboard` | 仪表盘统计 |
+| `GET` | `/admin/audit` | 审计日志 |
+| `GET` | `/admin/network/turn-check` | TURN 连通性自检 |
+| `GET` | `/admin/config/get` | 读取全量配置 |
+| `PATCH` | `/admin/config/update` | 更新配置（白名单制） |
+| `GET` | `/admin/file/list` | 文件列表 |
+| `GET` | `/admin/file/{file_id}` | 文件详情 |
+| `PATCH` | `/admin/file/{file_id}` | 修改文件 |
+| `PATCH` | `/admin/file/{file_id}/expire` | 修改有效期 |
+| `POST` | `/admin/file/extend` | 续期 |
+| `DELETE` | `/admin/file/delete` | 删除文件 |
+| `GET` | `/admin/collection/list` | 收件箱列表 |
+| `GET` | `/admin/collection/{id}/files` | 收件箱投件列表 |
+| `DELETE` | `/admin/collection/{id}` | 删除收件箱 |
+| `PATCH` | `/admin/collection/{id}/expire` | 修改收件箱有效期 |
+| `POST` | `/admin/collection/{id}/extend` | 收件箱续期 |
+| `GET` | `/admin/room/list` | 房间列表 |
+| `GET` | `/admin/room/{id}/files` | 房间缓存文件 |
+| `DELETE` | `/admin/room/{id}` | 删除房间（跨实例踢人） |
+| `DELETE` | `/admin/room/cache-file/{file_id}` | 删除房间缓存文件 |
+| `PATCH` | `/admin/room/{id}` | 修改房间 |
+| `PATCH` | `/admin/room/{id}/expire` | 修改房间有效期 |
+| `POST` | `/admin/room/{id}/extend` | 房间续期 |
 
-- **POST** `/transfer/create/`：创建房间，请求体 `{"title":"","expire_style":"day","expire_value":1}`
-- **GET** `/transfer/info/{room_code}`：房间信息
-- **WS** `/ws/transfer/{room_code}`：首个连接者为主机（`role: host`），其余为访客（`role: guest`）。信令帧：`rtc_offer` / `rtc_answer` / `rtc_ice`；控制帧：`file_start` / `file_cancel`；二进制帧直接中继给房间内其他连接。
+### 配置白名单
 
-### 直连快传（消息 + 文件一体）
-
-- **POST** `/direct/create/`：创建房间
-- **GET** `/direct/info/{room_code}`：房间信息
-- **GET** `/direct/history/{room_code}?before_id=0`：最近聊天消息
-- **WS** `/ws/direct/{room_code}`：多人房间。消息帧：`chat_message` / `typing`；文件流程：`file_offer`（广播）→ `file_response`（接受/拒绝）→ `file_start`（定向中继）→ 二进制数据定向转发给目标接收者；另有 `rtc_offer` / `rtc_answer` / `rtc_ice` 信令。服务器中转受后台 `directRelayEnabled` 与 `directRelaySpeedLimit` 控制。
-
----
-
-## 管理接口
-
-以下接口除 `/admin/login` 外均需携带管理员 Token（`Authorization: Bearer <token>`）。
-
-### 管理员登录
-
-**POST** `/admin/login`
-
-**请求参数：**
-
-| 参数名 | 类型 | 必填 | 描述 |
-|-------|------|------|------|
-| password | string | 是 | 管理员口令 |
-
-### 仪表盘数据
-
-**GET** `/admin/dashboard`
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "totalFiles": 100,
-    "storageUsed": "1572864000",
-    "sysUptime": "1723353600000",
-    "yesterdayCount": 50,
-    "yesterdaySize": "524288000",
-    "todayCount": 30,
-    "todaySize": "314572800",
-    "totalCollections": 5,
-    "activeCollections": 3,
-    "totalDeliveries": 12,
-    "todayDeliveries": 4,
-    "todayDeliveriesSize": "1048576"
-  }
-}
-```
-
-### 文件管理
-
-- **GET** `/admin/file/list?page=1&size=10&keyword=`：分页列表（含多文件子项明细，不含收件箱文件）
-- **DELETE** `/admin/file/delete`：删除文件，请求体 `{"id": 1}`
-
-### 配置管理
-
-- **GET** `/admin/config/get`：获取系统配置（敏感项脱敏为 `******`）
-- **PATCH** `/admin/config/update`：更新配置，请求体为配置项键值对（只更新提交的字段；敏感项留空/`******` 表示不修改）
-
-### 收件箱管理
-
-- **GET** `/admin/collection/list?page=1&size=10&keyword=`：收件箱列表（含三码、容量、各码过期状态）
-- **GET** `/admin/collection/{collection_id}/files`：收件箱文件列表
-- **DELETE** `/admin/collection/{collection_id}`：删除收件箱及其全部文件
-
-### 直连快传房间管理
-
-- **GET** `/admin/direct/room/list?page=1&size=10&keyword=`：房间列表（含在线人数、消息数）
-- **DELETE** `/admin/direct/room/{room_id}`：删除房间并断开在线连接
+`PATCH /admin/config/update` 只接受白名单内的键。`dbType` / `dbHost` / `dbPort` /
+`dbName` / `dbUser` / `dbPassword` / `dbSchema` / `redisUrl` **故意不进白名单**：
+这类基础设施配置在进程运行中改不生效（连接池已建立），在线编辑只会让人误以为已切换。
+它们通过环境变量/配置文件设定并需要重启。
 
 ---
 
-## 错误响应
+## 其它端点
 
-当发生错误时，API 返回对应的错误信息（HTTPException）：
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/` | 前端 SPA 页面（静态产物） |
+| `POST` | `/` | 公共配置（前端启动时拉取） |
+| `GET` | `/robots.txt` | 由 `robotsText` 配置生成 |
 
-```json
-{
-  "detail": "文件不存在"
-}
-```
+---
 
-或（未授权）：
+## 迁移说明
 
-```json
-{
-  "detail": "密码错误"
-}
-```
-
-## 状态码说明
-
-- 200: 请求成功
-- 400: 请求参数错误
-- 401: 未授权
-- 403: 禁止访问 / 权限不足
-- 404: 资源不存在
-- 410: 资源已过期
-- 422: 请求参数验证错误（Pydantic）
-- 429: 请求过于频繁 / 上传会话过多
-- 500: 服务器内部错误
+- 数据库迁移在每次启动时自动执行，位于 `apps/base/migrations/`，必须**幂等**。
+- 新增迁移的函数名**必须是 `migrate()`**：执行器用 `hasattr(module, "migrate")` 判断，
+  写成 `upgrade()` 会被**静默跳过**（日志照样打印"执行迁移"，但不做任何事），
+  直到运行时报 `no such column` 才暴露。
+- 当前最新迁移为 `migrations_033.py`（`FileCodes.access_code_hash`）。

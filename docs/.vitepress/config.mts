@@ -64,10 +64,12 @@ export default defineConfig({
             {
               text: 'API 参考',
               items: [
-                { text: '分享接口', link: '/api/#分享接口' },
-                { text: '管理接口', link: '/api/#管理接口' },
-                { text: '错误响应', link: '/api/#错误响应' },
-                { text: '状态码说明', link: '/api/#状态码说明' },
+                { text: '约定与鉴权', link: '/api/#约定' },
+                { text: '分享与取件', link: '/api/#分享与取件-share' },
+                { text: '分片与预签名上传', link: '/api/#分片上传-chunk' },
+                { text: '收件箱与投递', link: '/api/#收件箱-collection-与投递-delivery' },
+                { text: '实时房间', link: '/api/#实时房间-room-与-ws' },
+                { text: '管理后台', link: '/api/#管理后台-admin' },
               ],
             },
           ],
@@ -81,7 +83,7 @@ export default defineConfig({
           ],
         },
         socialLinks: [
-          { icon: 'github', link: 'https://github.com/vastsa/FileCodeBox' },
+          { icon: 'github', link: 'https://github.com/onlypeng/FileCodeBox' },
         ],
         footer: {
           message: '基于 LGPL-3.0 license 发布',
@@ -139,6 +141,8 @@ export default defineConfig({
                 { text: 'File Upload', link: '/en/guide/upload' },
                 { text: 'File Sharing', link: '/en/guide/share' },
                 { text: 'File Management', link: '/en/guide/management' },
+                { text: 'Inbox (File Collection)', link: '/en/guide/collection' },
+                { text: 'Chat & Direct Transfer', link: '/en/guide/realtime' },
               ],
             },
             {
@@ -157,10 +161,12 @@ export default defineConfig({
             {
               text: 'API Reference',
               items: [
-                { text: 'Share API', link: '/en/api/#share-api' },
-                { text: 'Admin API', link: '/en/api/#admin-api' },
-                { text: 'Error Response', link: '/en/api/#error-response' },
-                { text: 'Status Codes', link: '/en/api/#status-codes' },
+                { text: 'Conventions & Auth', link: '/en/api/#conventions' },
+                { text: 'Sharing', link: '/en/api/#sharing-share' },
+                { text: 'Chunked & Presigned', link: '/en/api/#chunked-upload-chunk' },
+                { text: 'Inbox & Delivery', link: '/en/api/#inbox-collection-and-delivery-delivery' },
+                { text: 'Realtime Rooms', link: '/en/api/#realtime-rooms-room-and-ws' },
+                { text: 'Admin', link: '/en/api/#admin-admin' },
               ],
             },
           ],
@@ -174,7 +180,7 @@ export default defineConfig({
           ],
         },
         socialLinks: [
-          { icon: 'github', link: 'https://github.com/vastsa/FileCodeBox' },
+          { icon: 'github', link: 'https://github.com/onlypeng/FileCodeBox' },
         ],
         footer: {
           message: 'Released under the LGPL-3.0 license',
@@ -197,7 +203,7 @@ export default defineConfig({
 
     // 社交链接
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/vastsa/FileCodeBox' },
+      { icon: 'github', link: 'https://github.com/onlypeng/FileCodeBox' },
     ],
 
     // 页脚

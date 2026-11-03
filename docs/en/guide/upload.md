@@ -134,12 +134,12 @@ curl -X POST "http://localhost:12345/share/file/" \
   -F "expire_value=10" \
   -F "expire_style=count"
 
-# Share text
-curl -X POST "http://localhost:12345/share/text/" \
-  -F "text=This is the text content to share"
+# Text-only share (no file, remark only)
+curl -X POST "http://localhost:12345/share/file/" \
+  -F "remark=This is the text content to share"
 
-# Download file by extraction code
-curl -L "http://localhost:12345/share/select/?code=YOUR_CODE" -o downloaded_file
+# Download (key is returned by POST /share/select/)
+curl -L "http://localhost:12345/share/download?code=YOUR_CODE&key=<key>" -o downloaded_file
 ```
 
 ::: tip When Authentication Required
@@ -159,9 +159,9 @@ curl -X POST "http://localhost:12345/share/file/" \
   -F "file=@/path/to/file.pdf"
 
 # 3. Share text with token
-curl -X POST "http://localhost:12345/share/text/" \
+curl -X POST "http://localhost:12345/share/file/" \
   -H "Authorization: Bearer xxx.xxx.xxx" \
-  -F "text=This is the text content to share"
+  -F "remark=This is the text content to share"
 ```
 :::
 

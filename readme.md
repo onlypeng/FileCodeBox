@@ -1,27 +1,28 @@
 <div align="center">
 
-# FileCodeBox
+# FileCodeBox · 驿码
 
-### 驿码 - 匿名口令分享文本和文件
+### 匿名口令分享文本与文件
 
-无需注册，输入口令即可分享与取件
+无需注册，输入提取码即可分享与取件
 
 [![GitHub stars](https://img.shields.io/github/stars/onlypeng/FileCodeBox?style=flat-square&logo=github)](https://github.com/onlypeng/FileCodeBox/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/onlypeng/FileCodeBox?style=flat-square&logo=github)](https://github.com/onlypeng/FileCodeBox/network)
 [![GitHub issues](https://img.shields.io/github/issues/onlypeng/FileCodeBox?style=flat-square&logo=github)](https://github.com/onlypeng/FileCodeBox/issues)
 [![GitHub license](https://img.shields.io/github/license/onlypeng/FileCodeBox?style=flat-square)](https://github.com/onlypeng/FileCodeBox/blob/master/LICENSE)
 
-[![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.128+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Vue.js](https://img.shields.io/badge/Vue.js-3.x-4FC08D?style=flat-square&logo=vue.js&logoColor=white)](https://vuejs.org)
 [![WebRTC](https://img.shields.io/badge/WebRTC-P2P-blue?style=flat-square)](https://webrtc.org)
 
-[English](./readme_en.md)
+[English](./readme_en.md) · [在线文档](./docs/index.md) · [参与贡献](./docs/contributing.md) · [安全政策](./SECURITY.md)
 
 ```bash
-# 🚀 一键部署
-docker run -d --restart always -p 12345:12345 -v /opt/FileCodeBox:/app/data --name filecodebox lanol/filecodebox:latest
-# 国内镜像（如果上面拉取缓慢）: docker.cnb.cool/aixk/filecodebox
+# 一键部署（单实例，零外部依赖）
+docker run -d --restart always -p 12345:12345 \
+  -v /opt/FileCodeBox:/app/data --name filecodebox \
+  lanol/filecodebox:latest
 ```
 
 </div>
@@ -30,252 +31,189 @@ docker run -d --restart always -p 12345:12345 -v /opt/FileCodeBox:/app/data --na
 
 ## 目录
 
-- [项目简介](#-项目简介)
-- [功能特性](#-功能特性)
-- [界面预览](#-界面预览)
-- [快速开始](#-快速开始)
-- [使用指南](#-使用指南)
-- [命令行使用（curl）](#-命令行使用curl)
-- [API 概览](#-api-概览)
-- [管理后台](#-管理后台)
-- [系统配置说明](#-系统配置说明)
-- [开发指南](#-开发指南)
-- [常见问题](#-常见问题)
-- [免责声明](#-免责声明)
+- [这是什么](#这是什么)
+- [当前能力速览](#当前能力速览)
+- [快速开始](#快速开始)
+- [环境变量](#环境变量)
+- [多实例部署](#多实例部署)
+- [反向代理](#反向代理)
+- [使用指南](#使用指南)
+- [命令行示例（curl）](#命令行示例curl)
+- [API 概览](#api-概览)
+- [管理后台](#管理后台)
+- [系统配置](#系统配置)
+- [开发指南](#开发指南)
+- [常见问题](#常见问题)
+- [免责声明](#免责声明)
 
 ---
 
-## 📝 项目简介
+## 这是什么
 
-FileCodeBox 是一个轻量级的文件分享工具，基于 **FastAPI + Vue3** 开发。用户无需注册，输入口令（提取码）即可匿名分享与获取文本和文件——就像从驿站取件一样简单。
+FileCodeBox 是一个**自托管的轻量文件快递柜**：发件人拿到一串 6 位提取码，把它给收件人，对方输入码即可取件。没有账号体系，没有注册流程。
 
-除了基础的文本/文件分享，当前版本还内置了 **收件箱（文件收集）**、**跨设备聊天**、**直连快传（WebRTC P2P + 服务器中转）** 等模块，可覆盖临时分享、文件收集、多人协作、跨设备同步、多摄像头实时共享等多种场景。
+后端是 FastAPI + Tortoise ORM（默认 SQLite，可切 PostgreSQL / MySQL），前端是 Vue 3 + Vite。**后端单端口同时提供 API 与前端静态产物**，所以最小部署只需要一个进程、一个端口、一个数据目录。
 
-### 应用场景
+除了基础的文本/文件分享，当前版本内置了收件箱（文件收集）、跨设备聊天、直连快传（WebRTC P2P + 服务器中转）、房间文件缓存、审计日志与可插拔病毒扫描钩子。
 
-| 场景 | 描述 |
-|------|------|
-| 📁 **临时文件分享** | 快速分享文件，无需注册登录 |
-| 📝 **代码片段分享** | 分享代码、配置文件等文本内容 |
-| 🕶️ **匿名文件传输** | 保护隐私的点对点传输 |
-| 📬 **文件收集** | 创建收件箱，他人凭投件码上传文件，收件人统一管理 |
-| 💬 **跨设备聊天** | 通过房间码实时收发消息 |
-| ⚡ **直连快传** | WebRTC P2P 直传大文件；支持多人房间、消息+文件一体、多摄像头画面共享，服务器中转兜底且不落盘 |
-| 💾 **临时存储** | 支持自定义过期时间（时间/次数）的云存储 |
-| 🌐 **私有服务** | 搭建企业或个人专属分享服务 |
+> 本项目基于 [vastsa/FileCodeBox](https://github.com/vastsa/FileCodeBox) 继续开发。文档与代码以**当前仓库实现**为准；若与其它分支的说明不一致，以代码为准并欢迎提 issue。
 
----
+### 典型场景
 
-## ✨ 功能特性
-
-<table>
-<tr>
-<td width="33%" valign="top">
-
-### 🚀 轻量高效
-- FastAPI + SQLite3 后端
-- Vue3 + TypeScript + Vite 前端（构建产物直接由后端内置服务，单端口部署）
-- Docker 一键部署
-- 资源占用极低
-
-</td>
-<td width="33%" valign="top">
-
-### 🔒 安全可靠
-- IP 上传/查询频率限制
-- 提取码错误次数限制
-- 文件自动过期清理
-- 管理员口令 PBKDF2 哈希存储
-- 提取口令（二次口令）可选启用，与取件码分离
-- 敏感配置（S3/WebDAV 凭据）加密存储
-
-</td>
-<td width="33%" valign="top">
-
-### 📤 便捷上传
-- 拖拽 / 复制粘贴上传
-- 多文件批量上传
-- 分片上传（断点续传，SHA256 校验；分片大小后台可配置）
-- S3 预签名直传（其他存储自动走代理转存）
-
-</td>
-</tr>
-<tr>
-<td width="33%" valign="top">
-
-### 🎫 灵活分享
-- 随机/自定义提取码
-- 有效期：天 / 小时 / 分钟 / 下载次数 / 永久
-- 支持备注（remark）
-- 多文件打包 ZIP 下载
-
-</td>
-<td width="33%" valign="top">
-
-### 📬 收件箱（文件收集）
-- 三码分离：管理码 / 投件码 / 取件码
-- 可设密码、最大文件数、投递次数
-- 管理码、投件码、取件码独立过期
-- WebSocket 实时推送投递进度
-
-</td>
-<td width="33%" valign="top">
-
-### ⚡ 直连快传（WebRTC）
-- 跨设备实时聊天（房间码加入）
-- 多人房间：消息 + 文件一体，文件定向转发
-- **多摄像头实时共享**：多路摄像头同一窗口网格分割显示（类监视器大屏）
-- WebRTC P2P 优先，服务器中转兜底（不落盘、可控分片大小与限速）
-
-</td>
-</tr>
-<tr>
-<td width="33%" valign="top">
-
-### 💾 多存储支持
-- 本地文件系统
-- S3 兼容存储
-- OneDrive
-- OpenDAL
-- WebDAV
-
-</td>
-<td width="33%" valign="top">
-
-### 🛠 管理后台
-- 仪表盘（分享/收件箱/投递统计）
-- 文件管理（含多文件明细）
-- 收件箱管理
-- 直连快传房间管理
-- 系统配置在线修改（热加载）
-
-</td>
-<td width="33%" valign="top">
-
-### 🌍 国际化与设备适配
-- 简体中文 / English
-- 响应式设计 / 深色模式
-- 手机 / 平板 / 电脑自适应（UA + 触屏识别）
-- 反代环境支持（CORS 白名单、可信代理配置）
-
-</td>
-</tr>
-</table>
+| 场景 | 对应能力 |
+|------|---------|
+| 临时传个文件给同事 | 提取码分享，按时间/次数自动过期 |
+| 发一段配置、日志、代码片段 | 纯文本分享（不上传文件，只提交备注内容） |
+| 收作业 / 收材料 | 收件箱：别人凭投件码上传，你用管理码统一查看下载 |
+| 两台设备互传大文件 | 直连快传：WebRTC P2P，服务器中转兜底且不落盘 |
+| 对方不在线也要能拿到 | 房间缓存：文件暂存服务端，对方上线后拉取 |
+| 担心提取码被转发 | 二次口令（提取口令），走另一条信道告知 |
+| 企业内网私有部署 | 全功能自托管，数据留在自己的磁盘/对象存储里 |
 
 ---
 
-## 🖼️ 界面预览
+## 当前能力速览
 
-> 以下截图由本项目实际运行页面截取（前端仓库：[FileCodeBoxFronted](https://github.com/onlypeng/FileCodeBoxFronted)）。
-
-<details open>
-<summary><b>🎨 首页与发件</b></summary>
-<br>
-<div align="center">
-<table>
-<tr>
-<td><img src="./.github/images/home.png" alt="首页（发件+查码）"></td>
-<td><img src="./.github/images/send.png" alt="发件页"></td>
-</tr>
-<tr>
-<td><img src="./.github/images/mobile-home.png" alt="手机端首页"></td>
-<td><img src="./.github/images/direct.png" alt="直连快传创建房间"></td>
-</tr>
-<tr>
-<td><img src="./.github/images/collection.png" alt="收件箱创建"></td>
-<td><img src="./.github/images/admin-login.png" alt="管理后台登录"></td>
-</tr>
-</table>
-</div>
-</details>
+| 领域 | 已具备 |
+|------|--------|
+| 分享 | 单文件 / 多文件 / 纯文本、时间型与次数型过期、有效期续期、撤销分享 |
+| 取件 | 提取码查询、只读详情刷新、二次口令、下载签名链接、断点续传（Range/206）、SHA-256 下载校验 |
+| 上传 | 整包上传、分片上传（断点续传）、S3 预签名直传、服务端权威哈希秒传 |
+| 收件箱 | 创建/编辑/关闭、投件码与取件码分离、分片投递、打包下载、后台管理 |
+| 实时 | 跨设备聊天、直连快传房间、房间消息持久化、WebRTC 信令、房间文件缓存与配额 |
+| 管理 | 仪表盘、文件/房间/收件箱管理、在线配置、审计日志、TURN 连通性自检 |
+| 安全 | PBKDF2 管理员口令、JWT、IP 失败限流、敏感配置加密、可插拔病毒扫描、强制首次改密 |
+| 存储 | 本地 / S3 兼容 / OneDrive / WebDAV / OpenDAL（可插拔） |
+| 部署 | 单端口、Docker、SQLite 开箱即用；PostgreSQL/MySQL + Redis 可水平扩展 |
+| 界面 | 中文简/繁/英三语、深浅色主题、移动端适配 |
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
 ### Docker 部署（推荐）
 
-**方式一：Docker CLI**
-
 ```bash
-# Docker Hub（推荐）
-docker run -d --restart always -p 12345:12345 -v /opt/FileCodeBox:/app/data --name filecodebox lanol/filecodebox:latest
-
-# 国内镜像（如果 Docker Hub 拉取缓慢）
-docker run -d --restart always -p 12345:12345 -v /opt/FileCodeBox:/app/data --name filecodebox docker.cnb.cool/aixk/filecodebox
+docker run -d --restart always -p 12345:12345 \
+  -v /opt/FileCodeBox:/app/data \
+  -e JWT_SECRET="$(openssl rand -hex 32)" \
+  -e ENCRYPTION_KEY="$(openssl rand -hex 32)" \
+  --name filecodebox lanol/filecodebox:latest
 ```
 
-**方式二：Docker Compose**
+国内拉取缓慢时可换镜像：`docker.cnb.cool/aixk/filecodebox`。
+
+打开 `http://<服务器IP>:12345` 即可使用。管理后台在 `/#/admin`，**默认管理员口令 `FileCodeBox2023`，首次部署请立刻修改**。
+
+### docker-compose（带 PostgreSQL + Redis 的多实例形态）
 
 ```yaml
 services:
-  file-code-box:
+  filecodebox:
     image: lanol/filecodebox:latest
-    container_name: filecodebox
-    restart: unless-stopped
-    ports:
-      - "12345:12345"
-    volumes:
-      - ./data:/app/data
+    ports: ["12345:12345"]
+    volumes: ["./data:/app/data"]
     environment:
-      - WORKERS=4
-      - LOG_LEVEL=info
-      - JWT_SECRET=your-random-secret
-      - ENCRYPTION_KEY=your-encryption-key
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      REDIS_URL: redis://redis:6379/0
+      WORKERS: 2
+      # 数据库类型为后台配置项（dbType），需要 postgres/mysql 才能多进程并发写
+    depends_on: [postgres, redis]
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: filecodebox
+      POSTGRES_USER: filecodebox
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes: ["./pgdata:/var/lib/postgresql/data"]
+  redis:
+    image: redis:7-alpine
 ```
+
+> **不要照抄 `WORKERS=2` 就直接用**：必须同时满足「数据库可并发写」与「集群已启用」两个条件，详见[多实例部署](#多实例部署)。条件不齐时启动会打 ERROR，且房间消息会出现"只有一半人收到"这种极难排查的现象。
+
+### 手动部署（前后端一体）
 
 ```bash
-docker compose up -d
+# 1. 克隆后端仓库（已内置前端构建产物 frontend_dist）
+git clone https://github.com/onlypeng/FileCodeBox.git
+cd FileCodeBox
+
+# 2. 创建虚拟环境并安装依赖
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements.txt   # Windows
+# source .venv/bin/activate && pip install -r requirements.txt  # Linux/macOS
+
+# 3. 启动（默认 0.0.0.0:12345）
+.venv/Scripts/python.exe main.py
 ```
 
-### 环境变量说明
+前端源码在**另一个仓库**（[FileCodeBoxFronted](https://github.com/onlypeng/FileCodeBoxFronted)）。只有需要改前端时才需要它；日常部署直接用后端仓库里的 `frontend_dist` 即可。
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `HOST` | `0.0.0.0` | 监听地址 |
-| `PORT` | `12345` | 服务端口 |
-| `WORKERS` | `1` | 工作进程数（建议设为 CPU 核心数） |
-| `LOG_LEVEL` | `info` | 日志级别：`debug` / `info` / `warning` / `error` |
-| `JWT_SECRET` | 空 | JWT 签名密钥。设置后修改管理员密码不会使已登录 Token 失效；留空则回退到管理员口令派生 |
-| `ENCRYPTION_KEY` | 空 | 敏感配置（S3/WebDAV 等凭据）的加密密钥，**强烈建议生产环境配置**；留空则从管理员口令派生 |
-| `REDIS_URL` | 空 | 多实例协调用的 Redis 连接串（如 `redis://127.0.0.1:6379/0`）。留空 = 单实例模式，无需任何外部依赖。**`WORKERS > 1` 时必须配置**，否则房间内的实时消息只落在单个进程 |
+本地开发时可以前后端分离运行：前端 `npm run dev`（5173）通过 Vite 代理把 `/share`、`/admin` 等请求转发到后端 `12345`。
 
-### 多进程 / 多实例部署
+---
 
-默认是**单实例**运行：房间 WebSocket 连接表与房间配额锁都在进程内存里。
-把 `WORKERS` 调大（或起多个容器 + 负载均衡）之前，必须同时满足：
+## 环境变量
 
-| 条件 | 原因 | 怎么判断 |
-|------|------|----------|
-| 数据库换成 `postgres` / `mysql` | SQLite 是单写者，多进程并发写会冲突 | 启动日志第一行「部署形态」 |
-| 配置 `REDIS_URL` | 房间成员、文本信令、配额锁需要跨进程共享 | 同上，`集群协调: Redis 模式` |
+| 变量 | 默认值 | 生效范围 | 说明 |
+|------|--------|---------|------|
+| `HOST` | `0.0.0.0` | 仅 Docker CMD | 传给 `uvicorn --host`；手动启动时用配置项 `serverHost` |
+| `PORT` | `12345` | 仅 Docker CMD | 传给 `uvicorn --port`；手动启动时用配置项 `serverPort` |
+| `LOG_LEVEL` | `info` | 仅 Docker CMD | uvicorn 日志级别 |
+| `WORKERS` | `1` | Docker CMD + 运行时能力判定 | 工作进程数。**默认请保持 1**；调大前必须满足多实例的两个前置条件 |
+| `JWT_SECRET` | 空 | 应用 | JWT 签名密钥。留空时从管理员口令派生，**改管理员密码会使已登录 Token 失效**；生产环境建议显式配置 |
+| `ENCRYPTION_KEY` | 空 | 应用 | S3/WebDAV 等敏感配置的加密密钥。留空时从管理员口令派生，生产环境建议显式配置 |
+| `REDIS_URL` | 空 | 应用 | 多实例协调的 Redis 连接串，如 `redis://127.0.0.1:6379/0`。留空 = 单实例，无需任何外部依赖 |
 
-启动时会把结论打在日志里，不会让人"以为支持"：
+生成随机密钥：`openssl rand -hex 32`。
+
+> `HOST` / `PORT` / `LOG_LEVEL` 是 Dockerfile 里 `CMD` 的 shell 变量，只在使用镜像时生效；直接跑 `python main.py` 时由 `core/settings.py` 的 `serverHost` / `serverPort` 决定。
+
+---
+
+## 多实例部署
+
+默认形态是**单实例**：房间 WebSocket 连接表与房间配额锁在进程内存里，SQLite 也是单写者。这是刻意选的保守路线——零外部依赖、行为可预测。
+
+把 `WORKERS` 调大，或起多个容器做负载均衡之前，**两个条件必须同时满足**：
+
+| 条件 | 为什么 | 怎么确认 |
+|------|--------|---------|
+| 数据库改为 `postgres` / `mysql` | SQLite 单写者，多进程并发写会冲突 | 后台「系统配置」→ `dbType`，改完重启 |
+| 配置 `REDIS_URL`（或后台 `redisUrl`） | 房间成员、文本信令、配额锁需要跨进程共享 | 启动日志 `集群协调: Redis 模式` |
+
+启动日志会如实打印结论，不会制造"看起来支持"的假象：
+
+```
+集群协调: 本地模式（单实例），未配置 redisUrl
+应用初始化完成
+部署形态: 数据库=sqlite 多进程支持=False
+```
+
+条件满足时：
 
 ```
 集群协调: Redis 模式 instance=8f3c1a2b9d4e channel=filecodebox:cluster
 部署形态: 数据库=postgres 多进程支持=True
-多进程部署注意: 房间文件分片中继（二进制帧）不跨实例转发：接入层需按房间做会话亲和…
 ```
 
-三条必须知道的约束：
+若 `WORKERS > 1` 但条件不齐，启动会打 `ERROR` 并要求修正配置。
 
-1. **房间文件中转需要会话亲和**。文本信令（成员上下线、文件卡片、WebRTC 协商、屏幕共享通知）
-   跨实例同步，但**文件分片的二进制帧不跨实例转发** —— 单帧最大 256KB，走 pub/sub 会把吞吐
-   放大 1.4 倍（base64）且延迟不可控。请在负载均衡上按房间码做一致性哈希/粘性会话，
-   让同一房间的 WebSocket 连接落到同一实例。纯 P2P 直连不受此限制。
-   未做亲和时发送方会收到明确提示，不会"传到一半静默卡住"。
-2. **IP 限流按实例计数**。上传/取件失败的阈值实际为「配置值 × 实例数」，属近似放宽，不影响正确性。
-3. **改 `REDIS_URL` 需重启**。订阅连接不能热切换；后台不提供该项在线编辑，也是这个原因。
+### 三条必须知道的约束
 
-Redis 只是协调件，不是主链路：运行中 Redis 抖动会丢部分文本信令（成员快照心跳每 5 秒自愈），
-加锁失败会降级为进程内锁（宁可极小概率超配额，也不让上传整体不可用）；启动时连不上则记 error
-并回落单实例，此时日志与能力报告都会如实标注"多进程不支持"。
+1. **房间文件中转需要会话亲和**。文本信令（成员上下线、文件卡片、WebRTC 协商）跨实例同步，但**文件分片的二进制帧刻意不跨实例转发**：单帧上限 256KB，走 pub/sub 会因 base64 放大约 1.4 倍且延迟不可控。请在负载均衡上按房间码做一致性哈希/粘性会话。纯 P2P 直连不受此限制；未做亲和时发送方会收到明确的 `relay_failed` 提示，而不是静默卡住。
+2. **IP 限流按实例计数**，实际阈值约为「配置值 × 实例数」，属近似放宽，不影响正确性。
+3. **Redis 只是协调件，不是主链路**。运行抖动会丢部分文本信令（成员快照每 5 秒自愈）；加锁失败降级为进程内锁（宁可极小概率超配额，也不让上传整体不可用）；启动时连不上则记 error 并回落单实例。
 
+多实例需要额外安装 `pip install redis`（默认单实例不需要，故未固定进 `requirements.txt`）。
 
-### 反向代理配置
+---
 
-使用 Nginx 时，请添加以下配置以正确获取客户端 IP（否则 IP 限流可能失效）：
+## 反向代理
+
+Nginx 示例（关键是转发头与 WebSocket 升级）：
 
 ```nginx
 location / {
@@ -284,516 +222,309 @@ location / {
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
-    client_max_body_size 100m;  # 根据需要调整上传大小限制
-    # WebSocket（收件箱实时推送 / 聊天 / 直连快传）
+    client_max_body_size 100m;
+
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
 }
 ```
 
-> 注意：容器启动时默认仅信任回环地址的转发头（`--forwarded-allow-ips "127.0.0.1"`）。部署在反向代理之后时，需将代理地址加入白名单，并在后台配置 `trustedProxies`。
-
-### 手动部署（前后端一体）
-
-```bash
-# 1. 克隆项目
-git clone https://github.com/onlypeng/FileCodeBox.git
-cd FileCodeBox
-
-# 2. 安装依赖
-pip install -r requirements.txt
-
-# 3. 构建前端并放入 frontend_dist（可选，仓库已内置当前构建产物）
-# cd FileCodeBoxFronted && npm install && npm run build
-# cp -r dist/* ../FileCodeBox/frontend_dist/
-
-# 4. 启动服务（默认单端口 serve 前端构建产物 + 后端 API）
-python main.py
-```
-
-> 后端启动时会自动检测 `frontend_dist/` 目录，存在则优先用它 serve 前端页面与静态资源（`/assets`），缺失时回退到 `themes/` 主题模板。
+容器默认只信任回环地址的转发头（`--forwarded-allow-ips "127.0.0.1"`）。部署在反代之后时，需把代理地址加入白名单，并在后台配置 `trustedProxies`，否则 IP 限流拿到的是网关地址。
 
 ---
 
-## 📖 使用指南
+## 使用指南
 
-### 基础操作
+### 发件与取件
 
-| 操作 | 步骤 |
-|------|------|
-| **分享文件/文本** | 打开网页 → 选择「发件」→ 拖拽/粘贴/输入 → 设置有效期 → 获取提取码 |
-| **获取文件** | 首页「查码」→ 输入提取码 → 查看/下载 |
-| **创建收件箱** | 首页 → 创建收件箱 → 设置标题/密码/容量/有效期 → 获得管理码、投件码、取件码 |
-| **投递文件** | 进入投递页（投件码）→ 上传文件（可署名）→ 投递 |
-| **收件箱管理** | 输入管理码 → 查看/下载/打包/删除投递的文件 |
-| **取件** | 输入取件码 → 只读查看并下载文件 |
-| **直连快传** | 首页 → 直连快传 → 创建房间 → 分享房间码 → 聊天 / 传文件 / 共享摄像头 |
-| **管理后台** | 访问 `/#/admin` → 输入管理员口令登录 |
+1. 首页选择文件（可多选）或直接填写文本备注，设置有效期，提交后得到 6 位提取码
+2. 收件人输入提取码 → 查看文件信息 → 下载
 
-### 发件
+有效期支持 `day` / `hour` / `minute` / `count`（下载次数）/ `forever`。
 
-- 支持文本与文件两种类型，文本单次不超过 222KB。
-- 支持单文件、多文件（默认最多 20 个）批量分享；多文件分享可打包 ZIP 下载，也可单独下载某一文件。
-- 有效期支持 `天 / 小时 / 分钟 / 下载次数 / 永久`（具体以后台 `expireStyle` 配置为准），并可附加备注。
-- 分片上传启用后，大文件按后台配置的 `uploadChunkSize`（默认 5MB）分片上传，支持断点续传与 SHA256 校验。
-- **提取口令（可选）**：发件时可额外设一个 2-32 位的口令。设置后取件码与口令缺一不可——取件码通常经聊天/邮件明文流转，口令走另一条信道（口头、电话），即使取件码泄露也取不到文件。口令以 PBKDF2 哈希存储（`filecodes.access_code_hash`），接口只判断对错、不回显原文；口令校验失败不计入该分享的取件次数（避免猜错就烧掉别人的额度），但会计入失败限流并写审计日志。
+### 提取口令（二次口令）
 
-```bash
-# 发一个带提取口令的文件
-curl -F "file=@a.txt" -F "expire_value=1" -F "expire_style=day" \
-     -F "access_code=pass2026" http://127.0.0.1:12345/share/file/
+提取码常在聊天、邮件里明文流转，泄露即等于文件泄露。发件时可额外设置一个 2–32 位**提取口令**，通过另一条信道（口头、电话）告知：
 
-# 取件：未带口令 → 403「该分享需要提取口令」；口令错误 → 403「提取口令错误」
-curl -H "Content-Type: application/json" \
-     -d '{"code":"XXXXXX","access_code":"pass2026"}' \
-     http://127.0.0.1:12345/share/select/
-```
+- 上传时随 `access_code` 一起提交；服务端只存 PBKDF2 哈希，不存明文
+- 取件时未带口令 → `403 该分享需要提取口令`，前端弹窗补输后重试
+- 口令错误 → `403 提取口令错误`，**不扣取件次数**（否则猜几次就能把别人额度烧光），但计入失败限流并写审计
+- 只读详情接口对未通过口令者只返回「需要口令」与过期状态，不下发文件名、大小、哈希
 
-设有口令的分享，`/share/download/item/{id}` 与 `/share/zip/{code}` 还需带上取件阶段下发的 `access_key`（短期 token），避免绕过口令直接按取件码下载。
+分片上传、S3 预签名直传同样支持：口令在「完成上传」阶段提交，不需要在上传会话里传递。
 
 ### 收件箱（文件收集）
 
-创建收件箱后会生成三个独立口令：
-
-| 码 | 用途 | 权限 |
-|------|------|------|
-| **管理码** `collection_code` | 收件人管理收件箱 | 查看、下载、打包、删除文件、修改配置 |
-| **投件码** `delivery_code` | 投件人上传文件 | 仅上传；可设置投递次数上限 |
-| **取件码** `retrieve_code` | 取件人查看 | 只读查看与下载，不可删除 |
-
-收件箱可设置：标题、描述、密码、最大文件数、投件码/取件码独立有效期、投递次数上限。投递进度通过 WebSocket 实时推送到管理页面。
+创建收件箱后得到两组码：**投件码**给提交者上传，**取件码 / 管理码**给收集者查看与打包下载。支持设置最大文件数、有效期，投件支持分片。
 
 ### 直连快传（WebRTC）
 
-- **多人房间**：创建房间获得房间码，实时收发文本消息，支持历史消息同步与在线成员展示。
-- **直连传输**：发送文件前需接收方确认，文件定向转发给目标用户；优先 WebRTC P2P，对称 NAT 等无法直连时自动回退服务器中转（不落盘）。
-- **多摄像头共享**：桌面端可同时选择多个摄像头共享（同一窗口网格分割显示，类监视器大屏）；手机/平板支持在设备间单选切换；竖屏画面保持原比例不裁切。
-- 可通过后台配置 TURN 服务器（`directTurnServers`）提升 P2P 直连成功率；中转分片大小（`directRelayChunkSize`）、单次中转文件上限（`directMaxRelaySize`）、中转限速（`directRelaySpeedLimit`）均可后台配置。
+进入房间后，优先尝试 P2P 直连；不可用时走服务器中转（**二进制帧不落盘**）。房间内可发消息、传文件、共享摄像头画面。若对方离线，可用房间文件缓存把文件暂存到服务端（默认 72 小时，单文件与房间级配额均可配）。
+
+### 撤销分享
+
+发件人持发起者凭证（`owner_token`）可撤销自己的分享。服务端会先检查物理文件是否被其它记录引用（秒传/去重会共享文件），有引用则只删记录不删文件。
 
 ---
 
-## 🧪 命令行使用（curl）
+## 命令行示例（curl）
 
 <details>
-<summary><b>点击展开 curl 使用示例</b></summary>
+<summary><b>展开 curl 示例</b></summary>
 
-**上传文件**
+**上传文件**（默认 1 天）
 
 ```bash
-# 基础上传（默认 1 天有效期）
+curl -X POST "http://localhost:12345/share/file/" -F "file=@./a.txt"
+```
+
+**指定有效期 / 次数 / 多文件 / 纯文本 / 提取口令**
+
+```bash
 curl -X POST "http://localhost:12345/share/file/" \
-  -F "file=@/path/to/file.txt"
+  -F "file=@./a.txt" -F "expire_value=1" -F "expire_style=hour"
 
-# 指定 1 小时有效期
 curl -X POST "http://localhost:12345/share/file/" \
-  -F "file=@/path/to/file.txt" \
-  -F "expire_value=1" \
-  -F "expire_style=hour"
+  -F "file=@./a.txt" -F "expire_value=10" -F "expire_style=count"
 
-# 指定下载 10 次后过期
 curl -X POST "http://localhost:12345/share/file/" \
-  -F "file=@/path/to/file.txt" \
-  -F "expire_value=10" \
-  -F "expire_style=count"
+  -F "files=@a.txt" -F "files=@b.txt" -F "remark=批量文件"
 
-# 多文件批量上传
+# 纯文本分享：不传文件，只传 remark
+curl -X POST "http://localhost:12345/share/file/" -F "remark=要分享的文本内容"
+
+# 带二次口令
 curl -X POST "http://localhost:12345/share/file/" \
-  -F "files=@a.txt" \
-  -F "files=@b.txt" \
-  -F "remark=批量文件"
+  -F "file=@./a.txt" -F "access_code=pass2026"
 ```
 
-**分享文本**
+**取件**
 
 ```bash
-curl -X POST "http://localhost:12345/share/text/" \
-  -F "text=要分享的文本内容"
+# 只读详情（不消耗取件次数）
+curl "http://localhost:12345/share/select/info/?code=ABCD12"
+
+# 正式取件（消耗次数，返回带签名 key 的下载地址）
+curl -X POST "http://localhost:12345/share/select/" \
+  -H "Content-Type: application/json" -d '{"code":"ABCD12"}'
+
+# 带口令
+curl -X POST "http://localhost:12345/share/select/" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"ABCD12","access_code":"pass2026"}'
+
+# 下载（用 select 返回的 key）
+curl -L "http://localhost:12345/share/download?code=ABCD12&key=<key>" -o a.txt
 ```
 
-**取件查询**
+**其它**
 
 ```bash
-curl "http://localhost:12345/share/select/?code=提取码"
+# 识别码类型（文件码/管理码/投件码/取件码/房间码）
+curl "http://localhost:12345/share/check_code/?code=ABCD12"
+
+# 撤销（需发起者凭证）
+curl -X POST "http://localhost:12345/share/revoke" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"ABCD12","owner_token":"<owner_token>"}'
 ```
 
-**下载文件**（先取件获取带签名 key 的下载地址，再跟随重定向下载）
-
-```bash
-curl -L "http://localhost:12345/share/download?key=<key>&code=提取码" -o filename
-```
-
-**检查码类型**（自动识别 文件码 / 管理码 / 投件码 / 取件码 / 聊天房间码 / 直连房间码）
-
-```bash
-curl "http://localhost:12345/share/check_code/?code=提取码"
-```
-
-**有效期参数**
-
-| `expire_style` | 说明 |
-|----------------|------|
-| `day` | 天数 |
-| `hour` | 小时 |
-| `minute` | 分钟 |
-| `count` | 下载次数 |
-| `forever` | 永久有效 |
-
-**返回示例**
+业务响应统一为：
 
 ```json
-{
-  "code": 200,
-  "message": "ok",
-  "detail": {
-    "code": "ABCD12",
-    "name": "file.txt"
-  }
-}
+{ "code": 200, "message": "ok", "detail": { "code": "ABCD12", "name": "a.txt" } }
 ```
 
-**需要认证时**（管理员关闭游客上传后，`openUpload=0`）
+**管理员关闭游客上传后**（`openUpload=0`）：
 
 ```bash
-# 1. 获取 token
-curl -X POST "http://localhost:12345/admin/login" \
+TOKEN=$(curl -s -X POST "http://localhost:12345/admin/login" \
   -H "Content-Type: application/json" \
-  -d '{"password": "FileCodeBox2023"}'
+  -d '{"password":"FileCodeBox2023"}' | python -c "import sys,json;print(json.load(sys.stdin)['detail']['token'])")
 
-# 2. 携带 token 上传
 curl -X POST "http://localhost:12345/share/file/" \
-  -H "Authorization: Bearer <token>" \
-  -F "file=@/path/to/file.txt"
+  -H "Authorization: Bearer $TOKEN" -F "file=@./a.txt"
 ```
+
+| `expire_style` | 含义 |
+|----------------|------|
+| `day` / `hour` / `minute` | 按时间过期 |
+| `count` | 下载指定次数后过期 |
+| `forever` | 永不过期 |
 
 </details>
 
 ---
 
-## 📚 API 概览
+## API 概览
 
-> 完整接口定义见 [docs/api](./docs/api/index.md)。以下为常用接口速查。所有业务响应统一为 `{ "code": 200, "message": "ok", "detail": {...} }`。
+> 完整接口说明见 [docs/api](./docs/api/index.md)。所有业务响应统一为 `{ "code": 200, "message": "ok", "detail": {...} }`；`410` 表示已过期。
 
-### 分享接口 `/share`
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/share/text/` | 分享文本 |
-| POST | `/share/file/` | 分享文件（单/多文件） |
-| GET | `/share/check_code/` | 检查码类型 |
-| GET/POST | `/share/select/` | 取件（获取文件信息/下载地址） |
-| GET | `/share/download` | 下载文件（需签名 key） |
-| GET | `/share/download/item/{item_id}` | 下载多文件分享中的单个文件 |
-| GET | `/share/zip/{code}` | 打包 ZIP 下载 |
-
-### 分片上传 `/chunk`
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/chunk/upload/init/` | 初始化分片会话（断点续传检测） |
-| POST | `/chunk/upload/chunk/{upload_id}/{index}` | 上传单个分片 |
-| GET | `/chunk/upload/status/{upload_id}` | 查询上传进度 |
-| POST | `/chunk/upload/complete/{upload_id}` | 合并分片并生成分享码 |
-| DELETE | `/chunk/upload/{upload_id}` | 取消上传 |
-
-### 预签名上传 `/presign`
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/presign/upload/init` | 初始化（S3 返回直传 URL，其他存储返回代理 URL） |
-| PUT | `/presign/upload/proxy/{upload_id}` | 代理模式上传 |
-| POST | `/presign/upload/confirm/{upload_id}` | 直传模式确认并生成分享码 |
-| GET | `/presign/upload/status/{upload_id}` | 查询会话状态 |
-| DELETE | `/presign/upload/{upload_id}` | 取消会话 |
-
-### 收件箱 `/collection` 与投递 `/delivery`
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/collection/create/` | 创建收件箱（返回三码） |
-| GET | `/collection/manage/{collection_code}` | 管理页面（文件列表） |
-| GET | `/collection/retrieve/{retrieve_code}` | 取件页面（只读） |
-| GET | `/collection/manage-by-delivery/{delivery_code}` | 投件码查看已投递文件 |
-| PATCH | `/collection/update/{collection_code}` | 更新投件码/取件码有效期、最大文件数 |
-| GET | `/collection/download/{file_id}` | 下载文件（需管理码/取件码） |
-| GET | `/collection/zip/{code}` | 打包下载所有文件 |
-| DELETE | `/collection/delete/{file_id}` | 删除文件（仅管理码） |
-| GET | `/delivery/{delivery_code}` | 获取投递页信息 |
-| POST | `/delivery/upload/` | 投递文件 |
-| WS | `/ws/collection/{code}` | 收件箱实时推送（管理码或投件码可连接） |
-
-### 跨设备聊天 `/chat`
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/chat/create/` | 创建聊天房间 |
-| GET | `/chat/info/{room_code}` | 房间信息 |
-| GET | `/chat/history/{room_code}` | 历史消息 |
-| WS | `/ws/chat/{room_code}` | 实时聊天 |
-
-### 直连快传 `/direct`
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/direct/create/` | 创建直连快传房间 |
-| GET | `/direct/info/{room_code}` | 房间信息 |
-| GET | `/direct/history/{room_code}` | 历史消息 |
-| WS | `/ws/direct/{room_code}` | 多人聊天 + 文件确认与定向中继（WebRTC 信令 + 二进制分片中继） |
-
-### 管理接口 `/admin`
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/admin/login` | 管理员登录，返回 Bearer Token |
-| GET | `/admin/dashboard` | 仪表盘统计 |
-| GET | `/admin/file/list` | 文件列表（分页/搜索） |
-| DELETE | `/admin/file/delete` | 删除文件 |
-| GET | `/admin/config/get` | 获取系统配置（敏感项脱敏） |
-| PATCH | `/admin/config/update` | 更新系统配置 |
-| GET | `/admin/collection/list` | 收件箱列表 |
-| GET | `/admin/collection/{id}/files` | 收件箱文件列表 |
-| DELETE | `/admin/collection/{id}` | 删除收件箱及其文件 |
-| GET | `/admin/direct/room/list` | 直连快传房间列表（含在线人数） |
-| DELETE | `/admin/direct/room/{id}` | 删除直连快传房间 |
+| 前缀 | 主要端点 | 说明 |
+|------|---------|------|
+| `/share` | `POST /file/`、`GET /check_code/`、`GET /select/info/`、`POST /select/`、`POST /revoke`、`GET /download`、`GET /download/item/{id}`、`GET /zip/{code}` | 分享与取件（含二次口令、多文件、打包下载） |
+| `/chunk` | `POST /upload/init/`、`POST /upload/`、`DELETE /upload/{id}`、`POST /complete/` | 分片上传（断点续传） |
+| `/presign` | `POST /upload/init`、`PUT /upload/proxy/{id}`、`POST /upload/confirm/{id}`、`DELETE /upload/{id}` | S3 预签名直传 / 代理上传 |
+| `/collection` | `POST /create/`、`PATCH /update/{code}`、`GET /status/{code}`、`GET /manage/{code}`、`GET /retrieve/{code}`、`GET /download/{id}`、`GET /zip/{code}`、`DELETE /delete/{id}` | 收件箱 |
+| `/delivery` | `POST /upload/`、`POST /chunk/init|complete|cancel/`、`GET /{delivery_code}` | 收件箱投件 |
+| `/room` | 房间管理端点 | 实时房间 |
+| `/ws` | `/ws/collection/{code}`、`/ws/room/{room_code}`、`/ws/direct/{room_code}`、`/ws/transfer/{room_code}` | WebSocket 实时通道 |
+| `/admin` | `POST /login`、`GET /verify`、`GET /dashboard`、`GET|PATCH /file/*`、`GET|PATCH /room/*`、`GET /collection/*`、`GET /audit`、`PATCH /config/update`、`GET /network/turn-check` | 管理后台（除 login 外全部需要 Bearer Token） |
 
 ---
 
-## 🛠 管理后台
+## 管理后台
 
-访问 `/#/admin`（或 `/#/login`），使用管理员口令登录（默认 `FileCodeBox2023`，**首次部署请务必修改**）。
+访问 `/#/admin`（或 `/#/login`），默认口令 `FileCodeBox2023`，**首次登录会被强制要求修改**。
 
-### 仪表盘
+| 模块 | 能力 |
+|------|------|
+| 仪表盘 | 文件数、存储占用、在线房间、过期趋势 |
+| 文件管理 | 列表、详情、修改有效期、续期、删除 |
+| 收件箱管理 | 收件箱列表、投件文件查看、删除、续期 |
+| 房间管理 | 房间列表、缓存文件、踢人、删除、续期 |
+| 系统配置 | 全量在线配置（数据库/Redis 等基础设施项除外） |
+| 审计日志 | 登录、配置变更、删除、撤销等关键操作留痕 |
+| 网络自检 | TURN 服务器连通性检查 |
 
-- 总文件数 / 存储空间 / 今日分享 / 昨日分享
-- 收件箱总数与有效数、投递统计
-- 文件健康度、类型分布、最近分享记录
-
-### 文件管理
-
-- 分页浏览所有分享记录（含多文件子项明细），支持按文件名搜索
-- 过期文件展示状态，可手动删除
-
-### 收件箱管理
-
-- 查看全部收件箱（标题、三码、容量、各码有效期与过期状态）
-- 查看单个收件箱的文件列表，支持删除收件箱及全部文件
-
-### 直连快传房间管理
-
-- 查看房间（在线人数、消息数、过期状态），可强制删除房间并断开在线连接
-
-### 系统配置
-
-- 站点信息（名称、描述、通知、页面说明、robots）
-- 存储引擎（本地 / S3 / OneDrive / WebDAV）及凭据
-- 上传设置（游客上传开关、单文件大小、分片开关、分片大小、有效期类型、最长保存时间）
-- 限流设置（上传频率、错误次数）
-- 主题选择、透明度、背景图
-- 高级设置（工作进程、CORS 白名单、可信代理、直连中继开关/分片大小/单次上限/限速/TURN 服务器）
+**为什么数据库与 Redis 配置不进后台白名单**：这类基础设施配置改了不会在当前进程生效（连接池已经建立），在后台改只会让人误以为已切换。它们通过环境变量/配置文件设定并重启生效。
 
 ---
 
-## ⚙️ 系统配置说明
+## 系统配置
 
-以下为 `DEFAULT_CONFIG` 中的核心配置项（均可在管理后台修改，写入数据库 `settings` 记录并热加载）：
+后台「系统配置」可在线修改，改完保存即生效（结构性配置除外）。常用项：
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `file_storage` | `local` | 存储引擎：`local` / `s3` / `onedrive` / `opendal` / `webdav` |
-| `admin_token` | `FileCodeBox2023` | 管理员口令（PBKDF2 哈希存储，界面显示脱敏） |
-| `openUpload` | `1` | 是否允许游客上传（关闭后需登录） |
-| `uploadSize` | `10MB` | 单文件大小上限 |
-| `uploadMinute` / `uploadCount` | `1` / `10` | IP 上传限流：每 X 分钟最多 Y 个文件 |
-| `errorMinute` / `errorCount` | `1` / `10` | IP 查询错误限流：每 X 分钟最多错误 Y 次 |
-| `expireStyle` | 5 种 | 可选有效期类型（天/小时/分钟/次数/永久） |
-| `enableChunk` | `0` | 是否启用分片上传 |
-| `uploadChunkSize` | `5` | 分片大小（MB），启用分片上传后大文件按此分片 |
-| `max_save_seconds` | `0` | 最长保存时间（秒），`0` 为不限制 |
-| `maxMultiFileCount` | `20` | 多文件分享单次数量上限 |
-| `maxSendFiles` | `20` | 发件时文件数量上限 |
-| `maxCollectionFiles` | `100` | 收件箱最大文件数上限 |
-| `collectionDefaultMaxFiles` | `20` | 创建收件箱默认最大文件数 |
-| `collectionDefaultExpireDays` | `7` | 创建收件箱默认有效期（天） |
-| `themesSelect` | `themes/2024` | 主题模板目录（未内置构建产物时使用） |
-| `showAdminAddr` | `0` | 是否在前台显示管理入口 |
-| `trustedProxies` | 空 | 可信代理 IP（逗号分隔） |
-| `cors_origins` | `http://localhost:5173,...` | CORS 白名单（逗号分隔；生产同源部署可留空） |
-| `directRelayEnabled` | `1` | 直连快传服务器中转开关 |
-| `directRelayChunkSize` | `64` | 服务器中转分片大小（KB，16~256KB） |
-| `directMaxRelaySize` | `0` | 单次中转文件大小上限（MB，`0` 不限制） |
-| `directRelaySpeedLimit` | `0` | 服务器中转限速（KB/s，`0` 不限速） |
-| `directTurnServers` | `[]` | WebRTC TURN 服务器列表（对称 NAT 下 P2P 失败时兜底） |
+| `openUpload` | `1` | 是否允许游客上传；`0` 时上传需管理员 Token |
+| `uploadSize` | `104857600` | 单文件大小上限（字节），默认 100MB |
+| `expireStyle` | `day/hour/minute/forever/count` | 可选过期方式 |
+| `enableChunk` / `uploadChunkSize` | `0` / `5` | 分片上传开关与分片大小（MB） |
+| `codeLength` | `6` | 提取码长度 |
+| `maxMultiFileCount` | `20` | 单次多文件分享上限 |
+| `errorMinute` / `errorCount` | `1` / `10` | 失败限流窗口与次数 |
+| `roomCacheEnabled` / `roomCacheDefaultHours` / `roomCacheMaxSize` / `roomCacheRoomQuota` | `1` / `72` / `100` / `500` | 房间缓存开关、默认时长（小时）、单文件上限（MB）、房间配额（MB） |
+| `globalStorageQuotaMB` | `0` | 全局存储配额，0 = 不限制 |
+| `auditLogRetentionDays` | `90` | 审计日志保留天数 |
+| `virusScanEnabled` / `virusScanHook` / `virusScanTimeoutSec` / `virusScanFailOpen` | `false` / 空 / `30` / `true` | 可插拔病毒扫描钩子 |
+| `directRelayEnabled` / `directRelayChunkSize` / `directMaxRelaySize` | `1` / `64` / `0` | 服务器中转开关、分片大小（KB）、单文件上限（0=不限） |
+| `shareDomain` | 空 | 生成分享链接时使用的域名 |
+| `trustedProxies` | 空 | 可信代理地址，反代部署时配置 |
+| `cors_origins` | `http://localhost:5173,http://127.0.0.1:5173` | 允许的跨域来源 |
+| `dbType` / `dbHost` / `dbPort` / `dbName` / `dbUser` / `dbPassword` / `dbSchema` | `sqlite` / … | 数据库连接（**改完需重启**） |
+| `redisUrl` | 空 | 集群协调 Redis 连接串（**改完需重启**） |
 
-> 敏感配置项（S3/OneDrive/WebDAV 凭据）保存时使用 `ENCRYPTION_KEY`（或管理员口令派生密钥）加密；读取配置时自动解密，管理界面展示时脱敏。
+### 病毒扫描钩子
+
+不内置扫描引擎，但留出接口：上传落盘后回调外部扫描服务（本地命令或 HTTP），命中即拒绝。
+
+| 项 | 说明 |
+|----|------|
+| `virusScanHook` | `cmd:<可执行文件路径> <参数...>` 或 `http://...` 的 multipart 接口 |
+| 返回码约定 | 命令：0 = 干净，1 = 命中，其它 = 扫描失败；HTTP：JSON `{ "infected": true/false }` |
+| `virusScanFailOpen` | 扫描器不可用时是否放行，默认 `true`（扫描是辅助能力，不该因扫描器挂掉让上传整体不可用） |
+
+命令参数以列表方式执行、**不经 shell**，避免文件名被拼进命令行造成注入。
 
 ---
 
-## 🔧 开发指南
+## 开发指南
 
-### 项目结构
+### 两个仓库
 
 ```
-FileCodeBox/
-├── apps/
-│   ├── admin/          # 管理后台（登录、仪表盘、文件/收件箱/直连房间管理、配置）
-│   └── base/           # 基础功能（分享、分片、预签名、收件箱、投递、聊天、直连快传）
-├── core/               # 核心模块（配置、数据库、存储、任务、WebSocket、工具）
-├── data/               # 数据目录（运行时生成，含 SQLite 与上传文件）
-├── docs/               # VitePress 文档
-├── frontend_dist/      # 前端构建产物（后端优先 serve；可替换为最新构建结果）
-├── themes/             # 前端主题模板（构建产物缺失时的回退）
-├── main.py             # 入口文件（API + 静态资源服务）
-└── requirements.txt    # Python 依赖
+FileCodeBox/          后端 FastAPI（master）       ← 本仓库
+FileCodeBoxFronted/   前端 Vue 3 + Vite（main）    ← 独立仓库，无统一父仓库
 ```
+
+后端 serve `FileCodeBox/frontend_dist`，**该目录必须入库**（Dockerfile 直接 COPY 它）。前端构建产物需要同步回后端仓库，否则镜像里会是旧界面。
 
 ### 本地开发
 
-**后端**
-
 ```bash
-pip install -r requirements.txt
-python main.py
-```
+# 终端 1：后端（工作目录必须是 FileCodeBox/，迁移扫描依赖相对路径 apps/）
+cd FileCodeBox
+.venv/Scripts/python.exe main.py
 
-**前端**
-
-```bash
-# 前端仓库: https://github.com/onlypeng/FileCodeBoxFronted
+# 终端 2：前端
 cd FileCodeBoxFronted
-npm install        # 或 pnpm install
-npm run dev
-# 构建：产物放入后端 frontend_dist 后由后端单端口 serve
-npm run build
-cp -r dist/* ../FileCodeBox/frontend_dist/
+npm install
+npm run dev        # 5173，Vite 代理转发到 12345
 ```
 
-> 前端开发默认访问 `http://localhost:5173`，后端默认已配置该地址为 CORS 白名单。
+### 构建与同步
+
+```bash
+cd FileCodeBoxFronted
+npm run build      # clean-dist → 架构边界检查 → vue-tsc → vite build，约 40~100s
+
+cd ..
+python .workbuddy/sync_dist.py   # 覆盖式复制 dist → FileCodeBox/frontend_dist
+git -C FileCodeBox add frontend_dist
+```
+
+`npm run build` 已内置构建前清理（`scripts/clean-dist.mjs`），解决 `emptyOutDir:false` 导致的产物累积。同步后请确认入口 chunk 已入库——Dockerfile 依赖它。
+
+### 验证
+
+```bash
+cd FileCodeBox
+.venv/Scripts/python.exe -m pytest -q          # 后端测试
+```
+
+端到端验证脚本在 `.workbuddy/`（`e2e_server.py` 起临时服务、`e2e_test.py` 断言），每次使用全新临时数据目录，不会碰真实 `data/`。
 
 ### 技术栈
 
-| 类别 | 技术 |
-|------|------|
-| **后端框架** | FastAPI / Uvicorn |
-| **数据库** | SQLite + Tortoise ORM |
-| **数据验证** | Pydantic 2.x |
-| **异步支持** | aiofiles / aiohttp / aioboto3 |
-| **对象存储** | S3 协议 / OneDrive / OpenDAL / WebDAV |
-| **实时通信** | WebSocket（收件箱推送 / 聊天 / 直连中继）|
-| **P2P 传输** | WebRTC（直连快传，多路媒体与数据通道）|
-| **媒体共享** | getUserMedia 多摄像头采集 + 网格布局渲染 |
-| **前端框架** | Vue 3 + Vite + TypeScript |
-| **密码安全** | PBKDF2-SHA256 / Fernet 加密 |
-| **容器化** | Docker / Docker Compose |
+| 层 | 选型 |
+|----|------|
+| 后端 | Python 3.12、FastAPI、Tortoise ORM、SQLite / PostgreSQL / MySQL |
+| 前端 | Vue 3、Vite 7、TypeScript、Pinia、vue-i18n、Tailwind CSS |
+| 实时 | WebSocket、WebRTC（P2P + TURN） |
+| 存储 | 本地 / S3 / OneDrive / WebDAV / OpenDAL |
+| 集群 | Redis pub/sub（可选） |
+
+注解与文档规范见 [docs/contributing.md](./docs/contributing.md)。核心一条：**注解写「为什么」，不写「做了什么」**；改了接口/配置，同一提交里必须同步文档。
 
 ---
 
-## ❓ 常见问题
+## 常见问题
 
-<details>
-<summary><b>如何修改上传大小限制？</b></summary>
+**Q：忘记管理员口令怎么办？**
+在数据库 `keyvalue` 表的 `settings` 记录里重置 `admin_token`，或删除数据目录重新初始化（会丢失全部数据）。生产环境请务必配置 `JWT_SECRET` 与 `ENCRYPTION_KEY` 并备份。
 
-在管理后台 → 系统配置中修改 `uploadSize`。如果使用 Nginx 反向代理，还需修改 `client_max_body_size`。
-</details>
+**Q：上传大文件失败？**
+检查 `uploadSize`（默认 100MB）、反向代理的 `client_max_body_size`、以及是否开启分片上传（`enableChunk=1`）。
 
-<details>
-<summary><b>如何配置存储引擎？</b></summary>
+**Q：下载链接过期 / 提示 410？**
+取件返回的下载地址带签名 `key`，有时效。请重新取件获取新链接；若分享本身已过期（`count` 用尽或时间到），则无法恢复。
 
-在管理后台 → 系统配置中选择存储引擎类型并配置相应参数。支持本地存储、S3、OneDrive、OpenDAL、WebDAV。
-</details>
+**Q：为什么改了管理员密码后所有人被登出？**
+未配置 `JWT_SECRET` 时，签名密钥由管理员口令派生，改口令即等于换密钥。配置 `JWT_SECRET` 可避免。
 
-<details>
-<summary><b>如何更换前端页面？</b></summary>
+**Q：多实例下文件传到一半卡住？**
+房间文件分片不跨实例转发，需要在负载均衡上按房间码做会话亲和。详见[多实例部署](#多实例部署)。
 
-分别构建 `FileCodeBoxFronted`（`npm run build`）后将 `dist/*` 复制到后端 `frontend_dist/` 覆盖即可；后端启动时优先读取 `frontend_dist/index.html` 与 `/assets`。
-</details>
+**Q：秒传为什么没生效？**
+文件哈希一律由服务端落盘时流式计算，不采信客户端声明值（防缓存投毒）。相同内容才会命中秒传/去重。
 
-<details>
-<summary><b>如何备份数据？</b></summary>
-
-备份 `data` 目录即可，其中包含数据库和上传的文件。
-
-需要注意三点：
-
-1. **必须在服务停止或刚做过 checkpoint 后备份**。数据库使用 SQLite WAL 模式，
-   近期写入可能还在 `data/filecodebox.db-wal` 里没写回主库，只拷 `.db` 文件会丢数据。
-   直接备份整个 `data` 目录（`*.db` + `*.db-wal` + `*.db-shm`）是安全的；
-   服务运行时每小时会自动执行一次 `wal_checkpoint(TRUNCATE)`，checkpoint 之后
-   `-wal` 会被截断，此时单独拷 `.db` 也完整。
-2. **`data/.room_cache_download_secret` 必须一起备份**。它是房间文件下载链接的
-   签名密钥，首次启动时随机生成；丢失或删除会让**已下发的所有下载链接失效**
-   （已有文件不受影响，重新取链接即可）。
-3. 若配置了外部存储（S3 / WebDAV / OneDrive 等），上传的文件不在 `data` 目录里，
-   需按对应存储另行备份。
-</details>
-
-<details>
-<summary><b>如何修改管理员口令？</b></summary>
-
-登录管理后台后，在系统配置中修改 `admin_token`（留空表示不修改，界面显示脱敏）。新口令会自动以 PBKDF2 哈希存储。
-</details>
-
-<details>
-<summary><b>部署在反向代理后 IP 限流失效怎么办？</b></summary>
-
-确保反向代理透传 `X-Forwarded-For` 头，并将代理地址加入容器启动白名单（`--forwarded-allow-ips`）及后台 `trustedProxies` 配置。
-</details>
-
-<details>
-<summary><b>直连快传无法建立 P2P 连接？</b></summary>
-
-对称 NAT 下 P2P 无法直连，会自动回退到服务器中转（不落盘）。可配置 TURN 服务器（`directTurnServers`）提升直连成功率。
-</details>
-
-<details>
-<summary><b>多摄像头共享/中转传文件很慢或失败？</b></summary>
-
-服务器中转时可调整 `directRelayChunkSize`（分片大小，默认 64KB）与 `directRelaySpeedLimit`（限速）；单次中转文件过大可调 `directMaxRelaySize`（默认不限制）。多摄像头共享同时开流数量受浏览器/设备能力限制，桌面端最多同时共享 4 路。
-</details>
-
-<details>
-<summary><b>如何接入病毒扫描？</b></summary>
-
-本项目的定位是自建轻量分享，**不内置扫描引擎**，但留了钩子：上传落盘后回调外部扫描服务，命中则拒绝并删除文件。默认关闭，未配置时零开销。
-
-在后台「系统配置」中设置：
-
-| 配置项 | 说明 |
-|---|---|
-| `virusScanEnabled` | 是否启用（默认关闭） |
-| `virusScanHook` | 扫描钩子，见下方两种形态 |
-| `virusScanTimeoutSec` | 单次扫描超时，默认 30 秒（1~300） |
-| `virusScanFailOpen` | 扫描服务不可用时的策略，默认 `true` 放行并告警 |
-
-钩子的两种形态：
-
-- **本地命令**（沿用 clamscan 约定：返回码 0 = 干净，1 = 感染）
-  ```
-  clamscan --no-summary {file}
-  ```
-  `{file}` 会被替换成待扫描文件路径。命令**不经 shell**执行，文件名不会被当作命令行解析。
-- **HTTP 接口**
-  ```
-  https://scan.example.com/check
-  ```
-  以 multipart 上传文件（字段名 `file`），约定返回 `{"infected": false, "reason": ""}`。
-
-关于 `virusScanFailOpen`：扫描是辅助能力，默认在扫描器挂掉/超时时**放行并记告警**，避免扫描服务故障导致整个上传功能不可用。若你的场景安全优先于可用性，把它设为 `false`，此时扫描没得出结论会直接拒绝上传。
-
-注意：外部存储（S3 / WebDAV / OneDrive）下拿不到本地文件路径，扫描会自动跳过。
-</details>
+**Q：数据存在哪里？**
+默认 `data/` 目录（Docker 部署时映射到 `/app/data`）。切换 S3/WebDAV 后在后台配置对应凭据。
 
 ---
 
-## 📜 免责声明
+## 免责声明
 
-本项目开源仅供学习交流使用，不得用于任何违法用途，否则后果自负，与作者无关。使用本项目时请保留项目地址和版权信息。
+本项目仅供合法合规的文件分享使用。使用者应遵守所在地区法律法规，不得用于传播违法、侵权内容。作者不对使用者的行为及由此产生的后果承担责任。
+
+部署到公网时请务必：修改默认管理员口令、配置 `JWT_SECRET` 与 `ENCRYPTION_KEY`、启用 HTTPS、按需配置文件类型白名单与病毒扫描。
 
 ---
 
 <div align="center">
 
-**如果觉得项目不错，欢迎 ⭐ Star 支持！**
-
-Made with ❤️ by [onlypeng](https://github.com/onlypeng)
+基于 [vastsa/FileCodeBox](https://github.com/vastsa/FileCodeBox) · License: LGPL-3.0 · 详见 [LICENSE](./LICENSE)
 
 </div>

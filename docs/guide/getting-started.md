@@ -36,7 +36,7 @@ services:
     ports:
       - "12345:12345"
     environment:
-      - WORKERS=4
+      - WORKERS=1
       - LOG_LEVEL=info
 volumes:
   fcb-data:
@@ -47,10 +47,20 @@ volumes:
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `HOST` | `::` | 监听地址，支持 IPv4/IPv6 双栈 |
-| `PORT` | `12345` | 服务端口 |
-| `WORKERS` | `4` | 工作进程数，建议设置为 CPU 核心数 |
+| `HOST` | `0.0.0.0` | 监听地址（仅 Docker 镜像 CMD 生效） |
+| `PORT` | `12345` | 服务端口（仅 Docker 镜像 CMD 生效） |
+| `WORKERS` | `1` | 工作进程数。**默认请保持 1**；调大前必须满足多实例的两个前置条件 |
 | `LOG_LEVEL` | `info` | 日志级别：debug/info/warning/error |
+| `JWT_SECRET` | 空 | JWT 签名密钥；留空时从管理员口令派生 |
+| `ENCRYPTION_KEY` | 空 | 敏感配置加密密钥；留空时从管理员口令派生 |
+| `REDIS_URL` | 空 | 多实例协调的 Redis 连接串；留空 = 单实例 |
+
+::: warning 多实例前置条件
+`WORKERS > 1` 必须**同时**满足：数据库改为 `postgres`/`mysql`（SQLite 单写者），
+且配置 `REDIS_URL`（房间状态与配额锁需跨进程共享）。条件不齐时启动会打 ERROR，
+且房间消息会出现"只有一半人收到"这类极难排查的现象。
+二进制文件分片不跨实例转发，负载均衡需按房间码做会话亲和。详见[主 README](https://github.com/onlypeng/FileCodeBox)。
+:::
 
 #### 自定义配置示例
 
@@ -58,7 +68,7 @@ volumes:
 docker run -d --restart=always \
   -p 12345:12345 \
   -v /opt/FileCodeBox/:/app/data \
-  -e WORKERS=8 \
+  -e WORKERS=1 \
   -e LOG_LEVEL=warning \
   --name filecodebox \
   lanol/filecodebox:latest

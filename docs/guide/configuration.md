@@ -24,7 +24,7 @@ FileCodeBox 支持两种配置方式：
 | `keywords` | string | `FileCodeBox, 驿码...` | 站点关键词，用于 SEO |
 | `serverHost` | string | `0.0.0.0` | 服务监听地址 |
 | `serverPort` | int | `12345` | 服务监听端口 |
-| `serverWorkers` | int | `1` | 工作进程数（建议设为 CPU 核心数） |
+| `serverWorkers` | int | `1` | 工作进程数。**默认保持 1**；多进程需同时满足 `postgres`/`mysql` 数据库与 `redisUrl`，详见主 README 的多实例章节 |
 
 ### 通知设置
 
