@@ -1,3 +1,9 @@
+"""Migration 028：room_message 增加内容哈希字段并建立索引，支撑房间消息去重。
+
+迁移由 core/database.py 顺序执行，**函数名必须是 migrate()**；
+写成 upgrade() 会被静默跳过（runner 只认 migrate 属性），直到运行时报 no such column 才暴露。
+迁移必须幂等：已存在列/表时安全跳过，因为每次启动都会重新扫描。
+"""
 from tortoise import connections
 from core.db_compat import column_exists, index_exists
 from core.logger import logger

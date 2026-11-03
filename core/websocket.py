@@ -1,7 +1,42 @@
-# @Time    : 2024/01/01
-# @Author  : FileCodeBox
-# @File    : websocket.py
-# @Software: PyCharm
+"""房间 WebSocket 连接管理：成员、在线判定、文本广播、文件中继路由。
+
+## 问题
+
+直连快传需要四类能力，全部依赖"谁在这个房间里"这份状态：
+
+1. 成员上下线与人数统计（前端要显示"房间里 3 个人"）
+2. 文本/Chat/打字状态/房间事件的广播
+3. WebRTC 信令与文件的**定向**投递（按 client_id 路由，不是广播）
+4. 房间缓存的 HTTP 接口鉴权（"你是本房间成员"要有凭据）
+
+最早这些状态散落在路由函数里的一个全局 dict 上，于是出现两个真问题：
+- client_id 由客户端自报 → 任何人都能伪造成别人去接收定向文件
+- 状态在进程内存里 → 多 worker 时消息只有一半人收到（且极难排查）
+
+## 方案
+
+- **client_id 服务端签发**：首帧 join 时 uuid4 下发，客户端不得自报；断线重连
+  想复用身份，需在 join 时带上次的 id，由服务端确认房间内无冲突才允许沿用。
+  由于路由一律按 client_id 转发，伪造他人身份变得不可行。
+- **本地连接与远端镜像分表**：`active_connections` 只放**本进程真实连接**，
+  其它实例的成员镜像放在 `_remote`，对外一律通过方法合并返回。
+  合二为一是诱人的简化，但远端成员没有可用的 ws，一旦被 send/close 循环读到
+  就是 None 崩溃，或是被 disconnect 误删。
+- **集群事件收敛为** join / leave / hb / bye / text / kick 六类，语义尽量简单：
+  前四类维护成员表（hb 是覆盖式全量快照，用来自愈丢包的增量事件），
+  text 投递文本信令，kick 关闭连接。传输由 core.cluster 负责；未配 Redis 时
+  全部本地 no-op，行为与单实例逐字节等价。
+
+## 刻意不做
+
+- **二进制文件中继不跨实例转发**。单帧上限 256KB，走 pub/sub 要把吞吐放大 1.4
+  倍（base64）且延迟不可控；正确做法是接入层按房间做会话亲和。发送方会拿到
+  明确的"接收方不在本实例"提示，而不是"传到一半没了"。
+- **不接受"客户端自报 client_id"的降级模式**。
+  `is_member_online()` 之所以能作为房间 HTTP 接口的鉴权凭据，前提是"这个 id
+  是服务端签发的、且此刻正连着本房间"。放开自报等于同时拆掉中鉴定向投递与
+  接口鉴权两件事的安全性，收益却只是省掉一次 join 握手。
+"""
 import asyncio
 import json
 import time
@@ -72,6 +107,11 @@ class ConnectionManager:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def stop(self) -> None:
+        """停掉心跳；幂等，可重复调用。
+
+        刻意不在 asyncio.CancelledError 时重启 task：stop 意味着进程在关，
+        继续发布快照只会让别的实例多看一轮无用的成员表。
+        """
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             try:
@@ -83,7 +123,12 @@ class ConnectionManager:
     # ==================== 连接管理 ====================
 
     async def connect(self, code: str, websocket: WebSocket, nickname: str = "", client_id: str = ""):
-        """接受连接并加入房间；client_id 为空则由服务端签发"""
+        """接受连接并加入房间，返回最终生效的 client_id。
+
+        入参 client_id 是**申请**而非断言：房间内已有在线连接占用时会被忽略，
+        重新签发。昵称此时通常还未知（前端在 welcome 之后才上报），
+        后续的 `refresh_presence` 负责把它同步出去。
+        """
         await websocket.accept()
         if not client_id or not self._is_client_id_available(code, client_id):
             client_id = self._issue_client_id()
@@ -148,7 +193,13 @@ class ConnectionManager:
         return uuid.uuid4().hex[:16]
 
     async def disconnect(self, code: str, websocket: WebSocket):
-        """断开连接并离开房间，返回断开连接的昵称"""
+        """移除连接并回收其路由状态，返回该连接的昵称（可能为空字符串）。
+
+        副作用不止于本房间：`file_targets` 是跨房间按 client_id 索引的，
+        这里会把该 client_id 作为"发送方"和"接收方"的角色一并清掉。
+        刻意不加 `code` 过滤 —— client_id 是全局唯一的，若只清本房间，
+        跨房间重连时会留下指向已失效连接的陈旧目标，表现为"文件静默发不出去"。
+        """
         nickname = ""
         client_id = ""
         if code in self.active_connections:
@@ -258,7 +309,11 @@ class ConnectionManager:
     # ==================== 消息投递 ====================
 
     async def broadcast(self, code: str, message: dict):
-        """向房间内所有连接广播消息（本地直投 + 通知其它实例）"""
+        """向房间全员广播（本地直投 + 通知其它实例）。
+
+        投递是"尽力而为"：本实例发送失败的连接会被即时摘掉（不等显式 close），
+        远端实例是否送达无法在本进程观测——这是 pub/sub 的必要代价。
+        """
         await self._deliver_local(code, message)
         if getattr(self.hub, "distributed", False):
             await self.hub.publish({"t": "text", "room": code, "msg": message})
@@ -393,7 +448,11 @@ class ConnectionManager:
             await self.hub.publish({"t": "kick", "room": code, "client_id": client_id, "reason": reason})
 
     async def kick_room(self, code: str, reason: str = "房间已被删除") -> None:
-        """关闭房间内全部连接并清空该房间状态（含其它实例上的）。"""
+        """关闭房间内全部连接并清空本房间的所有状态（含远端镜像）。
+
+        刻意连 `_remote` 一起清：房间已被删除，留下"别处还有成员"的镜像会让
+        room_size 长期虚高，而对方的 leave 事件永远不会来了（房间已不存在）。
+        """
         for conn in list(self.active_connections.get(code, [])):
             try:
                 await conn["ws"].close(code=4001, reason=reason)
@@ -406,7 +465,12 @@ class ConnectionManager:
             await self.hub.publish({"t": "kick", "room": code, "all": True, "reason": reason})
 
     async def sweep_rooms(self):
-        """心跳探测：剔除已断开但尚未清理的连接（防止在线人数虚高）"""
+        """探活清扫：把"操作系统还没报告断开"的死连接摘掉。
+
+        用文本帧 `"ping"` 而不是 ws ping/pong：starlette 的自动 pong 由底层完成，
+        应用层感知不到，我们要探测的是"对端应用层是否还活着"。
+        客户端遇到非 JSON 文本会忽略，因此不需要额外的协议约定。
+        """
         for code, conns in list(self.active_connections.items()):
             stale = []
             for conn in list(conns):
@@ -440,6 +504,11 @@ class ConnectionManager:
         await self.hub.publish({"t": "hb", "rooms": snapshot})
 
     def _prune_dead_instances(self) -> None:
+        """摘掉心跳超时（`INSTANCE_TIMEOUT`）的远端实例成员。
+
+        只按"最近一次见到该实例的时间"整体摘除，而不是逐个成员按 TTL 过期：
+        后者需要给每个成员单独维护时间戳，且实例正常但成员短暂断线时会被误删。
+        """
         now = time.monotonic()
         dead = {inst for inst, ts in self._inst_seen.items() if now - ts > INSTANCE_TIMEOUT}
         for inst in dead:
@@ -456,6 +525,13 @@ class ConnectionManager:
                 self._remote.pop(code, None)
 
     async def _on_cluster_event(self, event: dict) -> None:
+        """处理来自其它实例的事件。
+
+        这里假设事件已是"别人的"（发送方与这里的过滤由 core.cluster 完成：
+        自己发的消息不会回环），因此不做 origin == self 的二次判断。
+        事件字段一律按"可能畸形"处理（缺字段/类型不对就跳过），因为通道上
+        可能混入其它版本实例或非本系统的消息。
+        """
         kind = event.get("t")
         origin = str(event.get("origin") or "")
         room = event.get("room") or ""

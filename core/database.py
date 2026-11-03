@@ -1,3 +1,36 @@
+"""数据库初始化：连接配置生成 + 自建迁移执行。
+
+## 问题
+
+项目用 Tortoise ORM，但它的 `generate_schemas` 只会按 model 建表，**不会加列**。
+而本项目要给已上线的数据加字段（例如给 room 表加容量开关），升级后旧实例启动时
+表结构仍是旧的，查询直接报错。同时多进程部署下多个 worker 会同时跑到初始化，
+建表/加列会互相踩。
+
+此外 SQLite 是多写者不安全的单文件库，多个 worker 同时执行"建表 + 加列"会互相
+踩踏，因此需要一个**跨进程**的文件锁把这段结构变更串行化。
+
+## 方案
+
+- 连接配置集中在 `get_db_config()`：一行 `dbType` 决定 sqlite / postgres / mysql，
+  业务代码不许再写方言假设（详见 core/db_compat.py）。
+- 自建迁移：约定 `apps/**/migrations/migrations_*.py` 提供 `async def migrate()`，
+  按**文件名字典序**执行，已执行的文件名记进 `migrates` 表做幂等，
+  因此每个迁移文件必须自己写"列不存在才加"（用 `core.db_compat.column_exists`）。
+- 启动锁 `db_startup_lock()`：把"建 migrates 表 + 跑迁移"这段跨进程串行化，
+  Windows 用 msvcrt、POSIX 用 flock 各写一套，`asyncio.to_thread` 包起来避免
+  阻塞事件循环。锁是**咨询锁**：靠所有实例都遵守这个约定生效。
+
+## 刻意不做
+
+不引入 Aerich（Tortoise 官方迁移工具）。它需要在仓库里维护迁移快照并与 Tortoise
+版本绑定，而这个项目的表结构变更频率低、且全部是"幂等加列/建索引"这类安全变更；
+引入迁移工具带来的版本号耦合与额外命令，代价大于收益。
+
+同样，不把这个锁做成跨主机分布式锁：它只解决"单机多 worker 共用同一份 data 目录"
+场景；跨主机应当用 postgres / mysql 并把结构变更放到发布流程里，而不是让每个
+实例各自跑迁移互相竞争。
+"""
 import asyncio
 import glob
 import importlib
@@ -70,6 +103,11 @@ def get_db_config() -> dict:
 
 
 def _lock_file(file_obj: IO[str]) -> None:
+    """申请排他文件锁（同步，调用方在线程里跑）。
+
+    两套实现并存是必需的：Windows 没有 fcntl，而 msvcrt.LK_LOCK 是阻塞式的，
+    进程崩退时由 OS 自动释放（这正是我们要的 —— 死锁不该让下次启动永远起不来）。
+    """
     if os.name == "nt":
         import msvcrt
 
@@ -97,6 +135,12 @@ def _unlock_file(file_obj: IO[str]) -> None:
 
 @asynccontextmanager
 async def db_startup_lock():
+    """串行化"启动期结构变更"的咨询锁。
+
+    用 "a+" 打开：只追加不清空，避免两个实例同时启动时互相把对方的锁文件截断。
+    进程退出或崩溃时 OS 自动释放，不需要清理逻辑。
+    注意它保护的是**本机**上的多 worker（同一份 data 目录），不是跨主机。
+    """
     os.makedirs(data_root, exist_ok=True)
     lock_file = open(_STARTUP_LOCK_FILE, "a+", encoding="utf-8")
     try:
@@ -108,6 +152,11 @@ async def db_startup_lock():
 
 
 async def init_db():
+    """初始化连接与表结构，允许多次调用（靠 `Tortoise._inited` 短路）。
+
+    副作用：建 `migrates` 表并执行迁移。失败原样向上抛 —— 结构不对继续跑只会
+    在查询时才报更费解的错，宁可启动失败。
+    """
     try:
         db_config = get_db_config()
 
@@ -133,7 +182,16 @@ async def init_db():
 
 
 async def execute_migrations():
-    """执行数据库迁移"""
+    """按文件名字典序执行 `apps/**/migrations/migrations_*.py`。
+
+    约定（调用方与迁移作者都须知悉）：
+    - 已执行过的文件名记录在 `migrates` 表，**再次启动不会再跑**；
+      迁移文件上线后被修改，对旧实例无效，必须新建一个顺序更大的文件。
+    - 迁移实现必须是幂等的（先判 `column_exists` / `table_exists`），
+      因为"记录文件"与"执行完成"之间有窗口：执行成功但记账失败时会重试。
+    - 任一迁移失败即中止并向上抛，后续迁移不会执行 —— 迁移之间有依赖时
+      顺序必须是显式的（靠文件名的字典序前缀，如 migrations_001_...）。
+    """
     try:
         # 收集迁移文件
         migration_files = []

@@ -1,3 +1,9 @@
+"""Migration 031：建立 audit_log 表与索引，管理后台关键操作可追溯。
+
+迁移由 core/database.py 顺序执行，**函数名必须是 migrate()**；
+写成 upgrade() 会被静默跳过（runner 只认 migrate 属性），直到运行时报 no such column 才暴露。
+迁移必须幂等：已存在列/表时安全跳过，因为每次启动都会重新扫描。
+"""
 from tortoise import connections
 from core.db_compat import db_type
 from core.logger import logger

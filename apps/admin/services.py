@@ -1,3 +1,26 @@
+"""后台业务服务层：文件管理与配置读写。
+
+## 问题
+后台视图要同时处理"删记录"和"删文件"，而这两者**不是一回事**：
+秒传/去重会让多条 FileCodes 指向同一份物理文件，直接删文件会让别的取件码
+变成死链（表现为下载 404，且极难归因）。配置侧同理：管理员在表单里看到的
+敏感字段是 `******`，原样保存就会把星号写进数据库、把真凭据冲掉。
+
+## 方案
+- 删除前一律先查引用（`core.file_dedup.is_file_referenced_elsewhere`），
+  仍被引用的只删记录不删文件。
+- 配置更新把"脱敏占位符"识别为一等公民：`******` 或空串表示**不修改**，
+  从库里继承原值；真实值才走加密。
+
+## 刻意不做
+**不在服务层做权限判断**。调用方（后台路由）已由 router 级 `admin_required`
+统一鉴权，服务层重复校验会让"服务被其它入口复用时"产生虚假的安全感——
+真正的边界在路由依赖上。
+
+## 前提
+`KeyValue(key="settings")` 记录由启动流程 `core.config` 用 `get_or_create` 保证存在，
+因此本模块用 `update` 而非 upsert；绕过启动流程直接调用会静默丢配置。
+"""
 from core.storage import FileStorageInterface, storages
 from core.settings import settings
 from core.config import _sync_ip_limits
@@ -10,10 +33,22 @@ from core.utils import hash_password, is_password_hashed
 
 
 class FileService:
+    """文件管理：后台列表与删除。
+
+    实例在构造时绑定当前存储后端，因此**不做单例复用**——管理员切换存储后
+    必须让下一个请求拿到新的后端（见 apps/admin/dependencies.get_file_service）。
+    """
+
     def __init__(self):
         self.file_storage: FileStorageInterface = storages[settings.file_storage]()
 
     async def delete_file(self, file_id: int):
+        """删除一条分享记录；物理文件仅在无其它记录引用时一并删除。
+
+        副作用：写审计日志（`delete`）。日志**先于**记录删除写入，
+        因为 `target_id` 取的是记录上的取件码，删完就拿不到了。
+        目标不存在时抛 404。
+        """
         file_code = await FileCodes.filter(id=file_id).first()
         if not file_code:
             raise HTTPException(status_code=404, detail="文件不存在")
@@ -30,6 +65,15 @@ class FileService:
         await file_code.delete()
 
     async def list_files(self, page: int, size: int, keyword: str = "", status: str = ""):
+        """分页查询分享记录，返回 (记录列表, 总数)。
+
+        边界条件：
+        - **排除收件箱投递件**——它们复用 FileCodes 表但不是"文件分享"，
+          混进列表会让管理员误删后连带清空别人的收件箱。
+        - `status` 允许多选（逗号分隔）。两者都选或不传 = 不过滤；
+          只选一个才加过滤条件。非法取值被静默忽略（不影响分页结果）。
+        - 多文件分享会预取子项（`file_items`），单文件为 `[]`。
+        """
         from core.utils import get_now, pagination
         from tortoise.expressions import Q
 
@@ -92,7 +136,14 @@ class FileService:
 
 
 class ConfigService:
+    """系统配置读写：对外脱敏、对内加密、改完热生效。"""
+
     def get_config(self):
+        """导出完整配置，**敏感字段替换为 `******`**。
+
+        脱敏是"读时"而不是"存时"做的：库里存的是密文，只有这里会在出口处掩盖，
+        因此新增敏感字段只需加入 `SENSITIVE_KEYS`，无需改存储逻辑。
+        """
         from core.utils import SENSITIVE_KEYS
         config = dict(settings.items())
         # 脱敏敏感字段
@@ -102,6 +153,26 @@ class ConfigService:
         return config
 
     async def update_config(self, data: dict):
+        """合并写入配置并热生效。
+
+        前提：`data` 已由 `UpdateConfigRequest` 白名单过滤（见 apps/admin/schemas.py），
+        **本方法不再做白名单判断**，只做二次校验。直接传入任意 dict 会写入非法键。
+
+        处理顺序是有讲究的，不要调换：
+        1. 口令：空/占位符视为"不修改"，明文才哈希（已是哈希值则原样保留，
+           避免把哈希当明文再哈希一次导致永远登不进去）
+        2. 敏感字段：占位符继承库中旧值 → 明文加密存储
+        3. 数值字段：转 int/float，限速与配额类拒绝负数
+        4. 落库 + 同步到运行时 `settings` + 刷新 IP 限流实例
+
+        副作用：写库、改进程内 `settings`（**含解密后的明文凭据**）、
+        调用 `core.config._sync_ip_limits` 就地更新限流阈值。
+        最后一步刻意不重新构造限流实例，避免替换掉被调用方持有的引用。
+
+        安全提示：敏感字段用 Fernet 加密，密钥优先取环境变量 `ENCRYPTION_KEY`；
+        未配置时回退到由 `admin_token` 派生——**改管理员口令会让存量密文解不开**，
+        故生产环境必须先配 `ENCRYPTION_KEY`。
+        """
         from core.utils import hash_password, is_password_hashed, encrypt_value, decrypt_value, is_encrypted, SENSITIVE_KEYS
 
         # 读取现有配置，用于继承"脱敏占位符"对应的真实凭据

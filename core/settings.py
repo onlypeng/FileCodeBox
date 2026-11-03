@@ -1,12 +1,44 @@
-# @Time    : 2023/8/15 09:51
-# @Author  : Lan
-# @File    : settings.py
-# @Software: PyCharm
+"""配置项定义：DEFAULT_CONFIG + Settings 读写壳。
+
+## 问题
+
+本项目的配置项来自两个地方——本文件的 `DEFAULT_CONFIG`（代码默认值）与数据库
+KeyValue 表里 key="settings" 的 JSON（管理员在后台改过的部分）。历史上各处读取
+配置时自己写 `getattr(settings, "x", 某个值)`，兜底值逐渐与实际默认值漂移：
+同一个键在 A 处兜底 10、B 处兜底 20，改了默认值却忘记改兜底，排查时极难发现。
+另外"能不能多 worker""B 上限是否生效"这类问题都取决于某个开关的值，
+哪一处读错都会得出相反结论。
+
+## 方案
+
+- **默认值的唯一来源**：只在本文件登记。`Settings.__getattr__` 先查 user_config、
+  再回落 default_config，因此调用方可以放心写 `settings.xxx` 或
+  `getattr(settings, "xxx", None)`，不必复制一遍默认值。
+- **运行时覆盖不落回默认表**：`__setattr__` 除 default_config/user_config 之外
+  全部写进 user_config，`DEFAULT_CONFIG` 始终保持为"出厂值"，便于 diff 出厂默认值。
+- **新增配置项必须先登记到这里**：`apps/admin/services.py:update_config` 会把
+  不在 `settings.default_config` 里的键静默丢弃（不是报错），没登记的配置项
+  表现为"后台保存成功但完全没生效"。
+- **单位写在注释里**：MB / KB / 秒 / `0 = 不限制` 这类约定在这里定死，
+  调用方的 0 判断要与之对齐（例如 `roomCacheMaxSize=0` 表示不限制而非禁止上传）。
+
+## 刻意不做
+
+不做类型声明与校验（不用 pydantic BaseSettings）。配置项是通过后台表单写到
+KeyValue 的 JSON，库中既有 1/0 也有 True/False、`admin.schemas` 全是 Optional，
+若在此处加 schema 校验，历史数据会在读取期直接崩。类型容错放在读取点
+（`int(getattr(...))` + try / getattr 兜底），代价是重复，收益是升级不会炸。
+
+同理，这里也不做"配置项变更通知"：开关类配置（如 `redisUrl`）需要重启才生效，
+写进 `docs/` 与后台提示，而不是在这里引入订阅机制。
+"""
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 data_root = BASE_DIR / "data"
 
+# 导入期就建目录（本模块有副作用）：数据库文件、房间缓存根目录、签名密钥持久化文件
+# 都挂在它下面，等到首次写文件再 mkdir 会让这些路径在冷启动时随机失败。
 if not data_root.exists():
     data_root.mkdir(parents=True, exist_ok=True)
 
@@ -166,11 +198,22 @@ DEFAULT_CONFIG = {
 
 
 class Settings:
+    """配置读写壳：user_config（数据库）覆盖 default_config（代码默认值）。
+
+    刻意让未知属性抛 AttributeError 而不是返回 None：配置键拼错时，读到 None 往往
+    表现为"功能静默失效"（例如配额变 0、开关变关），比直接崩更难排查。
+    """
+
     def __init__(self, defaults=None):
         self.default_config = defaults or {}
         self.user_config = {}
 
     def __getattr__(self, attr):
+        """仅在常规属性查找失败时被调用（Python 协议），故这里查的是两张配置表。
+
+        注意 default_config/user_config 自身已在 __setattr__ 里落到实例字典，
+        不会走到这里；若未先实例化就会递归，构造顺序不能改。
+        """
         if attr in self.user_config:
             return self.user_config[attr]
         if attr in self.default_config:
@@ -180,12 +223,22 @@ class Settings:
         )
 
     def __setattr__(self, key, value):
+        """写配置一律进 user_config，default_config 永不被改写。
+
+        因此直接赋值可以写入 DEFAULT_CONFIG 中不存在的键（后续也能读到）。
+        后台写入侧另有白名单过滤（见 apps/admin/services.py:update_config），
+        这里不做校验，保留"代码路径可直接设置运行时值"的能力。
+        """
         if key in ["default_config", "user_config"]:
             super().__setattr__(key, value)
         else:
             self.user_config[key] = value
 
     def items(self):
+        """返回合并后的 dict_items（user 覆盖 default）。
+
+        是**快照**而非视图：修改返回值不会影响 settings，也不会回写数据库。
+        """
         return {**self.default_config, **self.user_config}.items()
 
 

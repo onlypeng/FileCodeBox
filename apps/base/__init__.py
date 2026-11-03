@@ -1,4 +1,1 @@
-# @Time    : 2023/8/13 20:43
-# @Author  : Lan
-# @File    : __init__.py.py
-# @Software: PyCharm
+"""面向匿名用户的业务域：分享、取件、收件箱、房间与直连快传。"""

@@ -1,7 +1,45 @@
-# @Time    : 2023/8/11 20:06
-# @Author  : Lan
-# @File    : storage.py
-# @Software: PyCharm
+"""可插拔存储层：本地 / S3 / OneDrive / OpenDAL / WebDAV 的统一门面。
+
+## 问题
+
+自建文件分享最常见的运维诉求是"我不想把文件放在本机磁盘上"。但这几种后端的
+接口差异极大：本地是文件路径、S3 是 bucket + key + 预签名、OneDrive 是 Graph
+SDK（同步调用）、WebDAV 是 HTTP 动词（PUT / MKCOL / PROPFIND）。把这些差异散进
+路由层的结果是——每支持一个新后端要改十几个上传/下载入口，任何一处漏改都表现为
+"某条路径下文件莫名消失"，且很难定位。
+
+## 方案
+
+一个接口 `FileStorageInterface` + `storages` 注册表。业务层只持有
+`storages[settings.file_storage]()`，不感知后端类型。设计约束：
+
+- **路径是后端语义的、相对 root 的字符串**：本地是相对 data_root 的相对路径，
+  S3 / WebDAV 是对象 key。调用方不要拼绝对路径，否则换了后端全部失效。
+- **分片上传三件套**（save_chunk / merge_chunks / clean_chunks）必须成套实现：
+  它们之间有"先写临时或 .part 文件、再原子改名"的隐含契约，缺一个就会出现
+  "上传成功但文件没有合并出来"。
+- **每个后端自己决定怎么流式化**：能流式就流式（本地下载直接交 FileResponse、
+  S3/WebDAV 合并走生成器）；凡是写成"先落地临时文件、再整体读出"的
+  （OpenDAL / WebDAV / OneDrive 合并）都是因为该后端没有可用的流式接口，
+  用临时文件换取"不全量驻留内存"。
+- **`get_file_response` 优先给直链、不能直链才代理**：能直链的给预签名 URL，
+  不能的由本服务代理流式转发，并尽力补 `Content-Length`——缺了它，浏览器下载
+  看不到进度条，CDN 也无法做范围缓存。
+
+## 刻意不做
+
+- **不把它做成严格的抽象基类**（没有 ABC / abstractmethod）。方法抛
+  NotImplementedError 表示"该后端不支持这个能力"，调用方应当自行降级到别的路径
+  （例如 `generate_presigned_upload_url` 默认返回 None，调用方据此退化为代理上传）。
+  改用 ABC 会把"部分实现"变成不可启动的结构性错误，代价大于收益。
+- **不在这一层做删除保护**。`delete_file` 不判断"是否还有别的记录引用这份物理
+  文件"：秒传会让多条 FileCodes 共享同一份文件，而这份判断依赖 models，
+  放在这里会形成循环依赖。引用检查统一放在 `core/file_dedup.py`，由清理任务
+  显式调用（见 `core/tasks.py` 对应注释）。
+- **不管磁盘配额**：那是 `core/quota.py` 的职责，这里只管"怎么存"。
+- **不缓存 storage 实例**：每次调用现场构造。构造成本很低（本地/S3 只是读几个
+  配置项），而长期持有会让"用户改了存储配置却不重启"变成半生效的诡异状态。
+"""
 import hashlib
 import os
 import tempfile
@@ -28,6 +66,15 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 
 class FileStorageInterface:
+    """存储后端契约。
+
+    不是抽象基类：这里的方法可以只实现一部分。抛 NotImplementedError 表示该后端
+    不支持这个能力，调用方负责降级（详见模块头的"刻意不做"）。
+
+    所有 `save_path` 都是**相对各自 root 的路径字符串**：
+    本地相对 `data_root`，对象存储即对象 key。传绝对路径在多数后端上会静默变成
+    奇怪的顶层目录，务必不要那么写。
+    """
 
     async def save_file(self, file: UploadFile, save_path: str):
         """
@@ -39,6 +86,10 @@ class FileStorageInterface:
     async def delete_file(self, file_code: FileCodes):
         """
         删除文件
+
+        无副作用保证：文件不存在时不抛异常（后端各不相同，统一按幂等删除实现），
+        重复删除是安全的。**不检查是否还有别的 FileCodes 引用同一份物理文件**，
+        秒传场景请调用方先用 core.file_dedup 判断。
         """
         raise NotImplementedError
 
@@ -46,44 +97,42 @@ class FileStorageInterface:
         """
         获取文件分享的url
 
-        如果服务不支持直接访问文件，可以通过服务器中转下载。
-        此时，此方法可以调用 utils.py 中的 `get_file_url` 方法，获取服务器中转下载的url
+        约定：返回**可直接被使用的绝对 URL**。若后端给不出公网直链，
+        则退回 core.utils.get_file_url(code) 拿服务端中转地址
+        （带签名、有时效，见 core/utils.py 模块头）。
         """
         raise NotImplementedError
 
     async def get_file_response(self, file_code: FileCodes):
         """
-        获取文件响应
+        获取文件响应（FastAPI Response）
 
-        如果服务不支持直接访问文件，则需要实现该方法，返回文件响应
-        其余情况，可以不实现该方法
+        约定：文件不存在时返回 APIResponse(code=404, detail="文件已过期删除")
+        **而不是抛异常** —— 调用方是 HTTP 路由，过期/删除是常态业务分支。
         """
         raise NotImplementedError
 
     async def save_chunk(self, upload_id: str, chunk_index: int, chunk_data: bytes, chunk_hash: str, save_path: str):
-        """
-        保存分片文件
-        :param upload_id: 上传会话ID
-        :param chunk_index: 分片索引
-        :param chunk_data: 分片数据
-        :param chunk_hash: 分片哈希值
-        :param save_path: 文件保存路径
+        """保存单个分片。
+
+        chunk_hash 是上传方声明的 SHA-256；本方法**不负责校验**（IO 只管落地），
+        真正的校验统一在 merge_chunks 做——那时才能拿到数据库里记录的权威哈希。
         """
         raise NotImplementedError
 
     async def merge_chunks(self, upload_id: str, chunk_info: UploadChunk, save_path: str) -> tuple[str, str]:
-        """
-        合并分片文件并返回文件路径和完整哈希值
-        :param upload_id: 上传会话ID
-        :param chunk_info: 分片信息
-        :param save_path: 文件保存路径
-        :return: (文件路径, 文件哈希值)
+        """合并分片并返回 (落盘路径, 全文件 SHA-256)。
+
+        返回值里的哈希是本 merge 过程中**服务端算出**的权威值，用于秒传去重；
+        任何分片缺失或哈希不符时抛 ValueError（调用方据此返回 400）。
         """
         raise NotImplementedError
 
     async def generate_presigned_upload_url(self, save_path: str, expires_in: int = 900) -> Optional[str]:
         """
-        生成预签名上传URL
+        生成预签名上传 URL（可选能力）：不支持直传的后端返回 None，**由调用方
+        决定是否退化为"经本服务代理上传"**。刻意不抛 NotImplementedError：直传
+        是优化路径，不是契约的一部分。
         :param save_path: 文件保存路径
         :param expires_in: URL过期时间（秒），默认15分钟
         :return: 预签名URL，如果不支持直传则返回None
@@ -100,15 +149,20 @@ class FileStorageInterface:
 
     async def clean_chunks(self, upload_id: str, save_path: str):
         """
-        清理临时分片文件
+        清理临时分片文件（best-effort）
+
+        中途失败只记日志不抛：它的调用方是后台清理任务，
+        一次清理失败不该让整轮清理中止（下次轮询会再试）。
         :param upload_id: 上传会话ID
         :param save_path: 文件保存路径
         """
         raise NotImplementedError
 
     async def get_file_stream(self, save_path: str) -> AsyncGenerator[bytes, None]:
-        """
-        获取文件流（用于ZIP打包等场景）
+        """按块产出文件内容（供 ZIP 打包等"必须顺序读"的场景）。
+
+        文件不存在时抛 FileNotFoundError（与其它方法"返回 404 壳对象"不同，
+        这里没有 HTTP 语义）。块的边界不保证与写入时的分片一致。
         :param save_path: 文件存储路径
         :return: 异步字节流生成器
         """
@@ -116,7 +170,8 @@ class FileStorageInterface:
 
     async def delete_file_by_path(self, storage_path: str, uuid_file_name: str):
         """
-        根据路径删除文件（用于CollectionFile等场景）
+        按物理路径删除（不经 FileCodes），用于没有对应记录的文件（如清理孤儿分片）。
+        同样幂等：不存在不报错。
         :param storage_path: 存储目录路径
         :param uuid_file_name: 文件名
         """
@@ -124,7 +179,10 @@ class FileStorageInterface:
 
     async def get_file_size(self, save_path: str) -> Optional[int]:
         """
-        获取文件大小
+        获取文件大小（字节）；拿不到返回 None。
+
+        刻意不抛异常也不返回 0：0 会被误当成"空文件"，而 None 明确表示"未知"，
+        调用方的配额/进度计算才有机会走另一条分支。
         :param save_path: 文件路径
         :return: 文件大小（字节），不支持则返回None
         """
@@ -141,6 +199,12 @@ def _rmtree_quiet(path) -> str:
 
 
 class SystemFileStorage(FileStorageInterface):
+    """本地磁盘后端（默认）。root 是 `data_root`，一切路径相对它解析。
+
+    同步文件 IO 一律用 `asyncio.to_thread` 包起来：本地后端的 IO 全部阻塞事件
+    循环，本地磁盘恰恰最容易变成"文件多了整体就卡住"的来源。
+    """
+
     def __init__(self):
         self.chunk_size = 256 * 1024
         self.root_path = data_root
@@ -155,7 +219,8 @@ class SystemFileStorage(FileStorageInterface):
     async def save_file(self, file: UploadFile, save_path: str):
         path_obj = Path(save_path)
         directory = str(path_obj.parent)
-        # 提取原始文件名并进行清理
+        # 二次消毒：调用方给的路径只保证"相对 data_root"，文件名仍可能带 "../"
+        # 或 Windows 保留字符（不同后端对这个越界的容忍度不同，这里统一收紧）
         filename = await sanitize_filename(path_obj.name)
         # 构建安全的完整保存路径
         safe_save_path = self.root_path / directory / filename
@@ -166,6 +231,8 @@ class SystemFileStorage(FileStorageInterface):
 
 
     async def delete_file(self, file_code: FileCodes):
+        # 幂等：存在就删、不存在直接返回。清理任务会并发跑同一个文件，
+        # 抛 FileNotFoundError 会让整轮清理把这个文件的记录永远留着
         save_path = self.root_path / await file_code.get_file_path()
         if save_path.exists():
             save_path.unlink()

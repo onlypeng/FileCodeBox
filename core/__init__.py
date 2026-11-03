@@ -1,4 +1,1 @@
-# @Time    : 2023/8/11 20:06
-# @Author  : Lan
-# @File    : __init__.py.py
-# @Software: PyCharm
+"""基础设施层：配置、数据库、存储、集群协调、日志与通用工具。"""

@@ -1,4 +1,1 @@
-# @Time    : 2023/8/14 14:38
-# @Author  : Lan
-# @File    : __init__.py.py
-# @Software: PyCharm
+"""管理后台业务域：鉴权、配置、文件/房间/收件箱管理与审计。"""

@@ -1,7 +1,20 @@
-# @Time    : 2023/8/9 23:23
-# @Author  : Lan
-# @File    : main.py
-# @Software: PyCharm
+"""应用入口：组装 FastAPI、注册路由、驱动启动与关闭生命周期。
+
+## 这里只做编排，不放业务
+路由实现在 apps/base/views.py 与 apps/admin/views.py，配置在 core/settings.py，
+跨进程协调在 core/cluster.py。入口文件只负责把它们按顺序接起来——把业务逻辑
+写进 main.py 会让"改一个上传规则要动入口文件"，是这类项目最常见的腐化路径。
+
+## 生命周期顺序不能随意调整
+先建库并执行迁移（execute_migrations 依赖进程 CWD 能找到 apps/），再加载配置、
+再启动集群协调与后台清理任务、最后才对外服务。反过来会让请求打到尚未就绪的
+连接池，或让后台任务在表还不存在时就开始读写。
+
+## 部署形态
+默认单实例：未配 redisUrl 时 core.cluster 走 LocalHub，行为与单进程等价。
+WORKERS>1 必须同时满足"数据库可并发写"与"集群已启用"两个条件，
+条件不齐时启动打 ERROR——这种配置矛盾表现为"房间消息只有一半人收到"，极难排查。
+"""
 import asyncio
 import html
 import os

@@ -1,7 +1,40 @@
-# @Time    : 2023/8/15 22:00
-# @Author  : Lan
-# @File    : tasks.py
-# @Software: PyCharm
+"""后台周期性任务：过期清理、完成不了的上传回收、缓存/审计回收、WAL checkpoint。
+
+## 问题
+
+本项目的资源几乎都不是"用到立刻释放"的：
+
+- 文件/收件箱/房间过期后还要留一段"过期保存时间"（宽限），到期才能真删；
+  否则用户隔天回来发现东西没了，会认为数据丢失
+- 分片上传中途放弃 → 分片文件与 UploadChunk 记录永远留着
+- SQLite 的 `-wal` 文件在长读事务存在时不回收，"备份 data 目录"拿不到完整数据
+- 房间 WS 连接断开但没清理时，在线人数虚高，房间看起来"一直有人"
+
+这些都需要周期性的兜底，而不能指望请求链路自己收拾干净。
+
+## 方案
+
+统一形态：`while True: try ... except(只记录不抛出) finally: await asyncio.sleep(N)`。
+
+- **异常必须吞掉并记录**：后台任务挂掉不会被任何人发现（没有请求会报错），
+  一个未捕获异常让清盘任务静默死掉，几天后磁盘被写满才暴露。
+- **每轮开头 `refresh_settings()`**：管理员在后台改宽限期/保留期，下一次轮询
+  才生效；不做这一步就会出现"改了配置但永远不生效"的伪故障。
+- 周期长短按"清理迟到多久可接受"而不是 CPU 成本：文件 10 分钟、房间缓存
+  5 分钟、连接清扫 20 秒、审计/checkpoint 1 小时。
+
+## 刻意不做
+
+- **不用 APScheduler / Celery beat**：只有一个进程需要处理的是"定期做一件小事"，
+  引入调度框架要额外管理持久化 job 与进程模型；并且 `finally: sleep` 的写法让
+  "任务之间没有重叠"天然成立——调度器的错过/并发语义反而是多余的心智负担。
+- **不做任务级分布式协调**：多实例部署时每个实例都会跑这些任务。清理类操作是
+  幂等的（删除不存在的记录不报错、删除已删文件同样不报错），重复执行的代价
+  远小于引入选主机制的复杂度。唯一例外是SQLite 单写者部署本身就不允许多实例，
+  见 core/capabilities。
+- **不在删除前做二次确认/回收站**：过期 vs 未过期的判定已在 SQL 层完成，
+  再留一层"逻辑删除"只会让磁盘回收的时间点变得不可预测。
+"""
 import asyncio
 import datetime
 from core.logger import logger
@@ -125,6 +158,17 @@ async def delete_expire_files():
 
 
 async def clean_incomplete_uploads():
+    """清理"上传没走完"的分片会话。
+
+    判定依据：`UploadChunk` 里 chunk_index=-1 的那条是会话哨兵记录，
+    它的 created_at 超过 `chunk_expire_hours`（默认 24h）即认为用户放弃了。
+    注意 `chunk_expire_hours` 未在 core/settings.py 的 DEFAULT_CONFIG 登记，
+    后台因此既不能展示也不能保存它（apps/admin 侧只落库已登记的配置键），
+    当前实际恒为 24 小时。要把它变成可配，得先在 DEFAULT_CONFIG 补一行。
+
+    顺序是先删存储实体、再删库记录：反过来的话一旦删库后清理存储失败，
+    分片文件就成了没人回收的孤儿。
+    """
     while True:
         try:
             await refresh_settings()
@@ -166,7 +210,13 @@ async def clean_incomplete_uploads():
 # ============ 收件箱事件定义 ============
 
 class CollectionEvents:
-    """收件箱事件处理器"""
+    """收件箱事件总线（进程内、内存态）。
+
+    handler 表是类属性：注册即全局生效，且**不做去重**——同一 handler 重复注册
+    会执行多次（默认 handler 在模块导入时注册，模块被重复导入时会叠加）。
+    刻意不引入第三方事件库：这里只有三个"写日志"的默认消费者，
+    引入框架带来的注册/生命周期管理成本大于收益。
+    """
     _handlers = {}
 
     @classmethod
@@ -178,7 +228,12 @@ class CollectionEvents:
 
     @classmethod
     async def emit(cls, event_name: str, data: dict):
-        """触发事件"""
+        """按注册顺序**串行**触发 handler。
+
+        单个 handler 抛异常只被记录、不影响后续 handler 执行：事件是旁路通知，
+        一个消费者写日志失败不该让"文件已投递"这件事对其它消费者消失。
+        返回值始终为 None —— 事件没有"被接住才有意义"的语义。
+        """
         handlers = cls._handlers.get(event_name, [])
         for handler in handlers:
             try:
@@ -190,7 +245,7 @@ class CollectionEvents:
         logger.info(f"[Event] {event_name}: {data}")
 
 
-# 注册默认事件处理器
+# 注册默认事件处理器（模块导入时执行，故 import 本模块即有副作用）
 async def _log_collection_created(data: dict):
     logger.info(f"收件箱已创建: collection_code={data.get('collection_code')}, delivery_code={data.get('delivery_code')}")
 
@@ -248,7 +303,12 @@ async def clean_expired_collections():
 
 
 async def _delete_collection_with_files(box) -> None:
-    """删除收件箱及其全部文件（文件实体 + 关联记录）"""
+    """连带删除某个收件箱的文件实体、关联文件记录与收件箱本身。
+
+    不做整体事务：-file 的 storage 操作（S3/OneDrive/WebDAV 的网络调用）无法和
+    ORM 处在同一事务里。因此顺序是"先删文件实体 → 再删 FileCodes → 最后删箱子"，
+    中途失败会留下孤儿记录但不会留下"看得见却下载不了"的幽灵文件。
+    """
     from core.storage import FileStorageInterface, storages
     file_storage: FileStorageInterface = storages[settings.file_storage]()
     collection_files = await CollectionFile.filter(collection=box).all()

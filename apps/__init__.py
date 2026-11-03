@@ -1,4 +1,1 @@
-# @Time    : 2023/8/13 20:43
-# @Author  : Lan
-# @File    : __init__.py.py
-# @Software: PyCharm
+"""应用层：按业务域拆分的路由集合。"""

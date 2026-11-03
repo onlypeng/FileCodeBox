@@ -1,3 +1,43 @@
+"""对外 HTTP / WebSocket 端点集合：分享取件、多文件、分片与预签名上传、收件箱、实时房间。
+
+## 问题
+
+形态是"一人上传、另一人凭码取走"，**没有账号体系**。所以这里的每个接口都必须靠
+"码 + 令牌"自证身份，而不是靠 session：取件码、owner_token、取件 select token、
+收件箱三码、房间成员令牌各管一段。这个约束决定了本文件的组织方式——它不是按资源
+建模的 CRUD，而是按"谁能凭什么调用"分组。
+
+文件大小也是历史包袱：端点按 文件柜 → 分片上传 → 预签名 → 收件箱 → 直连快传 →
+三合一房间 的顺序逐轮叠加，每轮都新增一组路由而不动旧路由，于是本文件成了全项目
+最大的模块。
+
+## 方案
+
+按凭证模型划分路由组，各组自成一段（见文件内各 `APIRouter`）：
+
+- `/share`：分享与取件。上传类走 `share_required_login`（`openUpload=1` 时游客可传，
+  否则要管理员 JWT）；取件只认取件码；提前作废只认上传时下发的 `owner_token`，
+  仅知道取件码的人无法撤销。
+- `/chunk`、`/presign`：同一件事的两条上传路径（服务端收分片 / 存储后端直传），
+  差别只在"文件何时落盘"，完成态都归一到 FileCodes。
+- `/collection`、`/delivery`：收件箱。一箱三码（管理码 / 投件码 / 取件码）各管一个
+  视角，响应按视角裁剪字段，**绝不回传另外两码**。
+- `/room` 与 `/ws/room`：实时房间（聊天 / 文件 / P2P 媒体已合并）。写接口要求
+  "当前在线 **或** 持有成员令牌"，令牌由 WS join 时服务端签发。
+- 末尾兼容段：旧 `/transfer/*`、`/direct/*` 入口保留，内部统一落到 Room 表。
+
+## 刻意不做的事
+
+- **不按技术分层拆成多个文件**：分组依据是凭证模型，拆开后"改一条鉴权语义要跨文件
+  找调用方"比维护一个大文件更容易出错。当前折中为按 `APIRouter` 分段。
+- **不采信客户端声明的哈希**：哈希一律由服务端落盘 / 合并时流式算出（见
+  `_sha256_saved_file`），客户端只拿它做完整性校验，防止缓存投毒。
+- **删除点不直接删物理文件**：秒传 / 去重会让多条记录共享同一份文件，任何删除点
+  都先查引用（见 `core/file_dedup`）。
+- **审计失败不影响主流程**：统一走 `core/audit.record()`，它吞异常。
+- 二进制分片中继**刻意不跨实例**（见 `core/cluster`），跨实例时给发送方明确报错，
+  而不是让文件静默传到一半。
+"""
 import asyncio
 import datetime
 import hashlib
@@ -91,13 +131,22 @@ share_api = APIRouter(prefix="/share", tags=["分享"])
 
 # ============ 公共服务层 ============
 class FileUploadService:
-    """统一的文件上传服务"""
+    """预签名上传复用的两个静态步骤：路径生成与记录落库。
+
+    预签名有 proxy / direct 两条收尾路径，过期换算与字段填充若各写一份，
+    两条路径迟早漂移（一边改了过期规则另一边没跟上）。这里把它们收口成同一处。
+    """
 
     @staticmethod
     async def generate_file_path(
         file_name: str, upload_id: Optional[str] = None
     ) -> tuple[str, str, str, str, str]:
-        """统一的路径生成"""
+        """返回 (path, suffix, prefix, filename, save_path)。
+
+        文件名先过 sanitize_filename 再去拼路径：文件名完全由客户端控制，
+        不清洗就会被 `../` 写成路径穿越。
+        每个 upload_id 一个独立目录，避免同名文件互相覆盖（秒传复用除外）。
+        """
         today = datetime.datetime.now()
         storage_path = settings.storage_path.strip("/")
         file_uuid = upload_id or uuid.uuid4().hex
@@ -117,7 +166,11 @@ class FileUploadService:
         expire_style: str,
         **extra_fields,
     ) -> str:
-        """统一创建FileCodes记录，返回code"""
+        """建 FileCodes 记录并返回取件码（码由 get_expire_info 统一生成，不自造）。
+
+        调用方负责通过 extra_fields 补齐自己那条路径的字段（remark、access_code_hash、
+        owner_token 等）——本函数不替调用方决定它们的取值。
+        """
         expired_at, expired_count, used_count, code = await get_expire_info(
             expire_value, expire_style
         )
@@ -141,6 +194,11 @@ class FileUploadService:
 
 
 async def validate_file_size(file: UploadFile, max_size: int) -> int:
+    """返回实际字节数；超限时抛 403（在落盘之前拦下）。
+
+    大小不取自请求头 / 客户端声明，而是 seek 到文件末尾问文件系统——声明值可以随便填。
+    副作用：结束时把读指针归零，调用方可以紧接着直接保存。
+    """
     size = file.size
     if size is None:
         await file.seek(0, 2)  # type: ignore[arg-type]
@@ -155,6 +213,7 @@ async def validate_file_size(file: UploadFile, max_size: int) -> int:
 
 
 async def create_file_code(code, **kwargs):
+    """早期遗留的一行封装（目前无调用方），保留仅为兼容可能的外部引用。"""
     return await FileCodes.create(code=code, **kwargs)
 
 
@@ -168,6 +227,23 @@ async def share_file(
     files: List[UploadFile] = File(default=[]),
     ip: str = Depends(ip_limit["upload"]),
 ):
+    """创建一条分享，返回 (code, owner_token)。
+
+    **凭证**：`share_required_login` —— `openUpload=1` 时游客可传，否则要管理员 JWT。
+    **owner_token 只在此处下发一次**，前端必须存好：它是"这条分享是我发起的"的唯一
+    凭证，撤销时校验它，仅知道取件码的人无从得知。
+
+    **三种形态**，互斥且按顺序判定：
+    1. 无文件 + 有 remark → 文本分享（内容存 remark，无物理文件）
+    2. 单文件 → 走 Fields 老结构（prefix/suffix/uuid_file_name），但仍建一条 FileItem
+    3. 多文件 → 一个共享目录 + N 条 FileItem，父记录只记总大小
+
+    **边界**：
+    - 取件次数在此**不扣**，只在 select / 下载时由 `update_file_usage` 扣。
+    - 多文件是"先全量校验、再逐个保存"：保存中途失败或被扫描拦截会回滚已落盘的文件，
+      不会留下半个分享。
+    - 非幂等：每次调用都生成新 code 与新目录，重试会产生重复的分享。
+    """
     if expire_style not in settings.expireStyle:
         raise HTTPException(status_code=400, detail="过期时间类型错误")
 
@@ -205,6 +281,8 @@ async def share_file(
             owner_token=owner_token,
             access_code_hash=access_code_hash,
         )
+        # 只在成功落库后计一次上传配额：失败尝试不计数，否则被限流的一方
+        # 靠狂发坏请求就能把正常上传挤掉。
         await ip_limit["upload"].add_ip(ip)
         return APIResponse(detail={"code": code, "owner_token": owner_token})
 
@@ -357,6 +435,14 @@ async def share_file(
 async def get_code_file_by_code(
     code: str, check: bool = True
 ) -> Tuple[bool, Union[FileCodes, str]]:
+    """按取件码取记录。返回 (是否可用, FileCodes 或中文原因)。
+
+    **约定**：失败时第二个返回值是给人看的文案（"文件不存在"/"文件已过期"），
+    调用方通常直接把它塞进响应 detail，因此不要在这里改成英文或结构化错误。
+
+    `check=False` 用于"已过期也要拿到记录"的场景（下载接口要自己区分
+    次数耗尽与时间到期，并给出 410 而非 404）。
+    """
     file_code = await FileCodes.filter(code=code).first()
     if not file_code:
         return False, "文件不存在"
@@ -387,7 +473,18 @@ async def update_file_usage(file_code: FileCodes) -> bool:
 
 @share_api.get("/check_code/")
 async def check_code_type(code: str, ip: str = Depends(ip_limit["error"])):
-    """检查码类型：file / collection / delivery / retrieve / unknown"""
+    """探测一个码属于哪类资源，供首页决定跳哪个页面。
+
+    **凭证**：无需任何凭证——码本身就是凭证，这一步就是"拿到码先问一次类型"。
+    **不消耗任何取件次数**，也不下发文件内容（只回 title 与是否过期）。
+
+    **返回码语义**：未命中时 HTTP 仍是 200，业务码 404 放在 body 里（`type=unknown`）。
+    前端按 body 的 type 分支，若改成真 404 会让"码不存在"变成一个无法解析的错误响应。
+
+    **防枚举**：只有完全未命中才计入 `ip_limit["error"]`；命中但过期不算失败——
+    过期会如实回 `expired=True`，因为"知道这个码存在"本来就是码泄露的必然结果，
+    而把过期码也说成不存在，反而会让用户以为自己记错了码。
+    """
     code = _validate_code(code)
     # 先检查是否为普通文件码
     has, file_code = await get_code_file_by_code(code)
@@ -429,6 +526,16 @@ async def check_code_type(code: str, ip: str = Depends(ip_limit["error"])):
 
 @share_api.get("/select/")
 async def get_code_file(code: str, access_code: str = "", ip: str = Depends(ip_limit["error"])):
+    """GET 版取件，与 POST /share/select/ 等价（为兼容旧前端保留，新调用方请用 POST）。
+
+    **凭证**：取件码 + 可选的提取口令 `access_code`。
+    **副作用**：真正取到内容才扣一次取件次数（count 模式）——口令校验在扣减之前，
+    口令错误不扣次数（见 `_require_access_code`），否则猜错几次就能把别人的额度烧光。
+
+    **返回码语义**：404 = 码不存在；410 = 已过期（含次数耗尽）。410 与 404 刻意区分，
+    前端据此提示"已过期"而不是"不存在"。
+    **幂等性**：不幂等——每次调用都扣一次次数，反复刷新会烧额度。
+    """
     file_storage: FileStorageInterface = storages[settings.file_storage]()
     has, file_code = await get_code_file_by_code(code)
     if not has:
@@ -583,6 +690,19 @@ async def get_file_info(
 
 @share_api.post("/select/")
 async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"])):
+    """取件主入口：返回分享详情，并在需要时下发下载用的短期 token。
+
+    **凭证**：取件码（先过 `_validate_code` 大写化 + 格式校验）+ 可选提取口令。
+    **副作用**：口令校验通过后才扣一次取件次数；写一条 `retrieve` 审计。
+
+    **返回码语义**：404 = 码不存在；410 = 已过期（含次数耗尽）。
+
+    **口令如何传导到下载**：口令通过后下发 `access_key`（短期 select token）。
+    下载相关的 /share/download、/download/item/{id}、/zip/{code} 只认取件码，
+    必须带上它——否则知道取件码的人可以直接拼下载 URL 绕过口令。
+
+    **幂等性**：不幂等，每次调用都扣一次次数。
+    """
     data.code = _validate_code(data.code)
     file_storage: FileStorageInterface = storages[settings.file_storage]()
     has, file_code = await get_code_file_by_code(data.code)
@@ -696,6 +816,16 @@ async def revoke_file(data: RevokeFileModel, ip: str = Depends(ip_limit["error"]
 
 @share_api.get("/download")
 async def download_file(key: str, code: str, ip: str = Depends(ip_limit["error"])):
+    """凭 select 阶段下发的短期 token 下载（单文件分享，或文本分享取原文）。
+
+    **凭证**：`key` 是绑定取件码的短期 select token，没有它光有取件码下载不了。
+    **不重复扣次数**：count 模式的次数在 select 阶段已经扣过，这里只判断
+    "取件窗口内分享是否仍然有效"（次数耗尽 / 时间到期 → 410）。
+    为什么 token 没过期还要再查一次：token 自己有 TTL，但分享可能在 token 有效期内
+    被取完次数或到点过期，只看 token 会让已失效的分享继续可下载。
+    **文本分享**（无文件路径、内容在 remark）返回 text/plain，不走文件响应。
+    **鉴权失败**：计入错误限流并写 `denied` 审计。
+    """
     file_storage: FileStorageInterface = storages[settings.file_storage]()
     if not await verify_select_token(key, code):
         await ip_limit["error"].add_ip(ip)
@@ -710,6 +840,7 @@ async def download_file(key: str, code: str, ip: str = Depends(ip_limit["error"]
     if not has:
         return APIResponse(code=404, detail="文件不存在")
     assert isinstance(file_code, FileCodes)
+    # expired_count >= 0 才是"按次数"模式（时间/永久模式存 -1），等于 0 即次数耗尽
     if file_code.expired_count >= 0 and file_code.expired_count <= 0:
         raise HTTPException(status_code=410, detail="文件已过期")
     if (
@@ -734,6 +865,20 @@ chunk_api = APIRouter(prefix="/chunk", tags=["切片"])
 
 @chunk_api.post("/upload/init/", dependencies=[Depends(share_required_login)])
 async def init_chunk_upload(data: InitChunkUploadModel, ip: str = Depends(ip_limit["upload"])):
+    """开一个分片上传会话，返回 upload_id 与分片参数。
+
+    **凭证**：`share_required_login`（与分享上传同一套）。
+    **副作用**：写一条 `chunk_index=-1` 的哨兵行当作"会话头"，并计一次上传限流。
+
+    **尺寸为什么按 `total_chunks * chunk_size` 估**：此刻服务端一个字节都没收到，
+    只能拿客户端声明的 (file_size, chunk_size) 算上界。真实大小在 upload_chunk
+    按累计量、complete 按实际分片数各再挡一次，所以声明值骗不大。
+
+    **断点续传**：存在同 (file_hash, file_size, file_name) 的未完成会话时直接复用，
+    回传已上传的分片下标。这里的 file_hash 只是"同一个文件"的续传键，
+    **不参与任何鉴权或去重判定**——权威哈希一律由合并时服务端算（见 `_sha256_saved_file`
+    与 `merge_chunks`）。
+    """
     _validate_file_type(data.file_name)
     # 限制未完成会话总数，防止资源耗尽（对比 presign 的 50 个上限）
     total_active = await UploadChunk.filter(chunk_index=-1).count()
@@ -809,12 +954,25 @@ async def upload_chunk(
     chunk_index: int,
     chunk: UploadFile = File(...),
 ):
-    # 获取上传会话信息
+    """收一片分片并落盘。
+
+    **凭证**：`share_required_login`。注意**不校验 upload_id 归属**——
+    upload_id 是随机 hex，能猜到即视为拿到了上传凭证；这也是所有分片接口统一的约定。
+
+    **幂等**：同一 chunk_index 已 completed 时直接回 `skipped=True`，
+    不重写、不重复计数，断点续传靠它安全地重发。
+
+    **为什么按声明的 chunk_size 上限读**：直接 `await chunk.read()` 会把整片读进内存，
+    客户端只要声明一个巨大的 chunk_size 就能打爆服务。这里最多读 chunk_size+1KB，
+    超出即按超限拒绝。
+
+    **落盘顺序**：先存成功再写记录（`update_or_create`）——反过来会留下"记录说有、
+    磁盘没有"的分片，complete 阶段合并到一半才发现缺片。
+    """
     chunk_info = await UploadChunk.filter(upload_id=upload_id, chunk_index=-1).first()
     if not chunk_info:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="上传会话不存在")
 
-    # 检查分片索引有效性
     if chunk_index < 0 or chunk_index >= chunk_info.total_chunks:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="无效的分片索引")
 
@@ -896,7 +1054,12 @@ async def upload_chunk(
 
 @chunk_api.delete("/upload/{upload_id}", dependencies=[Depends(share_required_login)])
 async def cancel_upload(upload_id: str):
-    """取消上传并清理临时文件"""
+    """放弃一个上传会话：清理临时分片与会话记录。
+
+    **凭证**：`share_required_login`（不校验归属，见 `upload_chunk`）。
+    **清理失败不报错**：临时文件删不掉最多占点磁盘，不该让"取消"这个动作失败；
+    数据库记录无论如何都会删掉，会话不会滞留成僵尸。
+    """
     chunk_info = await UploadChunk.filter(upload_id=upload_id, chunk_index=-1).first()
     if not chunk_info:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="上传会话不存在")
@@ -911,7 +1074,6 @@ async def cancel_upload(upload_id: str):
         except Exception as e:
             pass
 
-    # 清理数据库记录
     await UploadChunk.filter(upload_id=upload_id).delete()
 
     return APIResponse(detail={"message": "上传已取消"})
@@ -921,12 +1083,15 @@ async def cancel_upload(upload_id: str):
     "/upload/status/{upload_id}", dependencies=[Depends(share_required_login)]
 )
 async def get_upload_status(upload_id: str):
-    """获取上传状态"""
+    """查询会话已收齐哪些分片（断点续传用它决定从哪片继续）。
+
+    **凭证**：`share_required_login`（不校验归属，见 `upload_chunk`）。
+    只读，无副作用；`progress` 只是已收片数 / 总分片数，不代表字节进度。
+    """
     chunk_info = await UploadChunk.filter(upload_id=upload_id, chunk_index=-1).first()
     if not chunk_info:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="上传会话不存在")
 
-    # 获取已上传的分片列表
     uploaded_chunks = await UploadChunk.filter(
         upload_id=upload_id, completed=True
     ).values_list("chunk_index", flat=True)
@@ -950,6 +1115,23 @@ async def get_upload_status(upload_id: str):
 async def complete_upload(
     upload_id: str, data: CompleteUploadModel, ip: str = Depends(ip_limit["upload"])
 ):
+    """合并全部分片、建 FileCodes 记录，返回 (code, owner_token)。
+
+    **凭证**：`share_required_login`。过期策略与提取口令在**这一步**才提交——
+    会话表里不落这些字段，避免上传会话跟着业务配置漂移。
+
+    **副作用**：计一次上传限流、写 `upload` 审计、清理临时分片与会话记录，
+    并下发新的 owner_token（撤销这条分享的唯一凭证，只在这里给一次）。
+
+    **秒传**：用合并时服务端算出的哈希查同内容的未过期记录，命中就复用它的落盘、
+    丢弃本次合并结果。代价是多条记录共享同一物理文件，所以之后**任何删除点都必须先查
+    引用**（`is_file_referenced_elsewhere`），否则删一条会把另一条变成死链。
+    同理，秒传命中时的病毒扫描走 `allow_delete=False`：可以拒绝本次上传，
+    但不能删掉那份被共享的文件。
+
+    **幂等性**：不会重复建分享——成功后会话记录即被清理，重复提交会在
+    "上传会话不存在"处失败。
+    """
     # 校验过期时间类型
     if data.expire_style not in settings.expireStyle:
         raise HTTPException(status_code=400, detail="过期时间类型错误")
@@ -1072,7 +1254,11 @@ PRESIGN_SESSION_EXPIRES = 900  # 15分钟
 async def _get_valid_session(
     upload_id: str, expected_mode: Optional[str] = None
 ) -> PresignUploadSession:
-    """获取并验证会话"""
+    """取会话并校验：存在 / 未过期 / 模式匹配，否则抛错。
+
+    过期会话**顺手删掉**再抛 404：这张表没有后台清理任务，留着只会让
+    "进行中的上传数"统计虚高，把后面的 init 卡在 429 上。
+    """
     session = await PresignUploadSession.filter(upload_id=upload_id).first()
     if not session:
         raise HTTPException(404, "上传会话不存在")
@@ -1088,7 +1274,20 @@ async def _get_valid_session(
 async def presign_upload_init(
     data: PresignUploadInitRequest, ip: str = Depends(ip_limit["upload"])
 ):
-    """初始化预签名上传，S3返回直传URL，其他存储返回代理URL"""
+    """开一个预签名上传会话，返回上传地址与模式。
+
+    **凭证**：`share_required_login`。
+
+    **模式由存储后端决定**，不由客户端选：能签出直传 URL 就是 direct（客户端直传后端），
+    签不出就是 proxy（传到本服务再转存）。对前端只有 `mode` 与 `upload_url` 的差别，
+    收尾分别是 confirm 与 proxy 两个接口。
+
+    **会话 15 分钟过期**（`PRESIGN_SESSION_EXPIRES`）：直传 URL 是"拿着就能写"的凭证，
+    有效期越长泄露面越大；过期只能重新 init。
+
+    **进行中会话上限 50**（分片接口是 100）：这里的会话可能已经占着远端存储对象，
+    限额收紧一些。
+    """
     _validate_file_type(data.file_name)
     if data.file_size > settings.uploadSize:
         raise HTTPException(
@@ -1153,7 +1352,14 @@ async def presign_upload_proxy(
     access_code: str = Form(default=""),
     ip: str = Depends(ip_limit["upload"]),
 ):
-    """代理模式上传，服务器转存到存储后端"""
+    """proxy 模式收尾：接收整包 → 转存存储后端 → 直接产出取件码。
+
+    **凭证**：`share_required_login` + upload_id（路径里，随机 hex）。
+    **大小校验留 1KB 容差**：部分客户端 / 代理算不对边界，取严格相等会误杀正常上传，
+    容差内按实际大小入库。
+    **这条路径不下发 owner_token**（对比 share_file 与 complete_upload）：
+    产出的分享无法被 /share/revoke 撤销，发起者也没有"我是发起人"的凭证。
+    """
     session = await _get_valid_session(upload_id, expected_mode="proxy")
 
     file_size = await validate_file_size(file, settings.uploadSize)
@@ -1189,7 +1395,19 @@ async def presign_upload_confirm(
     data: Optional[PresignConfirmRequest] = None,
     ip: str = Depends(ip_limit["upload"]),
 ):
-    """直传确认，客户端完成S3直传后调用获取分享码"""
+    """direct 模式收尾：确认对象已落到存储后端，然后产出取件码。
+
+    **凭证**：`share_required_login` + upload_id。
+
+    **为什么必须回查存储**：直传不经过本服务，服务端无从得知客户端到底传没传、
+    传了多大。所以先 file_exists、再 get_file_size，差超过 1KB 视为异常并删掉对象——
+    挡住"用声明的小尺寸签出 URL、实际塞进超大对象"这种占存储的玩法。
+
+    **注意**：大小校验只在后端实现了 `get_file_size` 时才发生（`hasattr` 判断），
+    未实现的后端会静默跳过这一步，只剩 file_exists。
+    **file_hash 依然为空**：直传路径服务端没见过文件内容，算不出哈希，
+    接收端因此拿不到校验基准（分片路径有）。
+    """
     session = await _get_valid_session(upload_id, expected_mode="direct")
 
     storage: FileStorageInterface = storages[settings.file_storage]()
@@ -1231,7 +1449,11 @@ async def presign_upload_confirm(
     "/upload/status/{upload_id}", dependencies=[Depends(share_required_login)]
 )
 async def presign_upload_status(upload_id: str):
-    """查询上传会话状态"""
+    """查会话状态（供前端轮询展示）。
+
+    刻意**不走** `_get_valid_session`：那条路径对过期会话是"删除 + 抛错"，
+    而轮询查询不该有副作用，也不该把 404 当成错误。
+    """
     session = await PresignUploadSession.filter(upload_id=upload_id).first()
     if not session:
         raise HTTPException(404, "上传会话不存在")
@@ -1251,7 +1473,11 @@ async def presign_upload_status(upload_id: str):
 
 @presign_api.delete("/upload/{upload_id}", dependencies=[Depends(share_required_login)])
 async def presign_upload_cancel(upload_id: str):
-    """取消上传会话"""
+    """取消会话：删记录，direct 模式下顺带删掉已传到存储后端的对象。
+
+    只对 direct 删对象：proxy 模式的对象是在 PUT 收尾时才落地的，会话还在 = 没对象。
+    删除失败也吞掉——会话记录无论如何都要删掉，否则会一直占着"进行中"的名额。
+    """
     session = await PresignUploadSession.filter(upload_id=upload_id).first()
     if not session:
         raise HTTPException(404, "上传会话不存在")
@@ -1277,7 +1503,16 @@ async def presign_upload_cancel(upload_id: str):
 
 @share_api.get("/download/item/{item_id}")
 async def download_single_file(item_id: int, code: str, key: str = "", ip: str = Depends(ip_limit["error"])):
-    """下载多文件分享中的单个文件"""
+    """下载多文件分享中的单个文件。
+
+    **凭证**：取件码 `code`，且该分享设了提取口令时还要 `key`（select token）。
+    必须校验 item 所属分享的 code 与传入 code 一致——只凭 item_id 就能下载的话，
+    自增 id 是可枚举的，等于把 id 当凭证。
+
+    **副作用**：这里**会**扣一次取件次数（与 /share/download 相反，后者在 select 阶段
+    已扣）。列表里每点一次扣一次，重复点击会烧额度。
+    **返回码**：404 不存在 / 403 取件码不匹配或缺口令 / 410 次数已尽。
+    """
     file_item = await FileItem.filter(id=item_id).first()
     if not file_item:
         raise HTTPException(404, "文件不存在")
@@ -1348,7 +1583,16 @@ async def download_single_file(item_id: int, code: str, key: str = "", ip: str =
 
 @share_api.get("/zip/{code}")
 async def download_zip(code: str, key: str = "", ip: str = Depends(ip_limit["error"])):
-    """流式打包下载文件（单文件分享同样支持打包）"""
+    """打包下载整条分享（单文件分享也支持：它同样建了 FileItem 记录）。
+
+    **凭证**：取件码 + 该分享设了提取口令时的 `key`（select token）。
+    口令保护时不带 key 直接拒绝并审计：整包拖走的损失比单文件大得多。
+
+    **不扣取件次数**：次数只在 select / 单文件下载时扣。否则一个分享被反复拖 zip
+    会让计数与实际取件次数脱节。
+
+    **流式**：zip 不落盘，边打包边发——为大分享再占一份磁盘不划算。
+    """
     has, file_code = await get_code_file_by_code(code)
     if not has:
         await ip_limit["error"].add_ip(ip)
@@ -1539,7 +1783,16 @@ async def _get_unique_code(model_class, field_name: str, length: int = 0) -> str
 
 @collection_api.post("/create/", dependencies=[Depends(share_required_login)])
 async def create_collection(data: CreateCollectionRequest, ip: str = Depends(ip_limit["upload"])):
-    """创建收件箱，返回三码"""
+    """创建收件箱，一次性返回三个码：管理码 / 投件码 / 取件码。
+
+    **凭证**：`share_required_login`（同上传类接口）。
+    **三码即全部鉴权**：无账号体系下，拿到哪个码就拥有哪个视角。管理码看全部并可删，
+    投件码只能投，取件码只能取——所以服务端**永远不在响应里回传另外两码**
+    （见 `_build_collection_base`）。创建者若不保存管理码，等于永久失去管理权。
+
+    **约束**：整箱不支持 count（按次数）过期——收件箱存活期必须有时间维度；
+    两个子码的过期时间不得晚于整箱，否则会出现"箱子没了、子码还能用"的孤儿状态。
+    """
     collection_code = await _get_unique_code(CollectionBox, "collection_code")
     delivery_code = await _get_unique_code(CollectionBox, "delivery_code")
     retrieve_code = await _get_unique_code(CollectionBox, "retrieve_code")
@@ -1631,7 +1884,13 @@ delivery_api = APIRouter(prefix="/delivery", tags=["投递"])
 
 @delivery_api.get("/{delivery_code}")
 async def get_delivery_page(delivery_code: str, ip: str = Depends(ip_limit["error"])):
-    """获取投递页面信息（仅上传表单，不暴露文件列表）"""
+    """投件页信息（表单元数据 + 剩余容量），凭证是投件码。
+
+    **只回数量不回列表**：投递者之间互不可见，给列表等于让别人看到别人投了什么。
+    **所有失败分支都计错误限流**：投件码通常公开传播，猜码成本必须抬上去。
+    **返回码**：404 码不存在 / 410 收件箱或投件码已过期（410 而非 404，
+    让投递者知道"箱子还在、只是过期了"）。
+    """
     delivery_code = _validate_code(delivery_code)
     box = await CollectionBox.filter(delivery_code=delivery_code).first()
     if not box:
@@ -1872,7 +2131,16 @@ async def delivery_upload(
     uploader_name: str = Form(default=""),
     ip: str = Depends(ip_limit["upload"]),
 ):
-    """投递文件到收件箱，使用 delivery_code 认证（非分片模式）"""
+    """非分片投递：整包上传（分片模式走 /delivery/chunk/*）。
+
+    **凭证**：投件码（`delivery_code`）。投递者不需要任何账号，
+    因此上限全靠箱子自己的配置：投递次数与文件数。
+
+    **并发**：先原子占位一次投递次数（`_reserve_delivery_slot`），再在事务内校验收件箱
+    容量——两个并发投递不会同时挤进最后一个名额。上传失败会回滚占位。
+
+    **不回传已有文件**：投递响应只说本次结果，投递者看不到箱子里别的文件。
+    """
     _validate_file_type(file.filename or "")
     box = await _get_valid_delivery_box(delivery_code)
     uploader_name = (uploader_name or "").strip()[:50]
@@ -2154,7 +2422,11 @@ async def _build_delivery_view_response(box: CollectionBox) -> dict:
 
 @collection_api.get("/status/{collection_code}")
 async def get_collection_status(collection_code: str, ip: str = Depends(ip_limit["error"])):
-    """获取收件箱状态（同管理页面数据）"""
+    """管理码视角的收件箱状态，直接复用管理页接口（同数据、同鉴权）。
+
+    单独留一个路径是给前端轮询用的：名字上它是"状态"，权限上它等于"管理"，
+    所以**不能**拿取件码来调。
+    """
     return await get_collection_manage(collection_code, ip)
 
 
@@ -2364,7 +2636,15 @@ COLLECTION_WS_MAX_CONNECTIONS = 50
 
 @ws_api.websocket("/ws/collection/{code}")
 async def websocket_collection(websocket: WebSocket, code: str):
-    """收件箱实时推送 WebSocket"""
+    """收件箱实时推送 WebSocket：新投递的文件即时推给在线的收件人 / 投递者。
+
+    **凭证**：连接路径里的码，管理码或投件码都接受（**取件码不行**——
+    取件是只读视角，不该进入实时通道）。不存在 404、已过期 410，均以 close code 表达。
+
+    **连接数上限 50**（`COLLECTION_WS_MAX_CONNECTIONS`）：投件码会被公开传播，
+    不限流就能被无限建连耗句柄。用 `room_size`（含其它实例成员）判定，
+    否则多实例下每个实例各算各的、上限被放大 N 倍。
+    """
     # 支持通过 collection_code 或 delivery_code 连接
     collection = await CollectionBox.filter(collection_code=code).first()
     if not collection:
@@ -2439,7 +2719,11 @@ ROOM_RELAY_MAX_FRAME = 4 * 1024 * 1024  # 单帧二进制中继上限 4MB
 
 
 async def _get_room(code: str) -> Room:
-    """获取房间并校验状态"""
+    """按房间码取房间；不存在 404、已过期 410（与分享取件的语义保持一致）。
+
+    410 与 404 分开是给前端用的：房间过期是常态（默认 1 天），
+    提示"已过期"比"不存在"更能解释为什么链接打不开。
+    """
     code = _validate_code(code)
     room = await Room.filter(room_code=code).first()
     if not room:
@@ -2450,6 +2734,11 @@ async def _get_room(code: str) -> Room:
 
 
 async def _build_room_response(room: Room) -> dict:
+    """房间的公共输出字段，创建 / 查询 / 兼容入口共用一份（避免三处各写一遍而漂移）。
+
+    刻意**不含任何凭证类字段**：这个响应对"拿到房间码的人"可见，
+    creator_ip 之类不该出现在里面。
+    """
     return {
         "room_code": room.room_code,
         "title": room.title,
@@ -2496,14 +2785,26 @@ async def _create_room(data: CreateRoomRequest, ip: str) -> Room:
 
 @room_api.post("/create/", dependencies=[Depends(share_required_login)])
 async def create_room(data: CreateRoomRequest, ip: str = Depends(ip_limit["upload"])):
-    """创建房间（chat/transfer/direct 由 mode 决定），返回房间码"""
+    """创建房间，返回房间码（创建者把它发给对端即可）。
+
+    **凭证**：`share_required_login`（同上传类接口）。
+    **创建者没有后续特权**：服务端不记录"谁创建的"，也不下发 owner 凭证，
+    所以房间创建后无法改配置、无法提前解散，只能等过期。
+
+    **mode 已统一**：聊天 / 文件传输 / 直连快传三合一，新房间固定为 direct，
+    请求体里没有 mode 字段（旧版按 mode 分流的历史已结束，不要照着旧文档写）。
+    """
     room = await _create_room(data, ip)
     return APIResponse(detail=await _build_room_response(room))
 
 
 @room_api.get("/info/{room_code}")
 async def get_room_info(room_code: str, ip: str = Depends(ip_limit["error"])):
-    """获取房间信息（加入页展示）"""
+    """房间信息（加入页展示）：只读，房间码即凭证。
+
+    刻意**不下发成员名单与任何文件**：加入前就该看到尽可能少的东西，
+    成员 / 文件要等真正连上 WebSocket 才给。
+    """
     room = await _get_room(room_code)
     return APIResponse(detail=await _build_room_response(room))
 
@@ -2607,6 +2908,14 @@ RELAY_HINT_COOLDOWN = 60.0
 
 
 def _relay_cross_instance_hint(room_code: str, client_id: str) -> bool:
+    """是否该给发送方发一次"跨实例无法中继"提示（True = 该发，调用即记为已发）。
+
+    二进制中继是按帧循环的：不节流的话，一个传不动的文件能在几秒内刷出上万条提示，
+    把控制通道打满。同一 (房间, 发送者) 60 秒内最多提示一次。
+
+    节流表只增不减，超过 4096 条时整表清空——粗暴但够用：清空的代价只是
+    "可能早提示一次"，不影响正确性，也不值得为它引入过期扫描。
+    """
     now = time.monotonic()
     key = f"{room_code}:{client_id}"
     last = _RELAY_HINTED.get(key)
@@ -3650,11 +3959,17 @@ async def compat_create_direct(data: CreateRoomRequest, ip: str = Depends(ip_lim
 
 @compat_room_api.get("/transfer/info/{room_code}")
 async def compat_transfer_info(room_code: str):
+    """旧 /transfer/info 链接的兼容入口：与 /room/info/{room_code} 完全等价。
+
+    存在的唯一理由是"已经分享出去的旧链接不能 404"，新代码请直接用 /room/info。
+    注意本入口（以及下面的 direct 版）**未接 `ip_limit`**，与 /room/info 不一致。
+    """
     room = await _get_room(room_code)
     return APIResponse(detail=await _build_room_response(room))
 
 
 @compat_room_api.get("/direct/info/{room_code}")
 async def compat_direct_info(room_code: str):
+    """旧 /direct/info 链接的兼容入口，等价 /room/info/{room_code}（见上方同名说明）。"""
     room = await _get_room(room_code)
     return APIResponse(detail=await _build_room_response(room))
