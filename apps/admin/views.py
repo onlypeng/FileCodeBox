@@ -19,10 +19,15 @@
   否则前端会继续显示一个点开就 404 的入口。
 
 ## 刻意不做
-**不提供批量删除 / 一键清空**。匿名开放上传的场景下，磁盘清理的真正正确做法
-是"按过期时间清理"（core.tasks 的过期清理任务），而不是给后台一把
-能一次删光所有文件的枪——后者一旦点错无法挽回。
+**不提供"单请求批量删除 / 一键清空"接口**。匿名开放上传的场景下，磁盘清理的
+正确做法是"按过期时间清理"（core.tasks 的过期清理任务），而不是给后台一把
+能一次删光所有文件的枪——后者一旦点错无法挽回。管理端页面上的"批量"是
+并发调用单条删除接口实现的，每条仍各自经过确认弹窗、引用检查与审计留痕。
 统计类接口只读，不写任何库表。
+
+所有**写操作**（删除、过期变更、备注/房间设置修改）统一写审计：
+普通用户的每次取件/下载都留痕，管理员删整个房间却无痕是不合理的。
+审计由 `core.audit.record()` 承载，它吞掉异常，绝不让主流程因写日志失败而失败。
 """
 # @Time    : 2023/8/14 14:38
 # @Author  : Lan
@@ -30,7 +35,8 @@
 # @Software: PyCharm
 import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+import json as _json
 from apps.admin.services import FileService, ConfigService
 from apps.admin.dependencies import (
     admin_required,
@@ -49,10 +55,17 @@ from core.quota import current_storage_usage
 from core.audit import record
 from core.netcheck import check_turn_servers
 from core.file_dedup import is_file_referenced_elsewhere
-from core.settings import settings, DEFAULT_CONFIG
+from core.settings import settings, DEFAULT_CONFIG, BASE_DIR
 from core.utils import get_now, verify_password, pagination
 from core.logger import logger
 from core.websocket import ws_manager
+
+# 基础设施配置：只在启动期/环境变量里有效，后台提交必须显式拒绝而不是静默丢弃
+INFRA_CONFIG_KEYS = {
+    "dbType", "dbHost", "dbPort", "dbName", "dbUser", "dbPassword", "dbSchema", "redisUrl",
+}
+# 保存成功但当前进程不会立即生效的启动期参数
+RESTART_CONFIG_KEYS = {"serverWorkers", "serverHost", "serverPort"}
 
 # dependencies 挂在 router 上而不是逐个路由上：新增路由自动继承鉴权，
 # 漏挂一处就是未授权访问漏洞（且功能测试不会暴露）。登录接口由
@@ -484,6 +497,7 @@ async def get_config(
 
 @admin_api.patch("/config/update")
 async def update_config(
+    request: Request,
     data: UpdateConfigRequest,
     config_service: ConfigService = Depends(get_config_service),
 ):
@@ -499,20 +513,74 @@ async def update_config(
     新文件写新后端。这是刻意行为——静默搬运大流量数据风险更高，
     迁移应由运维显式执行。
     """
+    # UpdateConfigRequest 是白名单：未声明的键会被 Pydantic 静默丢弃。
+    # 基础设施配置（db*/redisUrl）正是被丢弃的那批，过去 PATCH 返回 200 却什么都没改，
+    # 而 config/get 又照样显示它们 —— 形成「保存成功」的假象。这里读原始 body
+    # 显式拒绝，让错误在保存时就被看见，而不是上线后排查半天。
+    try:
+        raw_body = _json.loads(await request.body() or b"{}")
+    except Exception:
+        raw_body = {}
+    # 前端「保存设置」提交的是整份配置，db*/redisUrl 会被原样带回（值与当前一致）。
+    # 因此按「值是否真的被改动」判断，而不是「键是否出现」：后者会让后台每一次
+    # 保存都 400，形成「点保存没反应」的假生效。空值与脱敏占位符一律视为不修改。
+    infra_changed = []
+    for key in sorted(set(raw_body) & INFRA_CONFIG_KEYS):
+        incoming = raw_body.get(key)
+        if incoming is None or str(incoming).strip() in ("", "******"):
+            continue
+        if str(incoming) != str(getattr(settings, key, None)):
+            infra_changed.append(key)
+    if infra_changed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"以下配置需通过环境变量设置并重启生效，后台不可修改：{', '.join(infra_changed)}",
+        )
+
+    # 记录提示相关字段的旧值：hints 只对「本次真的改了的项」提示，
+    # 避免整份表单回传时每次保存都弹「需重启 / 不生效」。
+    hint_keys = RESTART_CONFIG_KEYS | {"themesSelect"}
+    hint_before = {k: getattr(settings, k, None) for k in hint_keys}
+
     # 只取非None的字段
     update_data = {k: v for k, v in data.model_dump().items() if v is not None}
+    # 后台「保存设置」是整份表单回传，审计若把 65 个字段全记一遍会淹没真实变更。
+    # 先在写库前留一份旧值，写完只记录值确实变化了的字段。
+    values_before = {k: getattr(settings, k, None) for k in update_data}
     await config_service.update_config(update_data)
+    changed_fields = sorted(
+        k for k in update_data
+        if str(getattr(settings, k, None)) != str(values_before.get(k))
+    )
     # 改管理员密码属于高敏操作，单独留痕（不记录具体口令）
     if "admin_token" in update_data:
         await record("config_update", target_type="admin", target_id="password",
                      result="success", detail="修改管理员密码", actor="admin")
     else:
-        # 其余配置只记录变更项名称，不记录取值（配置里可能含密钥类字段）
-        fields = ",".join(sorted(update_data.keys()))
+        # 其余配置只记录**真正变化**的字段名，不记录取值（配置里可能含密钥类字段）
+        fields = ",".join(changed_fields)
         if fields:
             await record("config_update", target_type="system",
                          detail=fields[:255], actor="admin")
-    return APIResponse()
+    # 启动期参数与 dist 部署下的无效项：保存成功也要如实告诉管理员
+    # 「不会立刻 / 根本不生效」，不能只回一个空的 200。
+    hints: list[str] = []
+    restart = sorted(
+        k for k in (set(update_data) & RESTART_CONFIG_KEYS)
+        if str(update_data[k]) != str(hint_before.get(k))
+    )
+    if restart:
+        hints.append(f"以下配置保存后需重启服务才生效：{', '.join(restart)}")
+    themes_changed = (
+        "themesSelect" in update_data
+        and str(update_data["themesSelect"]) != str(hint_before.get("themesSelect"))
+    )
+    if themes_changed and (BASE_DIR / "frontend_dist" / "index.html").is_file():
+        hints.append(
+            "当前使用构建产物(frontend_dist)部署，themesSelect 不参与页面渲染；"
+            "请改用「站点默认主题 spaTheme」"
+        )
+    return APIResponse(detail={"hints": hints} if hints else None)
 
 
 @admin_api.get("/room/{room_id}/files")
@@ -564,6 +632,7 @@ async def admin_delete_room_cache_file(file_id: int):
 
     刻意不做"软删除标记"：缓存文件是临时副本，留着只会占磁盘，
     而房间成员手里的本地副本不受影响。
+    写审计 `delete`（target_type=room_cache），与房间成员侧的删除留痕口径一致。
     """
     entry = await RoomCachedFile.filter(id=file_id).first()
     if not entry:
@@ -583,6 +652,8 @@ async def admin_delete_room_cache_file(file_id: int):
         "type": "room_cache_removed",
         "transfer_id": transfer_id,
     })
+    await record("delete", target_type="room_cache", target_id=transfer_id or str(file_id),
+                 result="success", detail="后台强制清理房间缓存文件", actor="admin")
     return APIResponse()
 
 
@@ -705,7 +776,7 @@ async def delete_collection(collection_id: int):
     - 逐个删除投递文件对应的物理文件（**先查引用**，被别处共享则只删记录）
     - 级联删除投递记录（CollectionFile）与箱子本身
 
-    注意：**本路由不写审计日志**（与文件删除不一致），删箱留痕目前缺失。
+    写审计 `delete`（target_type=collection），与其它删除接口口径一致。
     单文件删除失败被静默吞掉（`except: pass`）——收件箱删除应尽力完成，
     不该因为某个文件所在存储后端不可用而整体失败，代价是可能残留孤儿文件。
     """
@@ -731,6 +802,8 @@ async def delete_collection(collection_id: int):
                     pass
                 await file_code.delete()
 
+    await record("delete", target_type="collection", target_id=box.collection_code,
+                 result="success", detail="后台删除收件箱及其投递文件", actor="admin")
     await box.delete()
     return APIResponse(detail="收件箱已删除")
 
@@ -772,6 +845,16 @@ async def room_list(
     total = await query.count()
     rooms = await query.limit(size).offset(offset)
 
+    # 本页房间的消息数/缓存数一次性聚合，避免逐房间两次 COUNT（一页 10 条原本要 20 次查询）
+    room_codes = [r.room_code for r in rooms]
+    message_counts: dict = {}
+    cached_counts: dict = {}
+    if room_codes:
+        for row in await RoomMessage.filter(room_code__in=room_codes).group_by("room_code").annotate(cnt=Count("id")):
+            message_counts[row.room_code] = row.cnt or 0
+        for row in await RoomCachedFile.filter(room_code__in=room_codes).group_by("room_code").annotate(cnt=Count("id")):
+            cached_counts[row.room_code] = row.cnt or 0
+
     result = []
     for room in rooms:
         result.append({
@@ -788,8 +871,8 @@ async def room_list(
             # 后加功能信息：保存消息 / 文件缓存（含各自记录量，供后台展示）
             "save_messages": bool(room.save_messages),
             "cache_enabled": bool(room.cache_enabled),
-            "message_count": await RoomMessage.filter(room_code=room.room_code).count(),
-            "cached_count": await RoomCachedFile.filter(room_code=room.room_code).count(),
+            "message_count": message_counts.get(room.room_code, 0),
+            "cached_count": cached_counts.get(room.room_code, 0),
         })
 
     return APIResponse(detail={
@@ -807,7 +890,7 @@ async def delete_room(room_id: int):
     权限：管理员。副作用：
     - **先广播踢人再删记录**：顺序不能反，否则成员会在已消失的房间里继续发消息
     - `kick_room` 会跨实例通知（多实例部署时只关本地连接会留下幽灵连接）
-    - 不写审计日志
+    - 写审计 `delete`（target_type=room），先写后删以便留下房间码
 
     注意：只删 `Room` 记录。房间消息（RoomMessage）与缓存文件（RoomCachedFile）
     按 `room_code` 关联而非外键，不会级联删除，其磁盘副本依赖缓存自身的过期回收。
@@ -817,7 +900,11 @@ async def delete_room(room_id: int):
         raise HTTPException(status_code=404, detail="房间不存在")
     # 清理该房间的在线连接（含其它实例上的成员：多实例时只关本地会留下幽灵连接）
     await ws_manager.kick_room(room.room_code, reason="房间已被删除")
+    # 审计先于记录删除：target_id 取的是房间码，删完就拿不到了
+    await record("delete", target_type="room", target_id=room.room_code,
+                 result="success", detail="后台删除房间（含踢出在线成员）", actor="admin")
     await room.delete()
+    return APIResponse()
 
 
 # ==================== 延长过期 ====================
@@ -894,8 +981,8 @@ async def _reset_expire(obj, style: str, value: int, prefix: str = ""):
 async def file_extend(data: ExtendExpireRequest, file_service: FileService = Depends(get_file_service)):
     """延长文件分享过期时间（day/hour/minute/count/forever；count 时 value 为剩余次数）。
 
-    权限：管理员。副作用：改库（**在当前过期时间基础上顺延**，见 `_apply_expire`）。
-    不写审计、不影响在线连接。已过期的分享延长后从"现在"起算，不会越延越过去。
+    权限：管理员。副作用：改库（**在当前过期时间基础上顺延**，见 `_apply_expire`）
+    + 写审计 `expire_update`。不影响在线连接。已过期的分享延长后从"现在"起算，不会越延越过去。
     与 `PATCH /file/{id}/expire` 的区别：那是按当前时间**重设**，这是顺延。
     """
     f = await FileCodes.filter(id=data.id).first()
@@ -904,6 +991,8 @@ async def file_extend(data: ExtendExpireRequest, file_service: FileService = Dep
     if data.expire_style not in ("day", "hour", "minute", "count", "forever"):
         raise HTTPException(status_code=400, detail="不支持的过期类型")
     await _apply_expire(f, data.expire_style, data.expire_value)
+    await record("expire_update", target_type="filecode", target_id=f.code,
+                 result="success", detail=f"延长文件过期({data.expire_style})", actor="admin")
     return APIResponse()
 
 
@@ -911,14 +1000,17 @@ async def file_extend(data: ExtendExpireRequest, file_service: FileService = Dep
 async def collection_extend(collection_id: int, data: ExtendExpireRequest):
     """延长收件箱过期：target=manage（整箱）/ deliver（投递）/ retrieve（取件）。
 
-    权限：管理员。副作用：改库（顺延）。不写审计。
+    权限：管理员。副作用：改库（顺延）+ 写审计 `expire_update`。
     未传 target 时默认整箱。**整箱创建后本不允许改过期**，
     这里的"延长"是在原到期时间上顺延，属于运营干预而非配置修改。
+    与重设接口一致：target 非法直接 400，不静默按整箱处理（改错对象不可逆）。
     """
     box = await CollectionBox.filter(id=collection_id).first()
     if not box:
         raise HTTPException(status_code=404, detail="收件箱不存在")
     target = data.target or "manage"
+    if target not in ("manage", "deliver", "retrieve"):
+        raise HTTPException(status_code=400, detail="不支持的过期目标")
     if target == "deliver":
         prefix = "delivery_"
     elif target == "retrieve":
@@ -926,6 +1018,8 @@ async def collection_extend(collection_id: int, data: ExtendExpireRequest):
     else:
         prefix = ""
     await _apply_expire(box, data.expire_style, data.expire_value, prefix)
+    await record("expire_update", target_type="collection", target_id=box.collection_code,
+                 result="success", detail=f"延长收件箱过期(target={target})", actor="admin")
     return APIResponse()
 
 
@@ -933,7 +1027,7 @@ async def collection_extend(collection_id: int, data: ExtendExpireRequest):
 async def room_extend(room_id: int, data: ExtendExpireRequest):
     """延长房间过期时间（count 时 value 为剩余会话次数）。
 
-    权限：管理员。副作用：改库（顺延）。
+    权限：管理员。副作用：改库（顺延）+ 写审计 `expire_update`。
     **不影响在线连接**：已在线的成员不会被踢，延长也不会重连。
     房间被延长后，正在"房间已过期"提示页上的成员刷新即可恢复。
     """
@@ -941,12 +1035,19 @@ async def room_extend(room_id: int, data: ExtendExpireRequest):
     if not room:
         raise HTTPException(status_code=404, detail="房间不存在")
     await _apply_expire(room, data.expire_style, data.expire_value)
+    await record("expire_update", target_type="room", target_id=room.room_code,
+                 result="success", detail=f"延长房间过期({data.expire_style})", actor="admin")
     return APIResponse()
 
 
 @admin_api.patch("/file/{file_id}")
 async def file_update(file_id: int, data: UpdateFileRequest):
-    """文件管理：修改备注（文本分享内容即备注；长度不超过后台 maxTextLength）"""
+    """文件管理：修改备注（文本分享内容即备注；长度不超过后台 maxTextLength）。
+
+    权限：管理员。副作用：改库 + 写审计 `admin_update`。
+    审计只记"改了备注"这一事实，**绝不把备注正文写进日志**——一条文本可达 20 万字符，
+    且内容可能含用户隐私。
+    """
     f = await FileCodes.filter(id=file_id).first()
     if not f:
         raise HTTPException(status_code=404, detail="文件不存在")
@@ -956,6 +1057,8 @@ async def file_update(file_id: int, data: UpdateFileRequest):
             raise HTTPException(status_code=400, detail=f"备注过长，最多 {max_len} 字符")
         f.remark = data.remark
         await f.save()
+        await record("admin_update", target_type="filecode", target_id=f.code,
+                     result="success", detail="后台修改文件备注", actor="admin")
     return APIResponse()
 
 
@@ -966,6 +1069,7 @@ async def room_update(room_id: int, data: UpdateRoomRequest):
     权限：管理员。副作用：改库。**不影响在线连接**——把 `max_members` 调小
     不会踢掉已在线的成员，只阻止后续加入，避免出现"改个数字把正在传文件的人踢下线"。
     `cache_enabled` 关掉不会立即删除已缓存的文件，只是不再新增。
+    写审计 `admin_update`（仅在确实有字段变化时）。
     """
     room = await Room.filter(id=room_id).first()
     if not room:
@@ -983,6 +1087,8 @@ async def room_update(room_id: int, data: UpdateRoomRequest):
         changed = True
     if changed:
         await room.save()
+        await record("admin_update", target_type="room", target_id=room.room_code,
+                     result="success", detail="后台修改房间设置", actor="admin")
     return APIResponse()
 
 
@@ -991,7 +1097,7 @@ async def room_update(room_id: int, data: UpdateRoomRequest):
 async def file_save_expire(file_id: int, data: ExtendExpireRequest):
     """保存文件过期时间（day/hour/minute/count/forever）——**按当前时间重设**。
 
-    权限：管理员。副作用：改库。不写审计。
+    权限：管理员。副作用：改库 + 写审计 `expire_update`。
     与 `POST /file/extend` 的区别：这里是"改成 N 天/次"（重设，见 `_reset_expire`），
     那边是"再加 N 天/次"（顺延）。管理弹窗走重设更符合直觉。
     """
@@ -1001,6 +1107,8 @@ async def file_save_expire(file_id: int, data: ExtendExpireRequest):
     if data.expire_style not in ("day", "hour", "minute", "count", "forever"):
         raise HTTPException(status_code=400, detail="不支持的过期类型")
     await _reset_expire(f, data.expire_style, data.expire_value)
+    await record("expire_update", target_type="filecode", target_id=f.code,
+                 result="success", detail=f"重设文件过期({data.expire_style})", actor="admin")
     return APIResponse()
 
 
@@ -1008,9 +1116,9 @@ async def file_save_expire(file_id: int, data: ExtendExpireRequest):
 async def collection_save_expire(collection_id: int, data: ExtendExpireRequest):
     """保存收件箱过期（target=manage(整箱)/deliver(投递)/retrieve(取件)，按当前时间重设）。
 
-    权限：管理员。副作用：改库。不写审计。
-    与延长接口不同，这里 `target` 取值非法会直接 400（延长接口会静默按整箱处理），
-    因为重设是破坏性操作，歧义必须拒绝而不是猜。
+    权限：管理员。副作用：改库 + 写审计 `expire_update`。
+    两个过期接口对 `target` 非法值都直接 400——重设/延长都是不可逆的破坏性操作，
+    歧义必须拒绝而不是猜。
     """
     box = await CollectionBox.filter(id=collection_id).first()
     if not box:
@@ -1022,18 +1130,25 @@ async def collection_save_expire(collection_id: int, data: ExtendExpireRequest):
         raise HTTPException(status_code=400, detail="不支持的过期类型")
     prefix = {"manage": "", "deliver": "delivery_", "retrieve": "retrieve_"}[target]
     await _reset_expire(box, data.expire_style, data.expire_value, prefix)
+    await record("expire_update", target_type="collection", target_id=box.collection_code,
+                 result="success", detail=f"重设收件箱过期(target={target})", actor="admin")
     return APIResponse()
 
 
 @admin_api.patch("/room/{room_id}/expire")
 async def room_save_expire(room_id: int, data: ExtendExpireRequest):
-    """保存房间过期时间（day/hour/minute/count/forever）"""
+    """保存房间过期时间（day/hour/minute/count/forever）——按当前时间重设。
+
+    权限：管理员。副作用：改库 + 写审计 `expire_update`。
+    """
     room = await Room.filter(id=room_id).first()
     if not room:
         raise HTTPException(status_code=404, detail="房间不存在")
     if data.expire_style not in ("day", "hour", "minute", "count", "forever"):
         raise HTTPException(status_code=400, detail="不支持的过期类型")
     await _reset_expire(room, data.expire_style, data.expire_value)
+    await record("expire_update", target_type="room", target_id=room.room_code,
+                 result="success", detail=f"重设房间过期({data.expire_style})", actor="admin")
     return APIResponse()
 
 

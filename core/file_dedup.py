@@ -15,7 +15,6 @@ from __future__ import annotations
 from tortoise.expressions import Q
 
 from apps.base.models import FileCodes
-from core.logger import logger
 from core.utils import get_now
 
 

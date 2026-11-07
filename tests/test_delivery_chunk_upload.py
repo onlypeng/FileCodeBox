@@ -1,5 +1,17 @@
 # 投递（delivery）分片上传：init → 上传分片 → complete 合并；cancel 回滚
+import pytest
+
 from apps.base.models import CollectionFile, UploadChunk
+from core.settings import settings
+
+
+@pytest.fixture(autouse=True)
+def _chunk_switch_enabled():
+    """服务端现在强制读取 enableChunk：分片单测模拟「管理员已在后台开启分片」的部署状态。"""
+    old = settings.enableChunk
+    settings.enableChunk = 1
+    yield
+    settings.enableChunk = old
 
 
 async def _create_collection(client) -> str:

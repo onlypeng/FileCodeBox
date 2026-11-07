@@ -16,6 +16,8 @@
 from pydantic import BaseModel, Field
 from typing import Optional
 
+from core.settings import settings
+
 
 class SelectFileModel(BaseModel):
     """取件请求：取件码 + 可选的二次口令。"""
@@ -79,16 +81,21 @@ class CreateCollectionRequest(BaseModel):
     """
     title: str = ""
     description: Optional[str] = ""
-    max_files: int = 20
+    # 默认值从运行时配置读取（default_factory 每次实例化都求值，后台改了立即生效），
+    # 而不是硬编码 20/7 —— 否则后台的 collectionDefault* 对不带参数的调用方永远无效。
+    max_files: int = Field(default_factory=lambda: int(getattr(settings, "collectionDefaultMaxFiles", 20) or 20))
     # 收件箱过期配置（创建后不可更改）
     expire_style: str = "day"
-    expire_value: int = 7
+    expire_value: int = Field(default_factory=lambda: int(getattr(settings, "collectionDefaultExpireDays", 7) or 7))
     # 投件码过期配置
     delivery_expire_style: str = "day"
-    delivery_expire_value: int = 7
+    # 子码默认有效期必须跟随收件箱默认有效期：后台把 collectionDefaultExpireDays
+    # 调小后，子码若仍固定 7 天会触发「投件码过期时间不能超过收件箱过期时间」
+    # 的校验，让不带参数的创建请求被自己的默认值拒掉（配置改了反而功能不可用）。
+    delivery_expire_value: int = Field(default_factory=lambda: int(getattr(settings, "collectionDefaultExpireDays", 7) or 7))
     # 取件码过期配置
     retrieve_expire_style: str = "day"
-    retrieve_expire_value: int = 7
+    retrieve_expire_value: int = Field(default_factory=lambda: int(getattr(settings, "collectionDefaultExpireDays", 7) or 7))
     delivery_count: int = -1  # 最大投递次数，-1 表示不限
     # 向后兼容：旧字段自动转换
     expire_days: Optional[int] = None

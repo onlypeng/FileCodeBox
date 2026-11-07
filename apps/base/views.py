@@ -526,7 +526,11 @@ async def check_code_type(code: str, ip: str = Depends(ip_limit["error"])):
 
 @share_api.get("/select/")
 async def get_code_file(code: str, access_code: str = "", ip: str = Depends(ip_limit["error"])):
-    """GET 版取件，与 POST /share/select/ 等价（为兼容旧前端保留，新调用方请用 POST）。
+    """GET 版取件（兼容旧前端保留，新调用方请用 POST）。
+
+    与 POST 的差异刻意保留：文件分享返回文件流，纯文本分享返回与 POST 一致的
+    详情 JSON（正文在 text 字段）。早期版本对文本分享误走文件响应，导致返回
+    「文件已过期删除」，这里按内容形态分流修掉。
 
     **凭证**：取件码 + 可选的提取口令 `access_code`。
     **副作用**：真正取到内容才扣一次取件次数（count 模式）——口令校验在扣减之前，
@@ -573,6 +577,22 @@ async def get_code_file(code: str, access_code: str = "", ip: str = Depends(ip_l
 
     if not await update_file_usage(file_code):
         return APIResponse(code=410, detail="文件已过期")
+    # 纯文本分享：内容在 remark，没有物理文件。走 get_file_response 会因路径不存在
+    # 误报「文件已过期删除」，这里返回与 POST /share/select/ 相同的详情（正文在 text）。
+    if not file_code.file_path and file_code.remark:
+        return APIResponse(detail={
+            "code": file_code.code,
+            "name": file_code.prefix + file_code.suffix,
+            "size": file_code.size,
+            "text": file_code.remark,
+            "remark": file_code.remark,
+            "file_hash": file_code.file_hash or "",
+            "created_at": file_code.created_at.isoformat() if file_code.created_at else None,
+            "expired_at": file_code.expired_at.isoformat() if file_code.expired_at else None,
+            "expire_style": file_code.expire_style,
+            "expire_value": file_code.expire_value,
+            "expired_count": file_code.expired_count,
+        })
     return await file_storage.get_file_response(file_code)
 
 
@@ -824,6 +844,9 @@ async def download_file(key: str, code: str, ip: str = Depends(ip_limit["error"]
     为什么 token 没过期还要再查一次：token 自己有 TTL，但分享可能在 token 有效期内
     被取完次数或到点过期，只看 token 会让已失效的分享继续可下载。
     **文本分享**（无文件路径、内容在 remark）返回 text/plain，不走文件响应。
+    注意当前前端正常流程下文本正文已由 /share/select/ 的 `text` 字段内联返回，
+    不会再来这里（文本分享的 select 响应不含下载 URL/token），故此分支是面向
+    持有 select token 的兼容调用方保留的备用入口，不是主流程。
     **鉴权失败**：计入错误限流并写 `denied` 审计。
     """
     file_storage: FileStorageInterface = storages[settings.file_storage]()
@@ -879,6 +902,7 @@ async def init_chunk_upload(data: InitChunkUploadModel, ip: str = Depends(ip_lim
     **不参与任何鉴权或去重判定**——权威哈希一律由合并时服务端算（见 `_sha256_saved_file`
     与 `merge_chunks`）。
     """
+    _enforce_chunk_config(data.chunk_size)
     _validate_file_type(data.file_name)
     # 限制未完成会话总数，防止资源耗尽（对比 presign 的 50 个上限）
     total_active = await UploadChunk.filter(chunk_index=-1).count()
@@ -1707,6 +1731,28 @@ async def _require_access_code(file_code: FileCodes, raw: str, ip: str) -> None:
     )
 
 
+def _enforce_chunk_config(chunk_size: int) -> None:
+    """让后台的 enableChunk / uploadChunkSize 在服务端真正生效。
+
+    这两个配置过去只被前端 JS 读取，后端对分片上传请求照单全收，形成
+    「后台关了分片、API 仍能上传」「改了分片大小、服务端无感」的假生效。
+    在 init 阶段统一挡住：开关关闭直接拒绝；uploadChunkSize 作为**分片大小
+    上限**校验（允许客户端切得更小，但不允许超过配置值）。
+
+    刻意取上界而非「必须相等」：分片大小本质是性能建议值，强制相等会让
+    所有非浏览器调用方（curl / 旧前端 / 单测）在后台改一次配置后集体失效。
+    配置改小时，超过上限的新会话会被拒绝，刷新页面后前端按新值切片即恢复。
+    """
+    if not int(getattr(settings, "enableChunk", 0) or 0):
+        raise HTTPException(403, "服务端未开启分片上传")
+    max_chunk = int(getattr(settings, "uploadChunkSize", 5) or 5) * 1024 * 1024
+    if chunk_size <= 0 or chunk_size > max_chunk:
+        raise HTTPException(
+            400,
+            f"分片大小超出服务端配置上限（{max_chunk} 字节），请刷新页面后重试",
+        )
+
+
 def _expire_to_seconds(expire_style: str, expire_value: int) -> int:
     """将过期时间转换为秒数（count 模式返回 0，不限制时间）"""
     if expire_style == "day":
@@ -2030,6 +2076,7 @@ async def init_delivery_chunk_upload(
     ip: str = Depends(ip_limit["upload"]),
 ):
     """投递分片上传初始化：占位投递次数、创建上传会话与投递记录"""
+    _enforce_chunk_config(data.chunk_size)
     _validate_file_type(data.file_name)
     box = await _get_valid_delivery_box(data.delivery_code)
     uploader_name = (data.uploader_name or "").strip()[:50]

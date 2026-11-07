@@ -13,10 +13,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shlex
-from typing import Optional, Tuple
+from typing import Tuple
 
 from core.logger import logger
 from core.settings import settings

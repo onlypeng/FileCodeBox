@@ -397,18 +397,32 @@ async def get_config():
             "uploadSize": settings.uploadSize,
             "expireStyle": settings.expireStyle,
             "enableChunk": settings.enableChunk,
+            # 分片大小必须与服务端 _enforce_chunk_config 的上界口径一致：只下发
+            # enableChunk 而不下发它，前端会一直按本地默认 5MB 分片；管理员把
+            # 上限调小后，页面仍发送 5MB 分片，请求被服务端 400 拒绝且提示含糊。
+            "uploadChunkSize": int(getattr(settings, "uploadChunkSize", 5) or 5),
             "openUpload": settings.openUpload,
             "notify_title": settings.notify_title,
             "notify_content": settings.notify_content,
             "show_admin_address": settings.showAdminAddr,
             "expiredRetentionStyle": getattr(settings, "expiredRetentionStyle", "day"),
             "expiredRetentionValue": getattr(settings, "expiredRetentionValue", 1),
-            "maxMultiFileCount": getattr(settings, "maxMultiFileCount", 20),
+            # 数量上限统一口径：前端与后端都以 maxSendFiles 为准。过去
+            # maxMultiFileCount 单独下发，管理员改了其中一个就会出现
+            # 「前端挡住 / 后端放行」的错位，这里直接回传同一个值。
+            "maxMultiFileCount": getattr(settings, "maxSendFiles", 20),
             "maxCollectionFiles": getattr(settings, "maxCollectionFiles", 100),
             "maxSendFiles": getattr(settings, "maxSendFiles", 20),
+            # 收件箱创建页默认值：后台可配，普通访客页面必须也能拿到
+            "collectionDefaultMaxFiles": int(getattr(settings, "collectionDefaultMaxFiles", 20) or 20),
+            "collectionDefaultExpireDays": int(getattr(settings, "collectionDefaultExpireDays", 7) or 7),
             "maxTextLength": getattr(settings, "maxTextLength", 200000),
             "directRelayEnabled": getattr(settings, "directRelayEnabled", 1),
             "directRelaySpeedLimit": getattr(settings, "directRelaySpeedLimit", 0),
+            # 房间中继分片/单文件上限由浏览器 JS 消费，但必须随公共配置下发，
+            # 否则后台改了只有 config/get 显示已保存、页面仍用本地默认值
+            "directRelayChunkSize": int(getattr(settings, "directRelayChunkSize", 64) or 64),
+            "directMaxRelaySize": int(getattr(settings, "directMaxRelaySize", 0) or 0),
             "mediaDefaultQuality": getattr(settings, "mediaDefaultQuality", "auto"),
             "defaultMaxMembers": getattr(settings, "defaultMaxMembers", 10),
             # 公共接口不暴露 TURN 凭据（username/credential），仅公开 urls；

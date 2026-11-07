@@ -150,6 +150,12 @@ class ConfigService:
         for key in SENSITIVE_KEYS:
             if key in config and config[key]:
                 config[key] = "******"
+        # admin_token 不在 SENSITIVE_KEYS（它是口令哈希、不是可解密凭据），
+        # 但哈希同样不应回给管理端配置表单，单独按占位符掩盖。
+        # 不能把它塞进 SENSITIVE_KEYS：那会让明文口令在 update_config 里被
+        # encrypt_value 当成凭据加密，登录就再也验不过了。
+        if config.get("admin_token"):
+            config["admin_token"] = "******"
         return config
 
     async def update_config(self, data: dict):
@@ -179,6 +185,15 @@ class ConfigService:
         config_record = await KeyValue.filter(key="settings").first()
         existing_config = config_record.value if config_record and config_record.value else {}
 
+        # 文件数量上限统一口径：maxMultiFileCount 与 maxSendFiles 指的是同一件事，
+        # 服务端真正读取的是 maxSendFiles（POST / 也只回传它）。后台表单「保存设置」
+        # 是整份配置回传，两个键会同时出现；若值不同必须强制以 maxSendFiles 为准，
+        # 否则 config/get 会显示两个不同的数，形成「保存成功但值不一致」的误导。
+        if "maxSendFiles" in data:
+            data["maxMultiFileCount"] = data["maxSendFiles"]
+        elif "maxMultiFileCount" in data:
+            data["maxSendFiles"] = data["maxMultiFileCount"]
+
         # 管理员密码：留空或占位符表示不修改（防止误操作改坏密码）
         admin_token = data.get("admin_token")
         if admin_token is None or str(admin_token).strip() == "" or admin_token == "******":
@@ -186,6 +201,9 @@ class ConfigService:
         elif not is_password_hashed(admin_token):
             data["admin_token"] = hash_password(admin_token)
 
+        # 先记录需要在循环后删除的键：迭代过程中直接 pop 会触发
+        # RuntimeError: dictionary changed size during iteration。
+        drop_keys = []
         for key, value in data.items():
             if key not in settings.default_config:
                 continue
@@ -194,7 +212,7 @@ class ConfigService:
                 if key in existing_config:
                     data[key] = existing_config[key]
                 else:
-                    data.pop(key, None)
+                    drop_keys.append(key)
                 continue
             # 加密敏感字段（跳过已加密值）
             if key in SENSITIVE_KEYS and isinstance(value, str) and value and not is_encrypted(value):
@@ -204,6 +222,7 @@ class ConfigService:
                 "errorMinute",
                 "maxCollectionFiles",
                 "maxSendFiles",
+                "maxMultiFileCount",
                 "maxTextLength",
                 "onedrive_proxy",
                 "openUpload",
@@ -223,7 +242,7 @@ class ConfigService:
                 # 限速/配额/时长类配置不允许负数
                 if data[key] < 0 and key in {
                     "errorCount", "errorMinute", "maxCollectionFiles",
-                    "maxSendFiles", "maxTextLength", "uploadRateLimitCount", "uploadMinute",
+                    "maxSendFiles", "maxMultiFileCount", "maxTextLength", "uploadRateLimitCount", "uploadMinute",
                     "uploadSize", "directRelaySpeedLimit", "expiredRetentionValue",
                 }:
                     raise HTTPException(status_code=400, detail=f"配置项 {key} 不能为负数")
@@ -232,6 +251,9 @@ class ConfigService:
                     data[key] = float(value)
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail=f"配置项 {key} 必须是数字")
+
+        for key in drop_keys:
+            data.pop(key, None)
 
         await KeyValue.filter(key="settings").update(
             value={**existing_config, **{k: v for k, v in data.items() if k in settings.default_config}}
