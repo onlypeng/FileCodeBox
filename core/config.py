@@ -50,13 +50,16 @@ async def refresh_settings() -> None:
     敏感值只在形式符合（SENSITIVE_KEYS 且带 enc:/fe: 前缀）时才解密，
     解密失败会保留原值并告警 —— 宁可配置不生效，也不要让登录/存储整体不可用。
     """
-    from core.utils import decrypt_value, SENSITIVE_KEYS
+    from core.utils import decrypt_value, is_encrypted, SENSITIVE_KEYS
     config_record = await KeyValue.filter(key="settings").first()
     raw_config = config_record.value if config_record and config_record.value else {}
     # 解密敏感字段
     settings.user_config = {}
     for k, v in raw_config.items():
-        if k in SENSITIVE_KEYS and isinstance(v, str) and v.startswith("enc:"):
+        # encrypt_value() 产出的是 fe: 前缀（旧实例才可能残留 enc:），两者都要解密。
+        # 只判 enc: 会把新密文当成明文灌进运行时：管理员保存对象存储/网盘密钥后，
+        # 下一次配置刷新（启动 / 每 5 秒中间件 / 定时任务）凭据即失效。
+        if k in SENSITIVE_KEYS and isinstance(v, str) and is_encrypted(v):
             settings.user_config[k] = decrypt_value(v)
         else:
             settings.user_config[k] = v

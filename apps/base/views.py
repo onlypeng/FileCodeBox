@@ -105,7 +105,7 @@ from core.room_cache import (
     verify_download,
 )
 from core.room_token import issue_member_token, verify_member_token
-from core.file_dedup import find_duplicate_file, is_file_referenced_elsewhere
+from core.file_dedup import find_duplicate_file, delete_physical_files
 from core.audit import record
 from core.storage import storages, FileStorageInterface, create_zip_stream
 from core.utils import (
@@ -818,13 +818,7 @@ async def revoke_file(data: RevokeFileModel, ip: str = Depends(ip_limit["error"]
         raise HTTPException(status_code=403, detail="凭证无效，无法撤销该分享")
 
     file_storage: FileStorageInterface = storages[settings.file_storage]()
-    if not await is_file_referenced_elsewhere(file_code.file_path, file_code.uuid_file_name, file_code.id):
-        try:
-            await file_storage.delete_file(file_code)
-        except Exception as e:
-            logger.error(f"撤销分享时删除文件失败 code={code}: {e}")
-    else:
-        logger.info(f"撤销分享：文件仍被其它记录引用，仅删除记录 code={code}")
+    await delete_physical_files(file_storage, file_code, logger)
 
     await FileItem.filter(file_code=file_code).delete()
     await file_code.delete()
@@ -1812,7 +1806,9 @@ def _calculate_expired_at(expire_style: str, expire_value: int, base_time: datet
         "count": timedelta(days=365),  # count 模式给较长过期时间
     }
     delta = delta_map.get(expire_style, timedelta(days=7))
-    return base_time + delta * expire_value
+    # count 模式按 365 天兜底，负数会算出「365 天前」让子码立即过期；
+    # 统一按至少 1 次处理，避免非法值把有效期算穿。
+    return base_time + delta * (max(1, expire_value) if expire_style == "count" else expire_value)
 
 
 async def _get_unique_code(model_class, field_name: str, length: int = 0) -> str:
@@ -2822,7 +2818,8 @@ async def _create_room(data: CreateRoomRequest, ip: str) -> Room:
         expire_value=data.expire_value,
         # count 模式：不限制时间，按"房间从有人变为无人"计次（expire_value 次）
         expired_at=None if is_count else _calculate_expired_at(data.expire_style, data.expire_value, await get_now()),
-        expired_count=data.expire_value if is_count else -1,
+        # count 模式钳到至少 1 次：负数会让 is_expired() 立刻判过期，0 则立即失效
+        expired_count=max(1, data.expire_value) if is_count else -1,
         save_messages=1 if data.save_messages else 0,
         cache_enabled=1 if data.cache_enabled else 0,
     )

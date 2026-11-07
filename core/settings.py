@@ -83,6 +83,9 @@ DEFAULT_CONFIG = {
     # 上传分片大小（单位 MB，默认 5）。仅当 enableChunk=1（发送页/投递页分片上传开启）时生效；
     # 前端按此大小把文件切成若干片断点续传，后端按声明值校验并（S3 后端）流式 multipart 合并。
     "uploadChunkSize": 5,
+    # 未完成分片会话的回收时长（小时）：会话哨兵 created_at 超过该时长即视为放弃，
+    # 由 clean_incomplete_uploads 清理。曾硬编码 24，现登记为后台可配（>=1）。
+    "chunkExpireHours": 24,
     "webdav_url": "",
     "webdav_password": "",
     "webdav_username": "",

@@ -49,7 +49,7 @@ from core.config import refresh_settings
 from core.settings import settings, data_root
 from core.room_cache import delete_room_dir, delete_room_file, sweep_incoming
 from core.db_compat import db_type
-from core.file_dedup import is_file_referenced_elsewhere
+from core.file_dedup import delete_physical_files
 from core.storage import FileStorageInterface, storages
 from core.utils import get_now
 from core.websocket import ws_manager
@@ -133,20 +133,15 @@ async def delete_expire_files():
                 )
             ).all()
             for exp in expire_data:
+                # retention=None 表示「不自动清理」（forever / 无效配置），整轮跳过。
+                # 不能写成 `retention is not None and ...`：那样 None 会落到删除分支，
+                # 与「永久保留」语义完全相反，造成不可逆数据丢失。
+                if retention is None:
+                    break
                 expired_point = await _expired_point(exp)
-                if retention is not None and expired_point is not None and expired_point + retention > now:
+                if expired_point is not None and expired_point + retention > now:
                     continue
-                try:
-                    # 秒传会让多条记录共享同一份物理文件，删除前必须确认
-                    # 没有别的记录还在引用它，否则会连带删掉别人的文件
-                    if not await is_file_referenced_elsewhere(
-                        exp.file_path, exp.uuid_file_name, exp.id
-                    ):
-                        await file_storage.delete_file(exp)
-                    else:
-                        logger.info(f"文件仍被其它记录引用，仅删除记录: code={exp.code}")
-                except Exception as e:
-                    logger.error(f"删除过期文件失败 code={exp.code}: {e}")
+                await delete_physical_files(file_storage, exp, logger)
                 try:
                     await exp.delete()
                 except Exception as e:
@@ -161,10 +156,10 @@ async def clean_incomplete_uploads():
     """清理"上传没走完"的分片会话。
 
     判定依据：`UploadChunk` 里 chunk_index=-1 的那条是会话哨兵记录，
-    它的 created_at 超过 `chunk_expire_hours`（默认 24h）即认为用户放弃了。
-    注意 `chunk_expire_hours` 未在 core/settings.py 的 DEFAULT_CONFIG 登记，
-    后台因此既不能展示也不能保存它（apps/admin 侧只落库已登记的配置键），
-    当前实际恒为 24 小时。要把它变成可配，得先在 DEFAULT_CONFIG 补一行。
+    它的 created_at 超过 `chunkExpireHours`（默认 24 小时，后台可配）即认为用户放弃了。
+    该键已登记在 core/settings.py 的 DEFAULT_CONFIG，经 UpdateConfigRequest 白名单
+    落库，后台「系统设置 → 上传」可调整；读取点再钳一次下界，防止非法值把哨兵
+    当成刚创建而永远不回收。
 
     顺序是先删存储实体、再删库记录：反过来的话一旦删库后清理存储失败，
     分片文件就成了没人回收的孤儿。
@@ -173,7 +168,7 @@ async def clean_incomplete_uploads():
         try:
             await refresh_settings()
             file_storage: FileStorageInterface = storages[settings.file_storage]()
-            expire_hours = getattr(settings, "chunk_expire_hours", 24)
+            expire_hours = max(1, int(getattr(settings, "chunkExpireHours", 24) or 24))
             now = await get_now()
             expire_time = now - datetime.timedelta(hours=expire_hours)
             expired_sessions = await UploadChunk.filter(
@@ -316,16 +311,7 @@ async def _delete_collection_with_files(box) -> None:
         if cf.file_code_id:
             file_code = await FileCodes.filter(id=cf.file_code_id).first()
             if file_code:
-                try:
-                    # 同上：共享文件需先确认无其它记录引用
-                    if not await is_file_referenced_elsewhere(
-                        file_code.file_path, file_code.uuid_file_name, file_code.id
-                    ):
-                        await file_storage.delete_file(file_code)
-                    else:
-                        logger.info(f"文件仍被其它记录引用，仅删除记录: code={file_code.code}")
-                except Exception as e:
-                    logger.error(f"删除收件箱文件失败 code={file_code.code}: {e}")
+                await delete_physical_files(file_storage, file_code, logger)
                 try:
                     await file_code.delete()
                 except Exception as e:
@@ -348,10 +334,12 @@ async def clean_expired_rooms():
             for room in rooms:
                 if not await room.is_expired():
                     continue
-                if retention is not None:
-                    expired_point = await _expired_point(room)
-                    if expired_point is None or expired_point + retention > now:
-                        continue
+                # 与收件箱口径一致：None = 不自动清理，整轮跳过
+                if retention is None:
+                    break
+                expired_point = await _expired_point(room)
+                if expired_point is None or expired_point + retention > now:
+                    continue
                 await room.delete()
                 # 房间删除/过期：同步清理其保存的消息与缓存文件元信息
                 try:

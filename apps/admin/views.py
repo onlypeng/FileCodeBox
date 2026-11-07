@@ -45,7 +45,7 @@ from apps.admin.dependencies import (
 )
 from apps.admin.schemas import IDData, LoginData, UpdateConfigRequest, ExtendExpireRequest, UpdateFileRequest, UpdateRoomRequest
 from core.response import APIResponse
-from apps.base.models import FileCodes, KeyValue, CollectionBox, CollectionFile, Room, RoomMessage, RoomCachedFile, AuditLog
+from apps.base.models import FileCodes, FileItem, KeyValue, CollectionBox, CollectionFile, Room, RoomMessage, RoomCachedFile, AuditLog
 from apps.base.utils import ip_limit
 from tortoise.expressions import Q
 from tortoise.functions import Count, Sum
@@ -54,7 +54,7 @@ from core.room_cache import build_download_query, delete_room_file
 from core.quota import current_storage_usage
 from core.audit import record
 from core.netcheck import check_turn_servers
-from core.file_dedup import is_file_referenced_elsewhere
+from core.file_dedup import delete_physical_files
 from core.settings import settings, DEFAULT_CONFIG, BASE_DIR
 from core.utils import get_now, verify_password, pagination
 from core.logger import logger
@@ -314,6 +314,30 @@ async def _dashboard_stats():
     used_total = await FileCodes.all().annotate(total=Sum("used_count")).first()
     used_count = used_total.total if used_total else 0
 
+    # 秒传/文件柜去重节省：逻辑总量 = 所有分享声明的 size 之和；
+    # 物理总量 = 按 (目录, 文件名) 去重后的实际落盘大小之和。多文件分享的
+    # FileCodes.uuid_file_name 恒为 None，物理实体在 FileItem 里，两个来源都要统计。
+    # 单文件分享同时有 FileCodes 与 FileItem 两条描述，用 seen 去重避免重复计入。
+    seen_physical: set = set()
+    physical_bytes = 0
+    for row in await FileCodes.filter(uuid_file_name__isnull=False).values(
+        "file_path", "uuid_file_name", "size"
+    ):
+        key = (row["file_path"], row["uuid_file_name"])
+        if key in seen_physical:
+            continue
+        seen_physical.add(key)
+        physical_bytes += int(row["size"] or 0)
+    for row in await FileItem.all().values("storage_path", "uuid_file_name", "file_size"):
+        key = (row["storage_path"], row["uuid_file_name"])
+        if key in seen_physical:
+            continue
+        seen_physical.add(key)
+        physical_bytes += int(row["file_size"] or 0)
+    logical_bytes = int(total_stats.total_size or 0) if total_stats else 0
+    dedup_saved_bytes = max(0, logical_bytes - physical_bytes)
+    dedup_rate = round(dedup_saved_bytes * 100 / logical_bytes, 1) if logical_bytes else 0.0
+
     # 文件类型分布（Top 后缀）
     suffix_rows = (
         await FileCodes.exclude(suffix="")
@@ -402,6 +426,12 @@ async def _dashboard_stats():
             "storageQuotaPercent": storage_usage["percent"],
             "storageQuotaExceeded": storage_usage["exceeded"],
             "storageBreakdown": storage_usage["breakdown"],
+            # 秒传/文件柜去重节省（逻辑总量 vs 去重后物理总量）
+            "dedupLogicalBytes": logical_bytes,
+            "dedupPhysicalBytes": physical_bytes,
+            "dedupSavedBytes": dedup_saved_bytes,
+            "dedupRate": dedup_rate,
+            "dedupUniqueFiles": len(seen_physical),
             "topSuffixes": top_suffixes,
             "recentFiles": recent_files,
             "recentCollections": recent_collections,
@@ -792,14 +822,7 @@ async def delete_collection(collection_id: int):
             if file_code:
                 from core.storage import storages
                 file_storage = storages[settings.file_storage]()
-                try:
-                    # 共享文件需先确认无其它记录引用，避免连带删除
-                    if not await is_file_referenced_elsewhere(
-                        file_code.file_path, file_code.uuid_file_name, file_code.id
-                    ):
-                        await file_storage.delete_file(file_code)
-                except Exception:
-                    pass
+                await delete_physical_files(file_storage, file_code, logger)
                 await file_code.delete()
 
     await record("delete", target_type="collection", target_id=box.collection_code,

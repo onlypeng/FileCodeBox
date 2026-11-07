@@ -24,7 +24,7 @@
 from core.storage import FileStorageInterface, storages
 from core.settings import settings
 from core.config import _sync_ip_limits
-from core.file_dedup import is_file_referenced_elsewhere
+from core.file_dedup import delete_physical_files
 from core.audit import record
 from core.logger import logger
 from apps.base.models import FileCodes, KeyValue
@@ -52,14 +52,10 @@ class FileService:
         file_code = await FileCodes.filter(id=file_id).first()
         if not file_code:
             raise HTTPException(status_code=404, detail="文件不存在")
-        # 秒传会让多条记录共享同一份物理文件：仍有其它记录引用时只删记录，
-        # 否则会把别人的文件一起删掉（表现为下载 404）
-        if not await is_file_referenced_elsewhere(
-            file_code.file_path, file_code.uuid_file_name, file_code.id
-        ):
-            await self.file_storage.delete_file(file_code)
-        else:
-            logger.info(f"文件仍被其它记录引用，仅删除记录: code={file_code.code}")
+        # 物理文件删除统一收口：单文件按自身路径、多文件按 FileItem 逐项删除，
+        # 每个文件删前都查引用（秒传共享）。多文件记录 uuid_file_name 恒为 None，
+        # 旧路径判断会让物理文件永远留在磁盘上。
+        await delete_physical_files(self.file_storage, file_code, logger)
         await record("delete", target_type="filecode", target_id=str(file_code.code),
                      result="success", detail="后台删除文件", actor="admin")
         await file_code.delete()
@@ -234,6 +230,7 @@ class ConfigService:
                 "directRelayEnabled",
                 "directRelaySpeedLimit",
                 "expiredRetentionValue",
+                "chunkExpireHours",
             ]:
                 try:
                     data[key] = int(value)
@@ -244,8 +241,11 @@ class ConfigService:
                     "errorCount", "errorMinute", "maxCollectionFiles",
                     "maxSendFiles", "maxMultiFileCount", "maxTextLength", "uploadRateLimitCount", "uploadMinute",
                     "uploadSize", "directRelaySpeedLimit", "expiredRetentionValue",
+                    "chunkExpireHours",
                 }:
                     raise HTTPException(status_code=400, detail=f"配置项 {key} 不能为负数")
+                if key == "chunkExpireHours" and data[key] < 1:
+                    raise HTTPException(status_code=400, detail="分片会话回收时长不能小于 1 小时")
             elif key in ["opacity"]:
                 try:
                     data[key] = float(value)

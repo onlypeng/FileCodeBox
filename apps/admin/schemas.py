@@ -96,6 +96,8 @@ class UpdateConfigRequest(BaseModel):
     enableChunk: Optional[int] = None
     # 上传分片大小（MB，默认 5；仅 enableChunk=1 时生效）
     uploadChunkSize: Optional[int] = None
+    # 未完成分片会话回收时长（小时，>=1）
+    chunkExpireHours: Optional[int] = None
     webdav_url: Optional[str] = None
     webdav_password: Optional[str] = None
     webdav_username: Optional[str] = None

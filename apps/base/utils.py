@@ -96,7 +96,10 @@ async def get_expire_info(
         "hour": lambda: now + datetime.timedelta(hours=expire_value),
         "minute": lambda: now + datetime.timedelta(minutes=expire_value),
         # 按次模式：无时间上限（次数用尽前永久有效），is_expired 仅按剩余次数判断
-        "count": lambda: (None, expire_value),
+        # count 模式必须保证剩余次数为正：负数会让 expired_count=-1，
+        # 被 FileCodes.is_expired() 当成「时间型且 expired_at=None」→ 永不过期，
+        # 等于绕过次数配额。服务端强制钳制，不依赖客户端/Pydantic 契约。
+        "count": lambda: (None, max(1, int(expire_value or 1))),
         "forever": lambda: (None, None),
     }
 
