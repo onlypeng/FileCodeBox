@@ -47,7 +47,7 @@ from apps.base.models import FileCodes, UploadChunk, CollectionBox, CollectionFi
 from apps.base.utils import ip_limit, get_chunk_file_path_name
 from core.config import refresh_settings
 from core.settings import settings, data_root
-from core.room_cache import delete_room_dir, delete_room_file, sweep_incoming
+from core.room_cache import delete_room_dir, delete_room_file, sweep_incoming, delete_room_file_if_unreferenced
 from core.db_compat import db_type
 from core.file_dedup import delete_physical_files
 from core.storage import FileStorageInterface, storages
@@ -373,7 +373,12 @@ async def clean_expired_room_cache_files():
             expired = await RoomCachedFile.filter(expires_at__lt=now).all()
             for entry in expired:
                 if entry.storage_key:
-                    await delete_room_file(entry.storage_key)
+                    # 去重共享：删之前先确认没有其它条目/消息仍引用这份落盘文件，
+                    # 否则那些条目的下载会集体 404（见 core/room_cache 收口函数）。
+                    await delete_room_file_if_unreferenced(
+                        entry.room_code, entry.storage_key,
+                        exclude_cached_id=entry.id, exclude_transfer_id=entry.transfer_id,
+                    )
                 # 同步清空历史里同名文件消息的落盘标记：否则历史仍显示"可下载"，
                 # 实际文件已随本次清理删除，点击只会 404
                 await RoomMessage.filter(

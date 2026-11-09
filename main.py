@@ -299,7 +299,15 @@ async def refresh_settings_middleware(request, call_next):
 
 # 仍在使用默认管理员口令时，只放行"能改密码"所必需的后台接口，其余一律拒绝。
 # 目的：默认口令是公开常量，仅靠启动日志 warning 不足以阻止它长期留在线上。
-_PASSWORD_CHANGE_ALLOWLIST = ("/admin/login", "/admin/verify", "/admin/logout", "/admin/config")
+# 精确到 (方法, 路径)：此前用 startswith("/admin/config") 会把 /admin/config/get、
+# /admin/config/update 整段放行，默认口令登录后可读全量配置、改任意配置，
+# 等于绕过"必须先改密"。改密统一走新增的 POST /admin/password。
+_PASSWORD_CHANGE_ALLOWLIST = {
+    ("POST", "/admin/login"),
+    ("GET", "/admin/verify"),
+    ("POST", "/admin/logout"),
+    ("POST", "/admin/password"),
+}
 
 
 @app.middleware("http")
@@ -307,7 +315,7 @@ async def force_password_change_middleware(request, call_next):
     path = request.url.path or ""
     if not path.startswith("/admin/"):
         return await call_next(request)
-    if any(path.startswith(p) for p in _PASSWORD_CHANGE_ALLOWLIST):
+    if (request.method.upper(), path) in _PASSWORD_CHANGE_ALLOWLIST:
         return await call_next(request)
 
     if verify_password(str(DEFAULT_CONFIG.get("admin_token") or ""), settings.admin_token):
@@ -315,6 +323,21 @@ async def force_password_change_middleware(request, call_next):
             status_code=403,
             content={"code": 403, "message": "请先修改默认管理员密码", "detail": None},
         )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def audit_ip_middleware(request, call_next):
+    """把可信来源 IP 写入 contextvar，供 core.audit.record() 自动取用。
+
+    后台写操作此前几乎都不传 ip，审计里全是空值。解析口径必须和限流依赖一致
+    （apps/base/dependencies.resolve_client_ip），否则反代场景下审计记网关地址、
+    限流记真实 IP，两条日志对不上。
+    """
+    from core.audit import set_request_ip
+    from apps.base.dependencies import resolve_client_ip
+
+    set_request_ip(resolve_client_ip(request))
     return await call_next(request)
 
 

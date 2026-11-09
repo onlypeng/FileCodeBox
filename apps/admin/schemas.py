@@ -33,6 +33,18 @@ class LoginData(BaseModel):
     password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    """独立改密接口（POST /admin/password）的请求体。
+
+    与 UpdateConfigRequest 分开：改密是唯一在"仍用默认口令"状态下被允许的
+    高敏写操作，放进整份配置更新里会迫使中间件放行整个 /admin/config 前缀
+    （见 main.py 的 B1）。current_password 可选：强制改密弹窗只需新口令，
+    常规改密可额外校验旧口令。
+    """
+    password: str
+    current_password: Optional[str] = None
+
+
 class UpdateConfigRequest(BaseModel):
     """配置更新请求 —— **本身就是白名单**。
 

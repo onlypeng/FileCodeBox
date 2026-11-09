@@ -24,6 +24,33 @@ from core.settings import settings
 from core.utils import get_now
 
 
+def resolve_client_ip(request: Request) -> str:
+    """解析可信来源 IP：仅在 request.client 命中 trustedProxies 时采信转发头。
+
+    抽成模块级函数，让限流依赖与审计中间件共用同一口径——两处各自实现时，
+    反代场景下审计记网关地址、限流记真实 IP，排查时会对不上。
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    trusted_proxies = getattr(settings, "trustedProxies", "")
+    if trusted_proxies:
+        trusted_list = [ip.strip() for ip in trusted_proxies.split(",") if ip.strip()]
+        if client_ip in trusted_list:
+            # 仅信任来自可信代理的转发头
+            forwarded_for = request.headers.get("X-Forwarded-For")
+            if forwarded_for:
+                # 取从右往左第一个非可信代理的 IP
+                ips = [ip.strip() for ip in forwarded_for.split(",")]
+                for ip in reversed(ips):
+                    if ip not in trusted_list:
+                        client_ip = ip
+                        break
+            else:
+                real_ip = request.headers.get("X-Real-IP")
+                if real_ip:
+                    client_ip = real_ip.strip()
+    return client_ip
+
+
 class IPRateLimit:
     """IP 限流：计数持久化到数据库（多 worker 共享，进程内不再各自计数）
 
@@ -89,25 +116,8 @@ class IPRateLimit:
         超限抛 423（Locked）而非 429：前端按 423 展示"请求次数过多，请稍后再试"，
         改状态码会破坏既有前端分支。
         """
-        # 获取客户端真实IP，防止伪造
-        client_ip = request.client.host if request.client else "unknown"
-        trusted_proxies = getattr(settings, "trustedProxies", "")
-        if trusted_proxies:
-            trusted_list = [ip.strip() for ip in trusted_proxies.split(",") if ip.strip()]
-            if client_ip in trusted_list:
-                # 仅信任来自可信代理的转发头
-                forwarded_for = request.headers.get("X-Forwarded-For")
-                if forwarded_for:
-                    # 取第一个非可信代理的IP
-                    ips = [ip.strip() for ip in forwarded_for.split(",")]
-                    for ip in reversed(ips):
-                        if ip not in trusted_list:
-                            client_ip = ip
-                            break
-                else:
-                    real_ip = request.headers.get("X-Real-IP")
-                    if real_ip:
-                        client_ip = real_ip.strip()
+        # 获取客户端真实IP，防止伪造（口径与审计中间件共用 resolve_client_ip）
+        client_ip = resolve_client_ip(request)
         if not await self.check_ip(client_ip):
             raise HTTPException(status_code=423, detail="请求次数过多，请稍后再试")
         return client_ip

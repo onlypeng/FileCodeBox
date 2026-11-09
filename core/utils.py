@@ -204,14 +204,18 @@ def is_password_hashed(password: str) -> bool:
            (password.startswith("sha256$") and len(password.split("$")) == 3)
 
 
-def pagination(page: int, size: int, max_size: int = 100) -> tuple[int, int]:
+def pagination(page: int, size: int, max_size: int = 100) -> tuple[int, int, int]:
     """
-    计算分页偏移（多接口共用，避免各处重复 (page-1)*size）。
+    计算分页参数（多接口共用，避免各处重复 (page-1)*size）。
+
+    返回 `(page, size, offset)`，**size 是钳制后的值**：调用方必须用返回的 size
+    去 `.limit()`，否则钳制只作用于 offset，`size=10000` 仍会一次性拖出上万行，
+    且 page/offset 与 limit 口径不一致会造成分页重叠/漏项。
     钳制非法输入：page/size 最小为 1，size 不超过 max_size。
     """
     page = max(1, int(page))
     size = min(max(1, int(size)), max_size)
-    return page, (page - 1) * size
+    return page, size, (page - 1) * size
 
 
 async def sanitize_filename(filename: str) -> str:

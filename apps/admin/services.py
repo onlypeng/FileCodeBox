@@ -73,7 +73,7 @@ class FileService:
         from core.utils import get_now, pagination
         from tortoise.expressions import Q
 
-        page, offset = pagination(page, size)
+        page, size, offset = pagination(page, size)
         now = await get_now()
         # 排除收件箱文件：用反向关联 JOIN 完成（collection_files 关联存在即排除），
         # 避免每次分页请求全表加载 CollectionFile 的 file_code_id 列表到内存

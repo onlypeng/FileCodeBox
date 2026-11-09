@@ -20,6 +20,7 @@ async def migrate():
         rows = await conn.execute_query_dict(
             "SELECT id, code, text FROM filecodes WHERE text IS NOT NULL AND text != ''"
         )
+        failed: list[str] = []
         if rows:
             # 用 settings.storage_path 拼接（与后端一致）；取默认 data 目录
             from core.settings import settings, data_root
@@ -34,13 +35,25 @@ async def migrate():
                     fpath.write_text(row["text"] or "", encoding="utf-8")
                 except Exception as e:
                     logger.warning(f"Migration 020: 落盘文本 {row['code']} 失败: {e}")
+                    failed.append(str(row["code"]))
                     continue
                 rel = f"share/text/{fname}"
                 await conn.execute_query(
                     "UPDATE filecodes SET file_path = ?, uuid_file_name = ?, prefix = ?, suffix = ?, size = ? WHERE id = ?",
                     [rel, fname, "Text", ".txt", len(row["text"] or ""), row["id"]],
                 )
-            logger.info(f"Migration 020: 已落盘 {len(rows)} 条存量文本")
+            logger.info(f"Migration 020: 已落盘 {len(rows) - len(failed)} 条存量文本")
+        if failed:
+            # 关键：单行落盘失败时**不能** DROP COLUMN text。
+            # 旧写法只 continue 就无条件删列，那几行正文会随列一起消失且不可恢复。
+            # 这里抛异常让迁移不记账（execute_migrations 失败即不 INSERT migrates），
+            # 运维修复磁盘/权限后重启会整体重跑；已成功的行重复落盘是幂等的。
+            logger.error(
+                f"Migration 020: {len(failed)} 条文本落盘失败，保留 text 列待重跑: {failed[:10]}"
+            )
+            raise RuntimeError(
+                f"Migration 020: 文本落盘失败 {len(failed)} 条，已保留 text 列"
+            )
         # 2) 删除 text 列
         cols = await conn.execute_query_dict("PRAGMA table_info(filecodes)")
         if any(c["name"] == "text" for c in cols):

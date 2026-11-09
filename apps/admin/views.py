@@ -43,14 +43,14 @@ from apps.admin.dependencies import (
     get_file_service,
     get_config_service,
 )
-from apps.admin.schemas import IDData, LoginData, UpdateConfigRequest, ExtendExpireRequest, UpdateFileRequest, UpdateRoomRequest
+from apps.admin.schemas import IDData, LoginData, ChangePasswordRequest, UpdateConfigRequest, ExtendExpireRequest, UpdateFileRequest, UpdateRoomRequest
 from core.response import APIResponse
 from apps.base.models import FileCodes, FileItem, KeyValue, CollectionBox, CollectionFile, Room, RoomMessage, RoomCachedFile, AuditLog
 from apps.base.utils import ip_limit
 from tortoise.expressions import Q
 from tortoise.functions import Count, Sum
 from apps.admin.dependencies import create_token
-from core.room_cache import build_download_query, delete_room_file
+from core.room_cache import build_download_query, delete_room_file, delete_room_file_if_unreferenced
 from core.quota import current_storage_usage
 from core.audit import record
 from core.netcheck import check_turn_servers
@@ -143,6 +143,38 @@ async def logout():
     return APIResponse()
 
 
+@admin_api.post("/password")
+async def change_password(
+    data: ChangePasswordRequest,
+    ip: str = Depends(ip_limit["error"]),
+    config_service: ConfigService = Depends(get_config_service),
+):
+    """修改管理员口令（独立于整份配置更新的专用入口）。
+
+    权限：管理员（router 级 admin_required 校验 JWT）。默认口令状态下本路由是
+    中间件白名单里唯一放行的高敏写操作（见 main.py），因此强制改密弹窗走这里，
+    不必再放行 /admin/config/get 与 /admin/config/update —— 后者此前让默认口令
+    登录者能读全量配置、改任意配置，等于绕过"必须先改密"。
+
+    副作用：写库 + 热生效 + 写审计 `config_update`（不记口令明文）。
+    可选传 current_password 做二次校验；不传时以已登录的 JWT 为凭证。
+    """
+    password = (data.password or "").strip()
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="新密码至少 6 位")
+    if verify_password(password, settings.admin_token):
+        raise HTTPException(status_code=400, detail="新密码不能与当前密码相同")
+    if data.current_password is not None and not verify_password(
+        data.current_password, settings.admin_token
+    ):
+        await ip_limit["error"].add_ip(ip)
+        raise HTTPException(status_code=403, detail="当前密码不正确")
+    await config_service.update_config({"admin_token": password})
+    await record("config_update", target_type="admin", target_id="password",
+                 result="success", detail="修改管理员密码", ip=ip, actor="admin")
+    return APIResponse()
+
+
 @admin_api.get("/audit")
 async def audit_list(
     page: int = 1,
@@ -161,7 +193,7 @@ async def audit_list(
     审计保留期由 `auditLogRetentionDays` 控制（0 = 不清理），
     长期运行的实例务必设一个值，否则 audit_log 表无限增长。
     """
-    page, offset = pagination(page, size)
+    page, size, offset = pagination(page, size)
 
     qs = AuditLog.all()
     if action:
@@ -671,7 +703,11 @@ async def admin_delete_room_cache_file(file_id: int):
     room_code = entry.room_code
     transfer_id = entry.transfer_id
     if entry.storage_key:
-        await delete_room_file(entry.storage_key)
+        # 与成员侧删除同口径：去重共享的落盘文件必须查引用后再删
+        await delete_room_file_if_unreferenced(
+            room_code, entry.storage_key,
+            exclude_cached_id=entry.id, exclude_transfer_id=transfer_id,
+        )
     await entry.delete()
     # 同步清空历史里同名文件消息的落盘标记：否则历史仍显示"可下载"、点击却 404
     await RoomMessage.filter(
@@ -704,7 +740,7 @@ async def collection_list(
     返回的 `is_expired` / `is_delivery_expired` / `is_retrieve_expired`
     三者独立，前端需分别展示。
     """
-    page, offset = pagination(page, size)
+    page, size, offset = pagination(page, size)
     now = await get_now()
     query = CollectionBox.all().order_by("-created_at")
     if keyword:
@@ -845,7 +881,7 @@ async def room_list(
     `redisUrl` 时，这个数字只反映当前实例上的成员，不是全站在线人数
     （整站的口径见概览 `onlineRooms`，它按房间去重统计）。
     """
-    page, offset = pagination(page, size)
+    page, size, offset = pagination(page, size)
     keyword = keyword.strip()
     query = Room.all().order_by("-created_at")
     if keyword:
@@ -941,7 +977,10 @@ async def _apply_expire(obj, style: str, value: int, prefix: str = ""):
     now = await get_now()
 
     def get_expire(attr):
-        return getattr(obj, f"{prefix}{attr}") if prefix else getattr(obj, attr)
+        # 收件箱三个子码没有 *_expired_count 字段：直接 getattr 会 AttributeError/500。
+        # 取不到就按 None 处理，由调用方决定该模式是否受支持。
+        name = f"{prefix}{attr}" if prefix else attr
+        return getattr(obj, name, None)
 
     def set_expire(attr, val):
         if prefix:
@@ -956,6 +995,11 @@ async def _apply_expire(obj, style: str, value: int, prefix: str = ""):
         if not prefix:
             setattr(obj, "expired_count", -1)
     elif style == "count":
+        # 收件箱整箱有 expired_count，三个子码没有：模型不支持就明确拒绝，
+        # 不能静默走完（只写 expired_at=None 会让 is_delivery_expired() 把 count
+        # 当成"无到期时间"→ 永久有效）。
+        if prefix:
+            raise HTTPException(status_code=400, detail="收件箱投递码/取件码不支持按次数过期")
         cur = get_expire("expired_count")
         base = cur if (cur is not None and cur >= 0) else 0
         set_expire("expire_style", "count")
@@ -987,6 +1031,9 @@ async def _reset_expire(obj, style: str, value: int, prefix: str = ""):
     收件箱三码通过 prefix 区分；整箱（prefix=''）创建后不可改由调用方限制。"""
     from apps.base.utils import get_expire_info
 
+    # 与 _apply_expire 同口径：子码没有次数字段，count 只会写出"永不过期"的坏数据
+    if prefix and style == "count":
+        raise HTTPException(status_code=400, detail="收件箱投递码/取件码不支持按次数过期")
     expired_at, expired_count, _, _ = await get_expire_info(value, style)
     if prefix:
         setattr(obj, f"{prefix}expire_style", style)
@@ -1034,6 +1081,8 @@ async def collection_extend(collection_id: int, data: ExtendExpireRequest):
     target = data.target or "manage"
     if target not in ("manage", "deliver", "retrieve"):
         raise HTTPException(status_code=400, detail="不支持的过期目标")
+    if data.expire_style not in ("day", "hour", "minute", "count", "forever"):
+        raise HTTPException(status_code=400, detail="不支持的过期类型")
     if target == "deliver":
         prefix = "delivery_"
     elif target == "retrieve":
@@ -1057,6 +1106,8 @@ async def room_extend(room_id: int, data: ExtendExpireRequest):
     room = await Room.filter(id=room_id).first()
     if not room:
         raise HTTPException(status_code=404, detail="房间不存在")
+    if data.expire_style not in ("day", "hour", "minute", "count", "forever"):
+        raise HTTPException(status_code=400, detail="不支持的过期类型")
     await _apply_expire(room, data.expire_style, data.expire_value)
     await record("expire_update", target_type="room", target_id=room.room_code,
                  result="success", detail=f"延长房间过期({data.expire_style})", actor="admin")

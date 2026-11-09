@@ -192,6 +192,46 @@ def delete_room_dir(room_code: str) -> int:
     return removed
 
 
+async def delete_room_file_if_unreferenced(
+    room_code: str,
+    storage_key: str,
+    *,
+    exclude_cached_id: int | None = None,
+    exclude_transfer_id: str = "",
+) -> bool:
+    """仅当没有其它缓存条目/历史消息引用这份落盘文件时才删除。
+
+    房间缓存去重会让多条 RoomCachedFile（不同 transfer_id、相同内容）共用同一个
+    storage_key。删除单条时若直接 unlink，其它条目的下载会集体 404。
+    上传侧覆盖旧文件、成员删除、后台删除、过期清理四处都必须走这里收口。
+
+    排除项语义：被删条目自身（exclude_cached_id）以及随本次操作一起清空
+    storage_key 标记的同名消息（exclude_transfer_id）不算"仍被引用"。
+    """
+    # 延迟导入：core 层不直接依赖 apps.base.models，避免模块级循环
+    from apps.base.models import RoomCachedFile, RoomMessage
+
+    key = (storage_key or "").strip()
+    if not key:
+        return False
+
+    cached_qs = RoomCachedFile.filter(room_code=room_code, storage_key=key)
+    if exclude_cached_id is not None:
+        cached_qs = cached_qs.exclude(id=exclude_cached_id)
+    if await cached_qs.exists():
+        logger.info(f"房间缓存落盘仍被其它条目引用，保留: room={room_code} key={key}")
+        return False
+
+    message_qs = RoomMessage.filter(room_code=room_code, storage_key=key)
+    if exclude_transfer_id:
+        message_qs = message_qs.exclude(content=exclude_transfer_id)
+    if await message_qs.exists():
+        logger.info(f"房间缓存落盘仍被其它历史消息引用，保留: room={room_code} key={key}")
+        return False
+
+    return await delete_room_file(key)
+
+
 # ============ 下载签名 ============
 # 缓存文件下载此前仅凭"房间码 + transfer_id"即可永久访问。加短期签名后，
 # 链接默认 30 分钟有效，即便被转发/泄露也会很快失效。

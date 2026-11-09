@@ -103,6 +103,7 @@ from core.room_cache import (
     resolve_path,
     save_room_file,
     verify_download,
+    delete_room_file_if_unreferenced,
 )
 from core.room_token import issue_member_token, verify_member_token
 from core.file_dedup import find_duplicate_file, delete_physical_files
@@ -176,7 +177,7 @@ class FileUploadService:
         )
         prefix, suffix = os.path.splitext(file_name)
 
-        await FileCodes.create(
+        file_code = await FileCodes.create(
             code=code,
             prefix=prefix,
             suffix=suffix,
@@ -189,6 +190,16 @@ class FileUploadService:
             expire_style=expire_style,
             expire_value=expire_value,
             **extra_fields,
+        )
+        # 与 share_file / complete_upload 一致：单文件分享也建 FileItem，
+        # 否则预签名上传产出的分享无法打包下载 / 单项下载（两条路径都只查 FileItem）。
+        await FileItem.create(
+            file_code=file_code,
+            file_name=file_name,
+            file_size=file_size,
+            storage_path=file_path,
+            uuid_file_name=file_name,
+            sort_order=0,
         )
         return code
 
@@ -464,11 +475,52 @@ async def update_file_usage(file_code: FileCodes) -> bool:
             expired_count=F("expired_count") - 1,
             used_count=F("used_count") + 1,
         )
-        return updated > 0
+        if updated <= 0:
+            return False
+        # 次数刚好扣到 0：记下真实耗尽时刻，供过期保留宽限从耗尽点起算
+        # （core/tasks.py:_expired_point 不再回退 created_at）。
+        # is_expired() 仍只看 expired_count，写 expired_at 不改变过期判定语义。
+        if file_code.expired_count == 1:
+            await FileCodes.filter(id=file_code.id).update(expired_at=await get_now())
+        return True
     await FileCodes.filter(id=file_code.id).update(
         used_count=F("used_count") + 1
     )
     return True
+
+
+# count 模式最后一次取件后仍允许下载的时间窗口（秒）。
+# 取件 token 自身 24h 有效，不能用它兜底：耗尽前签发的旧 token 会在这个窗口里
+# 被反复拖取，所以单独设一个紧贴"最后一次取件"的短窗口。
+_LAST_RETRIEVE_WINDOW = 3600
+
+
+def _token_issued_at(key: str) -> int:
+    """从 3 段式 select token 取签发时间戳；旧 2 段格式（存量链接）返回 0。
+
+    旧格式没有时间戳，无法判定是否伴随本次取件签发，一律按 0 处理（保守拒绝）。
+    """
+    parts = (key or "").split(".")
+    if len(parts) == 3:
+        try:
+            return int(parts[2])
+        except ValueError:
+            return 0
+    return 0
+
+
+def _count_exhausted_download_allowed(file_code: FileCodes, key: str) -> bool:
+    """次数耗尽后是否仍允许本次下载（修复"最后一次取件必然 410"）。
+
+    count 模式的额度在 select 阶段原子扣减，最后一次取件扣到 0 时，下载链接是
+    随这次取件一起签发的。若下载阶段再用"当前剩余次数"拒绝，阅后即焚（N=1）
+    永远拿不到文件、N 次实际只能下 N-1 次。这里只放行伴随最后一次取件新签发的
+    token：用时钟窗口而非库字段比对，避开 naive/aware datetime 在不同部署时区
+    下的换算偏差，也不改动既有 token 契约（存量链接仍兼容）。
+    """
+    issued = _token_issued_at(key)
+    elapsed = time.time() - issued if issued else float("inf")
+    return 0 <= elapsed <= _LAST_RETRIEVE_WINDOW
 
 
 @share_api.get("/check_code/")
@@ -486,9 +538,12 @@ async def check_code_type(code: str, ip: str = Depends(ip_limit["error"])):
     而把过期码也说成不存在，反而会让用户以为自己记错了码。
     """
     code = _validate_code(code)
-    # 先检查是否为普通文件码
-    has, file_code = await get_code_file_by_code(code)
+    # 先检查是否为普通文件码：用 check=False 拿记录，自己区分"不存在"与"已过期"。
+    # 过期码不计入失败限流，且如实回 expired=True（见本函数 docstring 防枚举约定）。
+    has, file_code = await get_code_file_by_code(code, False)
     if has:
+        if await file_code.is_expired():
+            return APIResponse(detail={"type": "file", "code": code, "expired": True})
         return APIResponse(detail={"type": "file", "code": code})
 
     # 检查是否为收件箱管理码
@@ -541,12 +596,15 @@ async def get_code_file(code: str, access_code: str = "", ip: str = Depends(ip_l
     **幂等性**：不幂等——每次调用都扣一次次数，反复刷新会烧额度。
     """
     file_storage: FileStorageInterface = storages[settings.file_storage]()
-    has, file_code = await get_code_file_by_code(code)
+    has, file_code = await get_code_file_by_code(code, False)
     if not has:
         await ip_limit["error"].add_ip(ip)
         return APIResponse(code=404, detail=file_code)
 
     assert isinstance(file_code, FileCodes)
+    # 命中但已过期：回 410 而不是 404，且不计入失败限流（防枚举只针对"码不存在"）
+    if await file_code.is_expired():
+        return APIResponse(code=410, detail="文件已过期")
 
     # 二次口令：未通过则不进入任何"消耗次数/返回内容"的分支
     await _require_access_code(file_code, access_code, ip)
@@ -611,7 +669,7 @@ async def get_file_info(
     否则只回"需要口令"与过期状态 —— 否则知道取件码就能把文件名/大小探出来。
     """
     code = _validate_code(code)
-    has, file_code = await get_code_file_by_code(code)
+    has, file_code = await get_code_file_by_code(code, False)
     if not has:
         await ip_limit["error"].add_ip(ip)
         return APIResponse(code=404, detail=file_code)
@@ -631,12 +689,8 @@ async def get_file_info(
         or await _verify_access_code(file_code, access_code)
     )
 
-    # 次数模式次数用尽 / 时间型已过期
-    if file_code.expired_count == 0 or (
-        file_code.expired_count < 0
-        and file_code.expired_at is not None
-        and file_code.expired_at < await get_now()
-    ):
+    # 与模型 is_expired() 口径统一：次数用尽 / 时间到期都回 410
+    if await file_code.is_expired():
         return APIResponse(code=410, detail="文件已过期")
 
     if not access_ok:
@@ -725,12 +779,15 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
     """
     data.code = _validate_code(data.code)
     file_storage: FileStorageInterface = storages[settings.file_storage]()
-    has, file_code = await get_code_file_by_code(data.code)
+    has, file_code = await get_code_file_by_code(data.code, False)
     if not has:
         await ip_limit["error"].add_ip(ip)
         return APIResponse(code=404, detail=file_code)
 
     assert isinstance(file_code, FileCodes)
+    # 命中但已过期：回 410，不消耗次数、不计入失败限流
+    if await file_code.is_expired():
+        return APIResponse(code=410, detail="文件已过期")
 
     # 二次口令：口令未通过时不扣取件次数、也不下发任何文件信息
     await _require_access_code(file_code, data.access_code, ip)
@@ -851,15 +908,19 @@ async def download_file(key: str, code: str, ip: str = Depends(ip_limit["error"]
         raise HTTPException(status_code=403, detail="下载鉴权失败")
     # 取件次数（count 模式）在 select 阶段已扣减，此处不重复扣减；
     # token 自带有效期（SELECT_TOKEN_TTL），超窗后需重新取件。故此处仅校验：
-    # - 次数型（count）：次数已用尽（expired_count <= 0）即使 token 未过期也拒绝
+    # - 次数型（count）：额度已随 select 扣完，只放行"伴随最后一次取件签发的 token"
+    #   （见 _count_exhausted_download_allowed），否则阅后即焚永远拿不到文件
     # - 时间型（day/hour/minute）：expired_at 到期拒绝
     has, file_code = await get_code_file_by_code(code, False)
     if not has:
         return APIResponse(code=404, detail="文件不存在")
     assert isinstance(file_code, FileCodes)
-    # expired_count >= 0 才是"按次数"模式（时间/永久模式存 -1），等于 0 即次数耗尽
+    # expired_count >= 0 才是"按次数"模式（时间/永久模式存 -1），等于 0 即次数耗尽。
+    # 但额度是 select 阶段原子扣掉的：最后一次取件扣到 0 时，下载链接是随这次
+    # 取件一起签发的，这里再按"当前剩余次数"拒绝会让阅后即焚永远拿不到文件。
     if file_code.expired_count >= 0 and file_code.expired_count <= 0:
-        raise HTTPException(status_code=410, detail="文件已过期")
+        if not _count_exhausted_download_allowed(file_code, key):
+            raise HTTPException(status_code=410, detail="文件已过期")
     if (
         file_code.expired_at is not None
         and file_code.expired_count < 0
@@ -1223,7 +1284,7 @@ async def complete_upload(
         else:
             await _scan_guard(f"{reuse_path}/{reuse_name}", allow_delete=False)
         owner_token = _new_owner_token()
-        await FileCodes.create(
+        file_code = await FileCodes.create(
             code=code,
             file_hash=file_hash,  # 使用合并后计算的哈希
             is_chunked=True,
@@ -1241,6 +1302,16 @@ async def complete_upload(
             expire_value=data.expire_value,
             owner_token=owner_token,
             access_code_hash=access_code_hash,
+        )
+        # 分片合并出的单文件分享同样要建 FileItem：/zip/{code} 与
+        # /download/item/{id} 只查 FileItem，缺了这条记录整包/单项下载必 404。
+        await FileItem.create(
+            file_code=file_code,
+            file_name=chunk_info.file_name,
+            file_size=chunk_info.file_size,
+            storage_path=reuse_path,
+            uuid_file_name=reuse_name,
+            sort_order=0,
         )
         # 清理临时文件
         await storage.clean_chunks(upload_id, save_path)
@@ -1611,15 +1682,16 @@ async def download_zip(code: str, key: str = "", ip: str = Depends(ip_limit["err
 
     **流式**：zip 不落盘，边打包边发——为大分享再占一份磁盘不划算。
     """
-    has, file_code = await get_code_file_by_code(code)
+    has, file_code = await get_code_file_by_code(code, False)
     if not has:
         await ip_limit["error"].add_ip(ip)
-        # 区分"不存在"和"已过期"
-        if isinstance(file_code, str) and "过期" in file_code:
-            raise HTTPException(410, file_code)
         raise HTTPException(404, "文件不存在")
 
     assert isinstance(file_code, FileCodes)
+    # 打包下载不扣次数（见 docstring）：select 阶段扣完最后一次额度后 zip 仍应可用，
+    # 否则 expire_value=1 的分享连整包都拿不到。只拒绝"时间到期"。
+    if file_code.expired_count < 0 and await file_code.is_expired():
+        raise HTTPException(410, "文件已过期")
 
     # 二次口令保护的分享：打包入口同样要 token，否则知道码即可整包拖走
     if file_code.access_code_hash and not await verify_select_token(key, file_code.code):
@@ -1846,6 +1918,10 @@ async def create_collection(data: CreateCollectionRequest, ip: str = Depends(ip_
         raise HTTPException(400, "最大文件数不能小于1")
     if data.max_files > max_collection_files:
         raise HTTPException(400, f"最大文件数不能超过{max_collection_files}")
+    # 投递次数上限：-1 表示不限，>=1 表示限量。0 没有明确语义（既不是"不限"
+    # 也不是"禁止投递"），直接拒绝，避免 _reserve_delivery_slot 把它当不限处理。
+    if data.delivery_count == 0 or data.delivery_count < -1:
+        raise HTTPException(400, "投递次数上限须为 -1（不限）或正整数")
 
     # 校验过期时间类型
     if data.expire_style not in settings.expireStyle:
@@ -1905,6 +1981,9 @@ async def create_collection(data: CreateCollectionRequest, ip: str = Depends(ip_
         retrieve_expired_at=retrieve_expired_at,
         creator_ip=ip,
         creator_name="匿名",
+        # 此前创建时漏传：模型默认 -1（不限），导致请求里的 delivery_count
+        # 恒被忽略、_reserve_delivery_slot 永不生效。
+        delivery_count=data.delivery_count,
     )
 
     await ip_limit["upload"].add_ip(ip)
@@ -3295,19 +3374,11 @@ async def upload_room_cache_file(
             # 让那些条目的下载变成 404「缓存文件已丢失」。
             old_key = (entry.storage_key or "").strip()
             if old_key and old_key != storage_key:
-                others = await RoomCachedFile.filter(
-                    room_code=room.room_code, storage_key=old_key
-                ).exclude(id=entry.id).exists()
-                if not others:
-                    others = await RoomMessage.filter(
-                        room_code=room.room_code, storage_key=old_key
-                    ).exclude(content=tid).exists()
-                if not others:
-                    await delete_room_file(old_key)
-                else:
-                    logger.info(
-                        f"旧落盘文件仍被其他条目引用，保留: code={room.room_code} key={old_key}"
-                    )
+                # 与成员删除 / 后台删除 / 过期清理共用同一份引用检查口径
+                await delete_room_file_if_unreferenced(
+                    room.room_code, old_key,
+                    exclude_cached_id=entry.id, exclude_transfer_id=tid,
+                )
             entry.storage_key = storage_key
             entry.file_name = (file.filename or "")[:255]
             entry.file_size = size
@@ -3487,7 +3558,12 @@ async def delete_room_cache_file(room_code: str, transfer_id: str, client_id: st
         raise HTTPException(status_code=403, detail="只有上传者可以删除该文件")
 
     if entry.storage_key:
-        await delete_room_file(entry.storage_key)
+        # 去重让多条缓存条目共享同一份落盘文件：删之前必须查引用，否则其它条目
+        # 的下载会集体 404。统一走 core.room_cache 的收口函数。
+        await delete_room_file_if_unreferenced(
+            room.room_code, entry.storage_key,
+            exclude_cached_id=entry.id, exclude_transfer_id=transfer_id,
+        )
     await entry.delete()
 
     # 同步清空历史里同名文件消息的落盘标记：否则历史仍显示"可下载"，点击却 404
