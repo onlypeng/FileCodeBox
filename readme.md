@@ -232,6 +232,20 @@ location / {
 
 容器默认只信任回环地址的转发头（`--forwarded-allow-ips "127.0.0.1"`）。部署在反代之后时，需把代理地址加入白名单，并在后台配置 `trustedProxies`，否则 IP 限流拿到的是网关地址。
 
+### CDN / 边缘加速不转发 WebSocket 时
+
+实时房间与收件箱推送走 `wss://.../ws/...`。若这一跳前面挂了不支持 WebSocket 的 CDN
+（例如阿里云 ESA 免费套餐自 2026-01-08 起不再提供 WebSocket），握手会被当成普通 HTTP
+请求返回 `404 {"code":404,"message":"接口不存在"}`，页面表现为反复重连失败。
+
+此时不用重新构建镜像：在后台「系统设置 → WebSocket 独立接入地址」填一个**直连源站、
+不经过 CDN** 的地址，如 `wss://ws.example.com` 或裸域名 `ws.example.com:12345`。
+HTTP 请求仍走原站点，只有 WebSocket 改走该地址；留空恢复同源。
+该值运行时随公共配置下发，改完刷新页面即生效。
+
+可用 `.workbuddy/check_ws_proxy.py --host <域名> --code <房间码>` 自检：
+返回 `101` 表示握手正常，返回 `404` 表示 Upgrade 头没到达后端。
+
 ---
 
 ## 使用指南

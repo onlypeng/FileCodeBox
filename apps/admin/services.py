@@ -203,6 +203,21 @@ class ConfigService:
         for key, value in data.items():
             if key not in settings.default_config:
                 continue
+            # WebSocket 独立地址会下发给所有访客，填错一次会让全部房间/收件箱断连，
+            # 因此服务端强制收敛：去空白与尾斜杠、拦危险/未知协议、限长度。
+            if key == "wsBaseUrl":
+                raw_ws = str(value or "").strip().rstrip("/")
+                if raw_ws:
+                    low_ws = raw_ws.lower()
+                    if low_ws.startswith(("javascript:", "data:", "file:", "vbscript:")) or (
+                        "://" in raw_ws
+                        and not low_ws.startswith(("http://", "https://", "ws://", "wss://"))
+                    ):
+                        raise HTTPException(status_code=400, detail="WebSocket 地址协议不合法")
+                    if len(raw_ws) > 255:
+                        raise HTTPException(status_code=400, detail="WebSocket 地址过长")
+                data[key] = raw_ws
+                continue
             # 跳过脱敏占位符/空值：继承数据库中的真实凭据（空值表示不修改）
             if key in SENSITIVE_KEYS and (value == "******" or value == ""):
                 if key in existing_config:

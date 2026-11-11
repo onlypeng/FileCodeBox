@@ -128,8 +128,13 @@ DEFAULT_CONFIG = {
     # 共享域名：生成分享/取件链接（含下载直链、二维码、wget 命令）时使用的站点地址，
     # 形如 "https://share.example.com"，留空表示使用当前访问地址。
     # 适用于反向代理或内网部署时对外固定分享域名，避免链接带上内网地址。
-    # 注意：仅影响对外分享链接，API 请求与 WebSocket 仍连接实际访问地址。
+    # 注意：仅影响对外分享链接；API 请求仍走实际访问地址，
+    # WebSocket 若需绕过不转发 Upgrade 的 CDN/ESA，用下面的 wsBaseUrl 单独指定。
     "shareDomain": "",
+    # WebSocket 独立接入地址：房间/收件箱实时通道可直连源站，HTTP 仍走原站点。
+    # 支持 "wss://ws.example.com"、"https://..." 或裸域名；留空 = 与页面同源。
+    # 该值会随公共配置下发给所有访客，只填公开域名，不要带路径或密钥。
+    "wsBaseUrl": "",
     "trustedProxies": "",
     "cors_origins": "http://localhost:5173,http://127.0.0.1:5173",
     "directRelayEnabled": 1,

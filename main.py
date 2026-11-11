@@ -461,6 +461,8 @@ async def get_config():
             "spaTheme": getattr(settings, "spaTheme", "light"),
             # 共享域名：对外分享链接使用的站点地址（留空 = 前端回退到当前访问地址）
             "shareDomain": getattr(settings, "shareDomain", ""),
+            # WebSocket 独立接入地址（留空 = 同源）。CDN/ESA 不转发 Upgrade 时指向直连源站域名
+            "wsBaseUrl": getattr(settings, "wsBaseUrl", ""),
             # 房间文件服务器缓存：前端据此判断能否缓存、以及超限文件降级为纯 P2P
             "roomCacheEnabled": int(getattr(settings, "roomCacheEnabled", 1) or 0),
             "roomCacheMaxSize": int(getattr(settings, "roomCacheMaxSize", 0) or 0),

@@ -138,6 +138,8 @@ class UpdateConfigRequest(BaseModel):
     cors_origins: Optional[str] = None
     # 共享域名：对外分享链接使用的站点地址（留空 = 使用当前访问地址）
     shareDomain: Optional[str] = None
+    # WebSocket 独立接入地址（留空 = 同源）。CDN/ESA 不转发 Upgrade 时指向直连源站域名
+    wsBaseUrl: Optional[str] = None
     mediaDefaultQuality: Optional[str] = None
     directRelayEnabled: Optional[int] = None
     directRelaySpeedLimit: Optional[int] = None
