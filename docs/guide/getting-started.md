@@ -106,21 +106,16 @@ wss://direct.example.com     # 允许 wss:// https:// 或裸域名 example.com
 
 ### 手动部署
 
-1. 克隆项目
 ```bash
 git clone https://github.com/onlypeng/FileCodeBox.git
-```
-
-2. 安装依赖
-```bash
 cd FileCodeBox
-pip install -r requirements.txt
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements.txt   # Linux/macOS: source .venv/bin/activate && pip install -r requirements.txt
+.venv/Scripts/python.exe main.py
 ```
 
-3. 启动服务
-```bash
-python main.py
-```
+仓库已内置前端构建产物 `frontend_dist`，后端单端口同时提供 API 与页面，无需额外构建。
+改前端源码才需要 `npm run build` 后同步产物。
 
 
 ## 使用方法
