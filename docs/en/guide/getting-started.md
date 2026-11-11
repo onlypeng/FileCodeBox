@@ -18,7 +18,7 @@ FileCodeBox is a simple and efficient file sharing tool that supports temporary 
 ### Docker Deployment
 
 ```bash
-docker run -d --restart=always -p 12345:12345 -v /opt/FileCodeBox/:/app/data --name filecodebox lanol/filecodebox:beta
+docker run -d --restart=always -p 12345:12345 -v /opt/FileCodeBox/:/app/data --name filecodebox onlypeng/filecodebox:latest
 ```
 
 ### Manual Deployment

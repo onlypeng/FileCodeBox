@@ -131,7 +131,7 @@ WebRTC 直传，服务器中转兜底不落盘
 ### Docker 部署
 
 ```bash
-docker run -d --restart=always -p 12345:12345 -v /opt/FileCodeBox/:/app/data --name filecodebox lanol/filecodebox:latest
+docker run -d --restart=always -p 12345:12345 -v /opt/FileCodeBox/:/app/data --name filecodebox onlypeng/filecodebox:latest
 ```
 
 ### 手动部署

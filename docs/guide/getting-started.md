@@ -20,7 +20,7 @@ FileCodeBox 是一个简单高效的文件分享工具，支持文件临时中�
 #### 快速启动
 
 ```bash
-docker run -d --restart=always -p 12345:12345 -v /opt/FileCodeBox/:/app/data --name filecodebox lanol/filecodebox:latest
+docker run -d --restart=always -p 12345:12345 -v /opt/FileCodeBox/:/app/data --name filecodebox onlypeng/filecodebox:latest
 ```
 
 #### Docker Compose
@@ -29,7 +29,7 @@ docker run -d --restart=always -p 12345:12345 -v /opt/FileCodeBox/:/app/data --n
 version: "3"
 services:
   file-code-box:
-    image: lanol/filecodebox:latest
+    image: onlypeng/filecodebox:latest
     volumes:
       - fcb-data:/app/data:rw
     restart: unless-stopped
@@ -71,7 +71,7 @@ docker run -d --restart=always \
   -e WORKERS=1 \
   -e LOG_LEVEL=warning \
   --name filecodebox \
-  lanol/filecodebox:latest
+  onlypeng/filecodebox:latest
 ```
 
 ### 配置反向代理（Nginx）

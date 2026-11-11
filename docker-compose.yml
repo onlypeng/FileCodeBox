@@ -1,7 +1,7 @@
 version: "3"
 services:
   file-code-box:
-    image: lanol/filecodebox:latest
+    image: onlypeng/filecodebox:latest
     environment:
       # 安全加固：JWT 签名密钥与敏感配置加密密钥必须设置强随机值。
       # 未设置时 compose 会直接拒绝启动（:? 强制展开），避免回退到默认口令派生的弱密钥。

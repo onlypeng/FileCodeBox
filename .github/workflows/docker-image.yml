@@ -7,7 +7,8 @@ name: Build and publish Docker image
 # 发布目标：
 #   - GHCR（ghcr.io/<owner>/<repo>）：使用 GITHUB_TOKEN，零额外配置，默认始终推送。
 #   - Docker Hub：仅当仓库配置了 DOCKER_USERNAME + DOCKER_PASSWORD 两个 Secrets 时推送，
-#     目标为 <DOCKER_USERNAME>/filecodebox（与 readme / docs 的 lanol/filecodebox 一致）。
+#     目标为 <DOCKER_USERNAME>/filecodebox（本仓库文档写的是 onlypeng/filecodebox:latest，
+#     因此 DOCKER_USERNAME 需为 onlypeng，否则文档里的镜像地址将不存在）。
 #     未配置时跳过，不会产生类似 "/filecodebox" 的非法镜像名。
 
 on:

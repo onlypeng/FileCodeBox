@@ -22,7 +22,7 @@ No sign-up. Share and retrieve with a short code.
 # One-line deploy (single instance, zero external dependencies)
 docker run -d --restart always -p 12345:12345 \
   -v /opt/FileCodeBox:/app/data --name filecodebox \
-  lanol/filecodebox:latest
+  onlypeng/filecodebox:latest
 ```
 
 </div>
@@ -98,7 +98,7 @@ docker run -d --restart always -p 12345:12345 \
   -v /opt/FileCodeBox:/app/data \
   -e JWT_SECRET="$(openssl rand -hex 32)" \
   -e ENCRYPTION_KEY="$(openssl rand -hex 32)" \
-  --name filecodebox lanol/filecodebox:latest
+  --name filecodebox onlypeng/filecodebox:latest
 ```
 
 If Docker Hub is slow from China, use the mirror `docker.cnb.cool/aixk/filecodebox`.
@@ -110,7 +110,7 @@ Open `http://<server-ip>:12345`. The admin panel is at `/#/admin`; the **default
 ```yaml
 services:
   filecodebox:
-    image: lanol/filecodebox:latest
+    image: onlypeng/filecodebox:latest
     ports: ["12345:12345"]
     volumes: ["./data:/app/data"]
     environment:
