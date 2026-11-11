@@ -15,6 +15,11 @@ RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
 # 安装 Python 依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 构建期自检：裸 uvicorn 不含 WS 协议实现，缺 websockets/wsproto 时镜像照样能启动、
+# 所有 HTTP 接口正常，但每个 /ws/* 升级请求都会落到 404 handler（实时房间永远"已断开"）。
+# 这种「局部静默不可用」在容器日志里看不出来，所以在构建阶段就让它直接失败。
+RUN python -c "import uvicorn, websockets; print('websocket protocol OK')"
+
 # 环境变量配置
 # JWT_SECRET: 签名密钥，设置后修改管理员密码不会使已登录 Token 失效（留空则回退到管理员口令）
 # ENCRYPTION_KEY: 敏感配置（S3/WebDAV 等凭据）的加密密钥，强烈建议生产环境配置（留空则从管理员口令派生）
