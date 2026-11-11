@@ -111,8 +111,8 @@ FileCodeBox 支持多种灵活的过期方式：
 | 按次数过期 | `count` | 文件在被下载指定次数后过期 |
 
 ::: info 说明
-- 管理员可以通过 `expireStyle` 配置项控制用户可选的过期方式
-- 管理员可以通过 `max_save_seconds` 配置项限制文件的最长保存时间
+- 管理员可以通过 `expireStyle` 配置项控制用户可选的过期方式（去掉 `forever` 即可强制每次上传都带期限）
+- 系统没有「全局最长保存时间」开关；过期后的清理由 `expiredRetentionStyle` / `expiredRetentionValue` 控制
 :::
 
 ### 过期方式示例

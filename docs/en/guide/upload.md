@@ -373,7 +373,7 @@ The system has rate limits on upload operations to prevent abuse:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `uploadMinute` | 1 | Limit time window (minutes) |
-| `uploadCount` | 10 | Maximum uploads within time window |
+| `uploadRateLimitCount` | 10 | Maximum uploads within time window |
 
 When rate limit is exceeded, you need to wait for the time window to pass before continuing uploads.
 
@@ -392,10 +392,10 @@ When rate limit is exceeded, you need to wait for the time window to pass before
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `openUpload` | int | 1 | Enable upload (1=enabled, 0=disabled) |
-| `uploadSize` | int | 10485760 | Maximum upload size (bytes) |
+| `uploadSize` | int | 104857600 | Maximum upload size (bytes), default 100MB |
 | `enableChunk` | int | 0 | Enable chunked upload (1=enabled, 0=disabled) |
 | `uploadMinute` | int | 1 | Upload rate limit time window (minutes) |
-| `uploadCount` | int | 10 | Maximum uploads within time window |
+| `uploadRateLimitCount` | int | 10 | Maximum uploads within time window |
 | `expireStyle` | list | ["day","hour","minute","forever","count"] | Allowed expiration methods |
 
 ### Configuration Example
@@ -407,7 +407,7 @@ enableChunk = 1
 
 # Relax upload rate limit: max 50 uploads per 5 minutes
 uploadMinute = 5
-uploadCount = 50
+uploadRateLimitCount = 50
 
 # Only allow expiration by days and count
 expireStyle = ["day", "count"]

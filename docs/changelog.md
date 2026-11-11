@@ -19,6 +19,22 @@
 - 新建 `docs/contributing.md` 与 `docs/en/contributing.md`，确立注解与文档规范：
   **注解写「为什么」，不写「做了什么」**；改接口/配置必须同提交同步文档。
 - 补齐本文件与英文版 changelog（此前均为 0 字节空文件）。
+- **精简说明文档**：`readme.md` 与 `readme_en.md` 从 500+ 行压到约 180 行，
+  只保留功能一览、功能截图、快速开始与文档索引；环境变量表、多实例章节、
+  反向代理配置、curl 示例、API 概览、系统配置整表全部迁入 `docs/`，避免两处维护。
+  重拍 `.github/images/` 下全部截图（新增取件码、仪表盘、系统设置 3 张）。
+- **配置文档按实现重新校准**：`docs/guide/configuration.md` 与英文版重写，
+  覆盖 `DEFAULT_CONFIG` 全部 88 个键，补齐此前缺失的 `roomCache*`、`virusScan*`、
+  `chunkExpireHours`、`globalStorageQuotaMB`、`auditLogRetentionDays`、`shareDomain`、
+  `wsBaseUrl`、`fileTypeWhitelist`、`codeLength`、`db*` 等；
+  删除文档里根本不存在、照着配也不会生效的 `max_save_seconds` 与 `uploadCount`
+  （真实键是 `uploadRateLimitCount`），并修正 `uploadSize` 默认值（100MB 而非 10MB）。
+- 把只在 README 里讲过的运维细节补进 docs：多实例的三条约束（会话亲和、
+  限流按实例计数、二进制分片不跨实例）、CDN 不转发 WebSocket 时用 `wsBaseUrl` 的排查顺序、
+  病毒扫描钩子的两种形态与 fail-open 取舍、房间文件接收流程的状态机与取源优先级。
+- 修正 6 处指向 README 已删章节的交叉引用（`api/index.md`、`guide/realtime.md`、
+  `guide/configuration.md`、`guide/getting-started.md` 及英文对应文件），
+  并更新 `contributing.md` 的文档同步规范：细节一律写 `docs/`，不再往 README 堆表。
 
 ### refactor(comments)
 

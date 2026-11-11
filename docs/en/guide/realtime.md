@@ -28,6 +28,41 @@ deliberate boundary: relay is a transport fallback, not a storage feature.
 - `directMaxRelaySize` caps a single relayed file (0 = unlimited)
 - `GET /admin/network/turn-check` verifies TURN connectivity from the admin panel
 
+## File receive flow
+
+Two delivery modes, two different flows. This state machine is the single source of
+truth for "no duplicate prompts, no duplicate downloads, no inconsistent cache state".
+
+**File state** (key `transfer_id`): `offered → collecting → transferring → done → available`
+
+**Per-user state** (key `transfer_id + client_id`, independent per person):
+`pending → accepted | declined → downloading → done → holder`
+
+### Cache off
+
+1. Sender emits `file_offer` to the other online members
+2. **Every online member gets exactly one prompt**; declining affects nobody else
+3. Transfer starts only when the receiver accepts; bytes are streamed to local storage
+   (OPFS) as they arrive, then the file becomes `holder`
+
+### Cache on
+
+1. The file is staged on the server and **nobody is asked to accept**
+2. Late joiners see the copy already available in the file list
+3. Whether to prompt for download is a configurable switch; when off it is silently available
+4. Anyone who already downloaded becomes a `holder` and is **never asked again** to serve it
+5. Late joiners prefer an online `holder` over the server copy
+
+### Source priority (fixed)
+
+```
+online holder that already downloaded (P2P)  >  server cache  >  no source (wait for sender)
+```
+
+Progress is tracked per user: the same file can sit at 62% for A while B sees 0% or
+done, without overwriting each other. Large files are read from the response body in
+chunks and written straight to disk — never buffered whole in memory.
+
 ## Room file cache
 
 P2P requires both peers online. Room cache stages files on the server so a late
@@ -61,7 +96,9 @@ inflate it ~1.4× with unpredictable latency.
 
 Configure session affinity on room code at the load balancer. Without it, the
 sender receives a `relay_failed` message rather than a silently stalled transfer.
-Pure P2P is unaffected. See the multi-instance section of the README.
+Pure P2P is unaffected. Rate-limit counters live in process memory, so the
+effective threshold under N instances is "configured value × N".
+See [Getting Started](/en/guide/getting-started) for the full prerequisites.
 
 ## API details
 

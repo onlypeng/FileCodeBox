@@ -223,8 +223,8 @@ Administrators can modify most configurations through the admin panel:
 | Category | Example Settings |
 |----------|------------------|
 | Basic Settings | `name`, `description`, `keywords`, `notify_title`, `notify_content` |
-| Upload Settings | `uploadSize`, `uploadMinute`, `uploadCount`, `openUpload`, `enableChunk` |
-| Expiration Settings | `expireStyle`, `max_save_seconds` |
+| Upload Settings | `uploadSize`, `uploadMinute`, `uploadRateLimitCount`, `openUpload`, `enableChunk` |
+| Expiration Settings | `expireStyle`, `expiredRetentionStyle`, `expiredRetentionValue` |
 | Theme Settings | `themesSelect`, `opacity`, `background` |
 | Security Settings | `admin_token`, `showAdminAddr`, `errorMinute`, `errorCount` |
 | Storage Settings | `file_storage`, `storage_path` and storage backend-specific configurations |

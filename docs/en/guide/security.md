@@ -59,13 +59,14 @@ Limit the number of uploads from a single IP within a specified time:
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `uploadMinute` | int | `1` | Upload limit time window (minutes) |
-| `uploadCount` | int | `10` | Maximum uploads allowed within the time window |
+| `uploadRateLimitCount` | int | `10` | Maximum uploads allowed within the time window |
 
 **How it works:**
-- System records upload requests from each IP
-- When an IP's upload count reaches `uploadCount` within `uploadMinute` minutes
-- Subsequent upload requests from that IP will be rejected with HTTP 423 error
+- Uploads are counted per IP; the counter lives in the database, the limiter itself is stateless
+- When an IP's upload count reaches `uploadRateLimitCount` within `uploadMinute` minutes
+- Subsequent upload requests from that IP are rejected with HTTP 423
 - Counter resets after the time window expires
+- Both keys apply immediately when changed in the admin panel, no restart
 
 **Configuration examples:**
 
@@ -73,15 +74,20 @@ Limit the number of uploads from a single IP within a specified time:
 # Relaxed configuration: Max 20 uploads in 5 minutes
 {
     "uploadMinute": 5,
-    "uploadCount": 20
+    "uploadRateLimitCount": 20
 }
 
 # Strict configuration: Max 3 uploads in 1 minute
 {
     "uploadMinute": 1,
-    "uploadCount": 3
+    "uploadRateLimitCount": 3
 }
 ```
+
+::: warning The threshold scales with instance count
+Counters are per process/table, so with N instances the effective threshold is roughly
+"configured value × N". For strict limits, count by IP at Nginx or a WAF in front.
+:::
 
 
 ### Error Rate Limiting
@@ -119,7 +125,7 @@ The default configuration `errorMinute=1, errorCount=1` is very strict, meaning 
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `uploadSize` | int | `10485760` | Maximum single file upload size (bytes), default 10MB |
+| `uploadSize` | int | `104857600` | Maximum single file upload size (bytes), default 100MB |
 | `openUpload` | int | `1` | Enable upload functionality (1=enabled, 0=disabled) |
 
 **Common size conversions:**
@@ -134,8 +140,9 @@ Through file expiration mechanisms, you can automatically clean up expired files
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `expireStyle` | list | `["day","hour","minute","forever","count"]` | Available expiration methods |
-| `max_save_seconds` | int | `0` | Maximum file retention time (seconds), 0 means no limit |
+| `expireStyle` | list | `["day","hour","minute","forever","count"]` | Expiration methods offered to uploaders |
+| `expiredRetentionStyle` | string | `day` | Unit for retention after expiry: `day`/`hour`/`minute`/`forever` |
+| `expiredRetentionValue` | int | `1` | Retention amount; `forever` = never auto-clean |
 
 **Expiration methods explained:**
 - `day` - Expire by days
@@ -144,18 +151,26 @@ Through file expiration mechanisms, you can automatically clean up expired files
 - `forever` - Never expire (requires alphanumeric extraction code)
 - `count` - Expire by download count
 
+::: tip What `count` really means
+A `count` share stays valid until the quota runs out (`expired_at` is empty, no time cap);
+it only expires when `expired_count` reaches 0. The download token issued on the last
+pickup keeps a 1-hour grace window so an in-flight download is not cut off.
+:::
+
 **Security recommendations:**
 
-For public services, it's recommended to:
-1. Remove the `forever` option to avoid permanent file storage
-2. Set `max_save_seconds` to limit maximum retention time
-3. Prefer using `count` method for automatic deletion after download
+There is no global "max retention" switch — each file's lifetime is whatever the uploader
+picks. For public services:
+
+1. Remove `forever` from `expireStyle` so every upload must carry a deadline
+2. Keep `expiredRetentionStyle` finite (e.g. `day` / `1`) so records and physical files are cleaned
+3. Prefer keeping `count`, which deletes after the last pickup
 
 ```python
-# Recommended configuration for public services
 {
     "expireStyle": ["hour", "minute", "count"],
-    "max_save_seconds": 86400  # Max retention 1 day
+    "expiredRetentionStyle": "day",
+    "expiredRetentionValue": 1
 }
 ```
 
@@ -168,6 +183,33 @@ In some cases, you may need to temporarily disable upload functionality:
     "openUpload": 0  # Disable upload functionality
 }
 ```
+
+### Virus scanning hook
+
+The biggest risk for an anonymous upload site is being used as a staging ground for
+malicious files. A **optional** scan hook is built in, off by default (zero overhead until
+configured). When enabled, every upload calls an external scanner after landing on disk.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `virusScanEnabled` | bool | `false` | Master switch |
+| `virusScanHook` | string | `""` | Command or HTTP endpoint |
+| `virusScanTimeoutSec` | int | `30` | Per-scan timeout (1–300 s) |
+| `virusScanFailOpen` | bool | `true` | Scanner unavailable: `true` = allow + warn, `false` = reject upload |
+
+```bash
+# Command form: {file} is replaced by the staged path; exit 0 = clean, 1 = infected
+clamscan --no-summary {file}
+
+# HTTP form: POST the file bytes, expect {"infected": true|false, "reason": "..."}
+https://scan.example.com/check
+```
+
+::: warning fail-open is a trade-off, not an oversight
+Scanning is auxiliary; a flaky scanner should not take the whole upload feature down, hence
+the default. Switch to `false` when security must win, accepting that uploads fail entirely
+while the scanner is unreachable.
+:::
 
 ## Reverse Proxy Security Configuration
 
@@ -300,11 +342,13 @@ Before deploying FileCodeBox, confirm the following security configurations:
     "showAdminAddr": 0,
     "uploadSize": 10485760,           # 10MB
     "uploadMinute": 1,
-    "uploadCount": 5,
+    "uploadRateLimitCount": 5,
     "errorMinute": 5,
     "errorCount": 3,
     "expireStyle": ["hour", "minute", "count"],
-    "max_save_seconds": 86400,        # Max 1 day
+    "expiredRetentionStyle": "day",   # clean up 1 day after expiry
+    "expiredRetentionValue": 1,
+    "fileTypeWhitelist": "jpg,png,pdf,zip,docx,xlsx,pptx",
     "openUpload": 1
 }
 ```
@@ -317,11 +361,12 @@ Before deploying FileCodeBox, confirm the following security configurations:
     "showAdminAddr": 1,
     "uploadSize": 104857600,          # 100MB
     "uploadMinute": 5,
-    "uploadCount": 50,
+    "uploadRateLimitCount": 50,
     "errorMinute": 1,
     "errorCount": 5,
     "expireStyle": ["day", "hour", "forever"],
-    "max_save_seconds": 0,            # No limit
+    "expiredRetentionStyle": "day",   # keep 7 days after expiry, then clean
+    "expiredRetentionValue": 7,
     "openUpload": 1
 }
 ```

@@ -76,13 +76,13 @@ FileCodeBox 内置了基于 IP 的速率限制机制，可以有效防止滥用�
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `uploadMinute` | int | `1` | 上传限制的时间窗口（分钟） |
-| `uploadCount` | int | `10` | 在时间窗口内允许的最大上传次数 |
+| `uploadRateLimitCount` | int | `10` | 在时间窗口内允许的最大上传次数 |
 
 **工作原理：**
-- 系统记录每个 IP 的上传请求
-- 当某 IP 在 `uploadMinute` 分钟内的上传次数达到 `uploadCount` 时
-- 该 IP 的后续上传请求将被拒绝，返回 HTTP 423 错误
-- 等待时间窗口过期后，计数器重置
+- 系统按 IP 在上传接口上计数（计数落库，实例本身无状态）
+- 当某 IP 在 `uploadMinute` 分钟内的上传次数达到 `uploadRateLimitCount` 时
+- 该 IP 的后续上传请求将被拒绝（HTTP 423），等待窗口过期后计数重置
+- 后台改这两项会就地生效，不需要重启
 
 **配置示例：**
 
@@ -90,15 +90,20 @@ FileCodeBox 内置了基于 IP 的速率限制机制，可以有效防止滥用�
 # 宽松配置：5分钟内最多上传20次
 {
     "uploadMinute": 5,
-    "uploadCount": 20
+    "uploadRateLimitCount": 20
 }
 
 # 严格配置：1分钟内最多上传3次
 {
     "uploadMinute": 1,
-    "uploadCount": 3
+    "uploadRateLimitCount": 3
 }
 ```
+
+::: warning 多实例下阈值会放大
+计数在进程内存与各自的表里独立维护，N 个实例的实际阈值约为「配置值 × N」。
+需要严格限流请在前置 Nginx 或 WAF 上按 IP 计数。
+:::
 
 ### 错误次数限制
 
@@ -135,7 +140,7 @@ FileCodeBox 内置了基于 IP 的速率限制机制，可以有效防止滥用�
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `uploadSize` | int | `10485760` | 单文件最大上传大小（字节），默认 10MB |
+| `uploadSize` | int | `104857600` | 单文件最大上传大小（字节），默认 100MB |
 | `openUpload` | int | `1` | 是否开启上传功能（1=开启，0=关闭） |
 
 **常用大小换算：**
@@ -160,8 +165,9 @@ FileCodeBox 内置了基于 IP 的速率限制机制，可以有效防止滥用�
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `expireStyle` | list | `["day","hour","minute","forever","count"]` | 可选的过期方式 |
-| `max_save_seconds` | int | `0` | 文件最大保存时间（秒），0 表示不限制 |
+| `expireStyle` | list | `["day","hour","minute","forever","count"]` | 允许上传者选择的过期方式 |
+| `expiredRetentionStyle` | str | `day` | 记录过期后的保留单位：`day`/`hour`/`minute`/`forever` |
+| `expiredRetentionValue` | int | `1` | 保留时长；`forever` = 不自动清理 |
 
 **过期方式说明：**
 - `day` - 按天数过期
@@ -173,20 +179,23 @@ FileCodeBox 内置了基于 IP 的速率限制机制，可以有效防止滥用�
 ::: tip count（按次）模式的语义
 `count` 模式为**次数用尽前永久有效**（`expired_at` 为空，无时间上限），
 仅按剩余取件次数判断过期；次数用尽（`expired_count = 0`）即过期并被后台任务清理。
+最后一次取件的下载链接仍有 1 小时放行窗口，避免下载到一半被掐断。
 ::: 
 
 **安全建议：**
 
-对于公开服务，建议：
-1. 移除 `forever` 选项，避免文件永久存储
-2. 设置 `max_save_seconds` 限制最长保存时间
-3. 优先使用 `count` 方式，下载后自动删除
+系统没有「全局最长保存时间」这个开关，单个文件的期限完全由上传时选择的方式决定。
+公开服务建议：
+
+1. 从 `expireStyle` 里**去掉 `forever`**，强制每次上传都带期限
+2. 把 `expiredRetentionStyle` 保持为有限值（如 `day`/`1`），过期记录连同物理文件一起清掉
+3. 优先保留 `count`，取完即删
 
 ```python
-# 公开服务推荐配置
 {
     "expireStyle": ["hour", "minute", "count"],
-    "max_save_seconds": 86400  # 最长保存1天
+    "expiredRetentionStyle": "day",
+    "expiredRetentionValue": 1
 }
 ```
 
@@ -199,6 +208,33 @@ FileCodeBox 内置了基于 IP 的速率限制机制，可以有效防止滥用�
     "openUpload": 0  # 关闭上传功能
 }
 ```
+
+### 病毒扫描钩子
+
+匿名上传站点的最大风险是被人当恶意文件的中转站。系统内置一个**可选**的扫描钩子，
+默认关闭（未配置钩子时零开销），启用后每个上传在落盘后回调外部扫描服务。
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `virusScanEnabled` | bool | `false` | 总开关 |
+| `virusScanHook` | str | `""` | 扫描钩子，命令或 HTTP 地址 |
+| `virusScanTimeoutSec` | int | `30` | 单次扫描超时（1~300 秒） |
+| `virusScanFailOpen` | bool | `true` | 扫描服务不可用时：`true`=放行并告警，`false`=拒绝上传 |
+
+两种钩子形态：
+
+```bash
+# 命令形态：{file} 替换为落盘后的临时路径，返回码 0=干净，1=感染
+clamscan --no-summary {file}
+
+# HTTP 形态：POST 文件二进制，需返回 {"infected": true|false, "reason": "..."}
+https://scan.example.com/check
+```
+
+::: warning fail-open 是取舍，不是疏漏
+扫描是辅助能力，不该因为扫描服务抖动就让整个上传不可用，所以默认放行。
+对安全要求更高的场景改成 `false`，代价是扫描服务不可用期间上传全部失败。
+:::
 
 ## 反向代理安全配置
 
@@ -331,11 +367,13 @@ your-domain.com {
     "showAdminAddr": 0,
     "uploadSize": 10485760,           # 10MB
     "uploadMinute": 1,
-    "uploadCount": 5,
+    "uploadRateLimitCount": 5,
     "errorMinute": 5,
     "errorCount": 3,
     "expireStyle": ["hour", "minute", "count"],
-    "max_save_seconds": 86400,        # 最长1天
+    "expiredRetentionStyle": "day",   # 过期后 1 天清理
+    "expiredRetentionValue": 1,
+    "fileTypeWhitelist": "jpg,png,pdf,zip,docx,xlsx,pptx",
     "openUpload": 1
 }
 ```
@@ -348,11 +386,12 @@ your-domain.com {
     "showAdminAddr": 1,
     "uploadSize": 104857600,          # 100MB
     "uploadMinute": 5,
-    "uploadCount": 50,
+    "uploadRateLimitCount": 50,
     "errorMinute": 1,
     "errorCount": 5,
     "expireStyle": ["day", "hour", "forever"],
-    "max_save_seconds": 0,            # 不限制
+    "expiredRetentionStyle": "day",   # 过期后保留 7 天再清理
+    "expiredRetentionValue": 7,
     "openUpload": 1
 }
 ```

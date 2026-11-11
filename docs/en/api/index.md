@@ -218,7 +218,9 @@ issued by the server on WS join.
 Text signaling is synchronized across instances; **binary file chunks are deliberately
 not forwarded** (a single frame is up to 256KB; pub/sub would inflate it ~1.4× with
 unpredictable latency). Use session affinity on room code; otherwise the sender
-receives `relay_failed`. See the multi-instance section of the README.
+receives `relay_failed`. Rate-limit counters (wrong pickup code, upload count) live in
+process memory, so the effective limit under N instances is "configured value × N".
+See the multi-instance part of [Getting Started](/en/guide/getting-started).
 
 ---
 

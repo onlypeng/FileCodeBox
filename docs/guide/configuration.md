@@ -1,252 +1,193 @@
 # 配置说明
 
-FileCodeBox 提供了丰富的配置选项，可以通过管理面板或直接修改配置来自定义系统行为。本文档详细介绍所有可用的配置项。
+配置有两处来源：`core/settings.py` 的 `DEFAULT_CONFIG`（出厂默认值）与数据库中的覆盖值。
+**推荐在管理后台「系统设置」修改**——保存即写库并热更新到运行中的进程，不用重启。
+可直接改库的场景只有部署初始化。
 
-## 配置方式
-
-FileCodeBox 支持两种配置方式：
-
-1. **管理面板配置**（推荐）：访问 `/admin` 进入管理面板，在设置页面修改配置
-2. **数据库配置**：配置存储在 `data/filecodebox.db` 数据库中
-
-::: tip 提示
-首次启动时，系统会使用 `core/settings.py` 中的默认配置。修改后的配置会保存到数据库中。
+::: warning 需重启才生效的配置
+`serverHost` / `serverPort` / `serverWorkers` 是启动参数，改完必须重启；
+`redisUrl` 与 `db*` 系列改动会在保存时被明确拒绝（值为真的改变时返回 400）——
+订阅连接与连接池无法热切换，请改 `.env` 或环境变量后重启。
 :::
 
-## 基础设置
-
-### 站点信息
+## 站点与界面
 
 | 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `name` | string | `驿码 - FileCodeBox` | 站点名称，显示在页面标题和导航栏 |
-| `description` | string | `开箱即用的文件快传系统` | 站点描述，用于 SEO |
-| `keywords` | string | `FileCodeBox, 驿码...` | 站点关键词，用于 SEO |
-| `serverHost` | string | `0.0.0.0` | 服务监听地址 |
-| `serverPort` | int | `12345` | 服务监听端口 |
-| `serverWorkers` | int | `1` | 工作进程数。**默认保持 1**；多进程需同时满足 `postgres`/`mysql` 数据库与 `redisUrl`，详见主 README 的多实例章节 |
-
-### 通知设置
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `notify_title` | string | `系统通知` | 通知标题 |
-| `notify_content` | string | 欢迎信息 | 通知内容，支持 HTML |
+|---|---|---|---|
+| `name` | string | `驿码 - FileCodeBox` | 站点名称，页面标题与导航栏 |
+| `description` | string | `开箱即用的文件快传系统` | 站点描述（SEO） |
+| `keywords` | string | `FileCodeBox, 驿码, ...` | 站点关键词（SEO） |
+| `notify_title` / `notify_content` | string | `系统通知` / 欢迎信息 | 顶部公告标题与内容，支持 HTML |
 | `page_explain` | string | 法律声明 | 页面底部说明文字 |
 | `robotsText` | string | `User-agent: *\nDisallow: /` | robots.txt 内容 |
+| `showAdminAddr` | int | `0` | 首页是否显示管理入口（1=显示） |
+| `opacity` | float | `0.9` | 界面透明度（0~1） |
+| `background` | string | `""` | 自定义背景图 URL，空 = 默认背景 |
+| `themesSelect` / `themesChoices` | string / list | `themes/2024` / 两个内置主题 | 旧版主题选择；**dist 部署不参与**，仅作兼容保留 |
+| `spaTheme` | string | `light` | 前端默认主题：`light` / `dark` / `enterprise`，由主题管理模块写入 |
 
-## 上传设置
-
-### 文件上传限制
+## 上传
 
 | 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `openUpload` | int | `1` | 是否开启上传功能（1=开启，0=关闭） |
-| `uploadSize` | int | `10485760` | 单文件最大上传大小（字节），默认 10MB |
-| `enableChunk` | int | `0` | 是否启用分片上传（1=启用，0=禁用） |
+|---|---|---|---|
+| `openUpload` | int | `1` | 是否开放上传（0=关闭，仅管理员可传） |
+| `uploadSize` | int | `104857600` | 单文件上限（**字节**），默认 100MB |
+| `fileTypeWhitelist` | string | `""` | 扩展名白名单，逗号分隔（`jpg,png,pdf`）；空 = 不限制 |
+| `expireStyle` | list | `day,hour,minute,forever,count` | 允许选择的过期方式 |
+| `maxTextLength` | int | `200000` | 纯文本分享/备注的最大**字符**数 |
+| `uploadMinute` | int | `1` | 上传限流时间窗口（分钟） |
+| `uploadRateLimitCount` | int | `10` | 窗口内单 IP 允许的上传次数 |
+| `maxSendFiles` | int | `20` | 单次发件的文件数量上限 |
+| `maxMultiFileCount` | int | `20` | 多文件分享记录的数量上限 |
+| `codeLength` | int | `6` | 提取码位数（4~12），文件码/收件箱三码/房间码统一长度 |
 
-::: warning 注意
-`uploadSize` 的单位是字节。10MB = 10 * 1024 * 1024 = 10485760 字节
+### 分片上传
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `enableChunk` | int | `0` | 是否启用分片上传（1=启用） |
+| `uploadChunkSize` | int | `5` | 分片大小（**MB**），仅分片开启时生效 |
+| `chunkExpireHours` | int | `24` | 未完成分片会话的回收时长（小时） |
+
+分片上传支持断点续传：进度保存在当前页面内存里（`uploadId` + 已传片号 + `File` 对象），
+刷新后 `File` 无法恢复，只能重传；主动「放弃」或离开页面才回滚已扣的投递次数。
+
+## 过期与清理
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `expiredRetentionStyle` | string | `day` | 记录过期后的保留单位：`day` / `hour` / `minute` / `forever` |
+| `expiredRetentionValue` | int | `1` | 保留时长数值；`forever` = 不自动清理，文件长期占盘 |
+
+保留期覆盖文件分享、收件箱、直连房间三类记录，到期由后台任务连同物理文件一起清理。
+`forever` 是逃生阀：开启后清理循环直接退出，磁盘只增不减，需自行巡检。
+
+## 安全管理
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `admin_token` | string | `FileCodeBox2023` | 管理员口令，**首次登录强制修改** |
+| `errorMinute` | int | `1` | 取件码猜错限流窗口（分钟） |
+| `errorCount` | int | `10` | 窗口内允许的猜错次数 |
+| `auditLogRetentionDays` | int | `90` | 审计日志保留天数（0=不清理） |
+| `trustedProxies` | string | `""` | 可信代理 IP，逗号分隔；部署在 Nginx 之后时填代理地址，否则取到的是代理 IP |
+| `cors_origins` | string | `http://localhost:5173,...` | CORS 白名单；生产同源部署可留空 |
+
+口令与密钥的存储细节（PBKDF2、敏感项加密、占位符回写）见[安全](/guide/security)。
+
+### 病毒扫描（可选）
+
+默认关闭，未配置钩子时零开销；启用后每个上传在落盘后回调外部扫描服务。
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `virusScanEnabled` | bool | `false` | 总开关 |
+| `virusScanHook` | string | `""` | 扫描钩子，两种形态见下 |
+| `virusScanTimeoutSec` | int | `30` | 单次扫描超时（1~300 秒） |
+| `virusScanFailOpen` | bool | `true` | 扫描服务不可用时的策略：`true`=放行并告警，`false`=拒绝上传 |
+
+```bash
+# 命令形态：{file} 会被替换为落盘后的临时路径，返回码 0=干净 / 1=感染
+clamscan --no-summary {file}
+
+# HTTP 形态：POST 文件二进制，响应 {"infected": true, "reason": "..."}
+https://scan.example.com/check
+```
+
+::: tip 为什么默认 fail-open
+扫描是辅助能力，不该因为扫描服务挂了就让整个上传不可用。
+对安全要求更高的场景改成 `false`，代价是扫描服务抖动期间上传全部失败。
 :::
 
-### 上传频率限制
+## 存储
 
 | 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `uploadMinute` | int | `1` | 上传限制的时间窗口（分钟） |
-| `uploadCount` | int | `10` | 在时间窗口内允许的最大上传次数 |
+|---|---|---|---|
+| `file_storage` | string | `local` | 存储后端：`local` / `s3` / `onedrive` / `webdav` / `opendal` |
+| `storage_path` | string | `""` | 本地存储目录，空 = `data/storage` |
 
-例如：默认配置表示每 1 分钟内最多允许上传 10 次。
+各后端的连接参数（`s3_*`、`onedrive_*`、`webdav_*`、`opendal_*`）见[存储配置](/guide/storage)。
 
-### 文件过期设置
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `expireStyle` | list | `["day","hour","minute","forever","count"]` | 可选的过期方式 |
-| `max_save_seconds` | int | `0` | 文件最大保存时间（秒），0 表示不限制 |
-
-过期方式说明：
-- `day` - 按天过期
-- `hour` - 按小时过期
-- `minute` - 按分钟过期
-- `forever` - 永不过期
-- `count` - 按下载次数过期
-
-## 主题设置
-
-### 主题选择
+## 收件箱
 
 | 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `themesSelect` | string | `themes/2024` | 当前使用的主题 |
-| `themesChoices` | list | 见下方 | 可用主题列表 |
+|---|---|---|---|
+| `maxCollectionFiles` | int | `100` | 单个收件箱的文件数硬上限 |
+| `collectionDefaultMaxFiles` | int | `20` | 创建时的默认文件数 |
+| `collectionDefaultExpireDays` | int | `7` | 创建时的默认有效期（天） |
 
-默认可用主题：
-```json
-[
-  {
-    "name": "2023",
-    "key": "themes/2023",
-    "author": "Lan",
-    "version": "1.0"
-  },
-  {
-    "name": "2024",
-    "key": "themes/2024",
-    "author": "Lan",
-    "version": "1.0"
-  }
-]
-```
-
-### 界面样式
+## 直连快传与房间
 
 | 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `opacity` | float | `0.9` | 界面透明度（0-1） |
-| `background` | string | `""` | 自定义背景图片 URL，为空则使用默认背景 |
-
-## 管理员设置
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `admin_token` | string | `FileCodeBox2023` | 管理员登录密码 |
-| `showAdminAddr` | int | `0` | 是否在首页显示管理入口（1=显示，0=隐藏） |
-
-::: danger 安全警告
-请务必在生产环境中修改默认的 `admin_token`！使用默认密码会导致严重的安全风险。
-:::
-
-## 安全设置
-
-### 错误次数限制
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `errorMinute` | int | `1` | 错误限制的时间窗口（分钟） |
-| `errorCount` | int | `10` | 在时间窗口内允许的最大错误次数 |
-
-此设置用于防止暴力破解提取码。
-
-## 存储设置
-
-### 存储类型
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `file_storage` | string | `local` | 存储后端类型 |
-| `storage_path` | string | `""` | 自定义存储路径 |
-
-支持的存储类型：
-- `local` - 本地存储
-- `s3` - S3 兼容存储（AWS S3、阿里云 OSS、MinIO 等）
-- `onedrive` - OneDrive 存储
-- `webdav` - WebDAV 存储
-- `opendal` - OpenDAL 存储
-
-详细的存储配置请参考 [存储配置](/guide/storage)。
-
-## 多文件与收件箱设置
-
-### 多文件分享
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `maxMultiFileCount` | int | `20` | 多文件分享单次数量上限 |
-| `maxSendFiles` | int | `20` | 发件时文件数量上限 |
-
-### 收件箱（文件收集）
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `maxCollectionFiles` | int | `100` | 收件箱最大文件数上限 |
-| `collectionDefaultMaxFiles` | int | `20` | 创建收件箱默认最大文件数 |
-| `collectionDefaultExpireDays` | int | `7` | 创建收件箱默认有效期（天） |
-
-## 实时通信设置
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `directRelayEnabled` | int | `1` | 直连快传服务器中转开关（1=开启，0=关闭） |
-| `directRelaySpeedLimit` | int | `0` | 服务器中转限速（KB/s，0 为不限速） |
-| `directTurnServers` | list | `[]` | WebRTC TURN 服务器列表，用于对称 NAT 下 P2P 失败时兜底直连 |
-
-TURN 服务器配置格式：
+|---|---|---|---|
+| `directRelayEnabled` | int | `1` | 服务器中转开关（1=开启）；关闭后只能 P2P |
+| `directRelaySpeedLimit` | int | `0` | 中转限速（KB/s，0=不限） |
+| `directRelayChunkSize` | int | `64` | 中转分片大小（KB，16~256）。分片加密后单帧 ≈ 分片+40B，网关常见上限 256KB，取值别顶满 |
+| `directMaxRelaySize` | int | `0` | 单个中转文件的体积上限（MB，0=不限）；P2P 直连不受此限 |
+| `directTurnServers` | list | `[]` | WebRTC TURN 列表，对称 NAT 下兜底直连 |
+| `defaultMaxMembers` | int | `10` | 房间默认人数上限（0=不限），创建时可选 1~该值 |
+| `mediaDefaultQuality` | string | `auto` | 共享视频流默认画质：`low` / `sd` / `hd` / `auto` |
 
 ```json
-[
-  {
-    "urls": "turn:host:3478?transport=udp",
-    "username": "xxx",
-    "credential": "yyy"
-  }
-]
+// directTurnServers 单项格式
+[{ "urls": "turn:host:3478?transport=udp", "username": "xxx", "credential": "yyy" }]
 ```
 
-## 网络安全设置
+### 房间文件缓存
+
+房间的「服务端缓存」把文件落到本机磁盘，后进房间的人可直接从服务器取，不必等发送方在线。
 
 | 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `trustedProxies` | string | `""` | 可信代理 IP（逗号分隔），部署在反向代理之后时配置 |
-| `cors_origins` | string | `http://localhost:5173,...` | CORS 白名单（逗号分隔）；生产同源部署可留空禁用 |
+|---|---|---|---|
+| `roomCacheEnabled` | int | `1` | 是否允许房间文件缓存到服务器；关闭后只能 P2P 多源转发 |
+| `roomCacheDefaultHours` | int | `72` | 默认缓存时长（小时，0=跟随房间生命周期） |
+| `roomCacheMaxSize` | int | `100` | 单个缓存文件的体积上限（MB，0=不限） |
+| `roomCacheRoomQuota` | int | `500` | 单个房间的缓存总配额（MB，0=不限）；超配额拒绝新上传，文件过期后额度自动释放 |
 
-## 配置示例
+取源优先级固定为：**在线且已下载的持有者（P2P）> 服务端缓存 > 无源提示**。
+已有缓存的用户不会被再问一次「是否提供下载」，避免重复弹窗。
 
-### 示例 1：小型个人使用
+## 全局配额
 
-适合个人或小团队使用，限制较宽松：
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `globalStorageQuotaMB` | int | `0` | 全局存储配额（MB，0=不限）。口径 = 文件柜累计大小 + 房间缓存目录占用 |
 
-```python
-{
-    "name": "我的文件分享",
-    "uploadSize": 52428800,        # 50MB
-    "uploadMinute": 5,             # 5分钟
-    "uploadCount": 20,             # 最多20次
-    "expireStyle": ["day", "hour", "forever"],
-    "admin_token": "your-secure-password",
-    "showAdminAddr": 1
-}
-```
+超配额**不阻止上传**，只在后台持续告警并显示占比。开放匿名上传时务必设一个值，
+否则磁盘会被慢慢写满而没有任何提示。
 
-### 示例 2：公开服务
+## 对外链接
 
-适合公开服务，需要更严格的限制：
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `shareDomain` | string | `""` | 生成分享/取件链接（含下载直链、二维码、wget 命令）时使用的站点地址，如 `https://share.example.com`；空 = 用当前访问地址 |
+| `wsBaseUrl` | string | `""` | WebSocket 独立接入地址。CDN/边缘加速不转发 `Upgrade` 时填直连源站域名；空 = 与页面同源 |
 
-```python
-{
-    "name": "公共驿码服务",
-    "uploadSize": 10485760,        # 10MB
-    "uploadMinute": 1,             # 1分钟
-    "uploadCount": 5,              # 最多5次
-    "errorMinute": 5,              # 5分钟
-    "errorCount": 3,               # 最多3次错误
-    "expireStyle": ["hour", "minute", "count"],
-    "max_save_seconds": 86400,     # 最长保存1天
-    "admin_token": "very-secure-password-123",
-    "showAdminAddr": 0
-}
-```
+`shareDomain` 只影响对外分享链接，API 请求仍走实际访问地址；
+`wsBaseUrl` 只影响 WebSocket，HTTP 仍走原站点。两者都随公共配置运行时下发，
+改完刷新页面即生效。填法与排障见[快速开始](/guide/getting-started)的反向代理一节。
 
-### 示例 3：企业内部使用
+## 服务端与数据库
 
-适合企业内部使用，支持大文件和分片上传：
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `serverHost` | string | `0.0.0.0` | 监听地址（需重启） |
+| `serverPort` | int | `12345` | 监听端口（需重启） |
+| `serverWorkers` | int | `1` | 工作进程数（需重启）。**默认保持 1**，多进程条件见[快速开始](/guide/getting-started) |
+| `redisUrl` | string | `""` | 多实例协调的 Redis 连接串，空 = 单实例；改动需重启 |
+| `dbType` | string | `sqlite` | `sqlite` / `postgres` / `mysql`；SQLite 单写者，只支持单进程 |
+| `dbHost` / `dbPort` | string / int | `127.0.0.1` / `0` | 端口 0 = 用类型默认端口（postgres 5432 / mysql 3306） |
+| `dbUser` / `dbPassword` | string | `""` | 数据库账号口令 |
+| `dbName` | string | `filecodebox` | 库名 |
+| `dbSchema` | string | `public` | PostgreSQL schema，其它类型忽略 |
 
-```python
-{
-    "name": "企业文件中转站",
-    "uploadSize": 1073741824,      # 1GB
-    "enableChunk": 1,              # 启用分片上传
-    "uploadMinute": 10,            # 10分钟
-    "uploadCount": 100,            # 最多100次
-    "expireStyle": ["day", "forever"],
-    "file_storage": "s3",          # 使用S3存储
-    "admin_token": "enterprise-secure-token",
-    "showAdminAddr": 1
-}
-```
+`redisUrl` / `db*` **故意不开放后台热改**：前端「保存设置」是整份配置回传，
+后端只在值真的改变时返回 400，避免动了一个无关开关就阻断整个表单。
+这些参数请通过环境变量 `REDIS_URL`、`DB_TYPE` 等注入后重启。
 
 ## 下一步
 
-- [存储配置](/guide/storage) - 了解如何配置不同的存储后端
-- [安全设置](/guide/security) - 了解如何增强系统安全性
-- [文件分享](/guide/share) - 了解文件分享功能
+- [快速开始](/guide/getting-started) - 部署、环境变量、反向代理、多实例
+- [存储配置](/guide/storage) - 各存储后端参数
+- [安全设置](/guide/security) - 口令、限流、白名单、病毒扫描
+- [管理面板](/guide/management) - 后台各模块操作

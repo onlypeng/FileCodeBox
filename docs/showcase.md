@@ -2,7 +2,7 @@
 
 这里收录了一些使用 FileCodeBox 搭建的优秀站点。如果你也部署了 FileCodeBox，欢迎提交 PR 将你的站点添加到这里！
 
-## 官方演示站
+## 上游演示站
 
 <div class="showcase-grid">
 
@@ -11,8 +11,8 @@
 ### 🌟 FileCodeBox Demo
 
 - **网址**：[share.lanol.cn](https://share.lanol.cn)
-- **简介**：官方演示站点，体验最新功能
-- **特点**：稳定运行，功能完整
+- **简介**：上游原版（vastsa/FileCodeBox）的演示站点，可用来对比基础功能
+- **注意**：本仓库在其基础上继续开发，界面与功能已有差异
 
 </div>
 
@@ -23,9 +23,8 @@
 ::: tip 提交你的站点
 如果你使用 FileCodeBox 搭建了自己的文件分享服务，欢迎通过以下方式提交：
 
-1. 在 [GitHub](https://github.com/vastsa/FileCodeBox) 提交 PR，编辑此页面
-2. 在 [Issues](https://github.com/vastsa/FileCodeBox/issues) 中提交你的站点信息
-3. 加入 QQ 群 739673698 联系管理员
+1. 在 [GitHub](https://github.com/onlypeng/FileCodeBox) 提交 PR，编辑此页面
+2. 在 [Issues](https://github.com/onlypeng/FileCodeBox/issues) 中提交你的站点信息
 :::
 
 <!-- 

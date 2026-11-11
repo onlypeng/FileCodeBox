@@ -21,6 +21,27 @@ The project has two independent repositories (backend `FileCodeBox`, frontend
   documentation conventions: **comments explain why, not what**; changing an
   endpoint or config key requires updating docs in the same commit.
 - Filled in this file and the Chinese changelog (both were 0-byte placeholders).
+- **Trimmed the docs**: `readme.md` and `readme_en.md` went from 500+ lines to about 180,
+  keeping only the feature table, screenshots, quick start and a docs index. The env var
+  table, multi-instance section, reverse proxy config, curl examples, API overview and the
+  full config table all moved into `docs/` to stop dual maintenance. Re-shot every
+  screenshot in `.github/images/` (three new: pickup code, dashboard, settings).
+- **Re-calibrated the configuration reference**: rewrote `docs/guide/configuration.md` and
+  its English twin to cover all 88 keys in `DEFAULT_CONFIG`, adding the previously missing
+  `roomCache*`, `virusScan*`, `chunkExpireHours`, `globalStorageQuotaMB`,
+  `auditLogRetentionDays`, `shareDomain`, `wsBaseUrl`, `fileTypeWhitelist`, `codeLength`
+  and `db*`. Removed `max_save_seconds` and `uploadCount`, which **do not exist** in the
+  implementation (the real key is `uploadRateLimitCount`), and fixed the `uploadSize`
+  default (100MB, not 10MB).
+- Moved operations details that only lived in the README into `docs/`: the three
+  multi-instance constraints (session affinity, per-instance rate counters, binary chunks
+  not crossing instances), the `wsBaseUrl` troubleshooting order for CDNs that drop
+  WebSocket, both virus-scan hook forms with the fail-open trade-off, and the room file
+  receive-flow state machine with its source priority.
+- Fixed six cross-references pointing at README sections that no longer exist
+  (`api/index.md`, `guide/realtime.md`, `guide/configuration.md`,
+  `guide/getting-started.md` and their English counterparts) and updated the sync rules in
+  `contributing.md`: details belong in `docs/`, the README no longer carries tables.
 
 ### refactor(comments)
 

@@ -106,11 +106,15 @@ Code Review 时这一条与代码正确性同等对待。
 
 | 改动位置 | 需同步的文档 |
 |---------|------------|
-| 新增/修改路由 | `readme.md` 的 API 概览、`docs/api/index.md` |
-| 新增配置项 | `readme.md` 的系统配置说明、`docs/guide/configuration.md` |
-| 新增环境变量 | `readme.md` 的环境变量表、`docs/guide/getting-started.md` |
+| 新增/修改路由 | `docs/api/index.md` + `docs/en/api/index.md` |
+| 新增配置项 | `core/settings.py:DEFAULT_CONFIG` → `docs/guide/configuration.md` + 英文版 |
+| 新增环境变量 | `.env.example` → `docs/guide/getting-started.md` + 英文版 |
 | 新增/修改模型字段 | `apps/base/models.py` 注解 + 对应迁移文件注解 |
-| 部署形态相关 | `readme.md` 多实例章节、`docs/guide/getting-started.md` |
+| 部署形态相关 | `docs/guide/getting-started.md`（多实例、反向代理）+ 英文版 |
+| 面向用户的新功能 | `readme.md`「功能一览」加一行，必要时补 `.github/images/` 截图 |
+
+`readme.md` / `readme_en.md` 只保留功能清单、截图、快速开始与文档索引。
+**细节一律写进 `docs/`**，不要往 README 里堆配置表和接口表——两处维护必然失真。
 
 ### 2. 中英文文档同步
 

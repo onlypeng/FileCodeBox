@@ -2,16 +2,8 @@
 
 ## 简介
 
-FileCodeBox 是一个简单高效的文件分享工具，支持文件临时中转、分享和管理。本指南将帮助您快速部署和使用 FileCodeBox。
-
-## 特性
-
-- 🚀 快速部署：支持 Docker 一键部署
-- 🔒 安全可靠：文件访问需要提取码
-- ⏱️ 时效控制：支持设置文件有效期
-- 📊 下载限制：可限制文件下载次数
-- 🖼️ 文件预览：支持图片、视频、音频等多种格式预览
-- 📱 响应式设计：完美适配移动端和桌面端
+FileCodeBox 是单端口应用：一个进程同时提供 API 与预构建的前端页面，
+`docker run` 一条命令就能跑起来，SQLite 开箱即用、零外部依赖。
 
 ## 部署方式
 
@@ -38,6 +30,8 @@ services:
     environment:
       - WORKERS=1
       - LOG_LEVEL=info
+      - JWT_SECRET=${JWT_SECRET}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
 volumes:
   fcb-data:
     external: false
@@ -55,24 +49,24 @@ volumes:
 | `ENCRYPTION_KEY` | 空 | 敏感配置加密密钥；留空时从管理员口令派生 |
 | `REDIS_URL` | 空 | 多实例协调的 Redis 连接串；留空 = 单实例 |
 
-::: warning 多实例前置条件
-`WORKERS > 1` 必须**同时**满足：数据库改为 `postgres`/`mysql`（SQLite 单写者），
-且配置 `REDIS_URL`（房间状态与配额锁需跨进程共享）。条件不齐时启动会打 ERROR，
-且房间消息会出现"只有一半人收到"这类极难排查的现象。
-二进制文件分片不跨实例转发，负载均衡需按房间码做会话亲和。详见[主 README](https://github.com/onlypeng/FileCodeBox)。
+::: tip 生产环境请显式设置 `JWT_SECRET` 与 `ENCRYPTION_KEY`
+两者留空时由管理员口令派生，省事但有两个副作用：**修改管理员口令会让所有已登录 Token 立即失效**
+（因为签名密钥跟着变了），且口令泄漏等于签名密钥泄漏。生成方式：`openssl rand -hex 32`。
 :::
 
-#### 自定义配置示例
+::: warning 多实例前置条件
+`WORKERS > 1` 必须**同时**满足两条：数据库改为 `postgres`/`mysql`（SQLite 只允许单写者），
+且配置 `REDIS_URL`（房间状态、配额锁需跨进程共享）。条件不齐时启动会打 ERROR，
+房间消息则会出现"只有一半人收到"这类极难排查的现象。
 
-```bash
-docker run -d --restart=always \
-  -p 12345:12345 \
-  -v /opt/FileCodeBox/:/app/data \
-  -e WORKERS=1 \
-  -e LOG_LEVEL=warning \
-  --name filecodebox \
-  onlypeng/filecodebox:latest
-```
+即使条件齐备，仍有两条约束：
+
+1. **二进制分片刻意不跨实例转发**。单帧 ≤256KB，走 pub/sub 会放大约 1.4 倍且延迟不可控，
+   所以文件直传要求收发双方落在同一实例 → 接入层必须按房间码做**会话亲和**，
+   否则发送方会收到 `relay_failed`。
+2. **限流按实例计数**。`uploadRateLimitCount`、登录失败锁定等计数都在进程内存里，
+   多实例下实际阈值是“配置值 × 实例数”。需要严格限流请前置 Nginx/WAF 按 IP 计数。
+:::
 
 ### 配置反向代理（Nginx）
 
@@ -94,11 +88,27 @@ location / {
 }
 ```
 
+::: tip CDN / 边缘加速不转发 WebSocket 时
+部分 CDN（含 EdgeOne、ESA 一类默认配置）只代理 HTTP，`Upgrade` 请求会被吞掉。
+此时房间页显示「已断开」而普通页面一切正常。不必换 CDN，去
+**管理后台 → 系统设置 → WebSocket 独立接入地址** 填一个直连源站的域名即可：
+
+```
+wss://direct.example.com     # 允许 wss:// https:// 或裸域名 example.com
+```
+
+前端只在建立 WebSocket 时改用它，HTTP 请求仍走 CDN；值随公共配置运行时下发，
+**改完刷新页面即生效，无需重新构建镜像**。留空或非法值自动回退同源。
+
+排障顺序：先确认镜像里装上了 WS 协议实现（`docker exec <容器> python -c "import uvicorn, websockets"`），
+再查反向代理是否转发 `Upgrade`，最后才怀疑 CDN。
+:::
+
 ### 手动部署
 
 1. 克隆项目
 ```bash
-git clone https://github.com/vastsa/FileCodeBox.git
+git clone https://github.com/onlypeng/FileCodeBox.git
 ```
 
 2. 安装依赖

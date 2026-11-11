@@ -112,8 +112,8 @@ FileCodeBox supports multiple flexible expiration methods:
 | By Count | `count` | File expires after specified download count |
 
 ::: info Note
-- Administrators can control available expiration methods via the `expireStyle` configuration
-- Administrators can limit maximum file retention time via the `max_save_seconds` configuration
+- Administrators control the available expiration methods via `expireStyle` (drop `forever` to force a deadline on every upload)
+- There is no global "max retention" switch; post-expiry cleanup is driven by `expiredRetentionStyle` / `expiredRetentionValue`
 :::
 
 ### Expiration Method Examples

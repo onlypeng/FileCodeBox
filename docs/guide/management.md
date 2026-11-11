@@ -153,11 +153,11 @@ FileCodeBox 提供了功能完善的管理面板，让管理员可以方便地�
 | 类别 | 配置项示例 |
 |------|------------|
 | 基础设置 | `name`, `description`, `keywords`, `notify_title`, `notify_content` |
-| 上传设置 | `uploadSize`, `uploadMinute`, `uploadCount`, `openUpload`, `enableChunk` |
-| 过期设置 | `expireStyle`, `max_save_seconds` |
+| 上传设置 | `uploadSize`, `uploadMinute`, `uploadRateLimitCount`, `openUpload`, `enableChunk` |
+| 过期设置 | `expireStyle`, `expiredRetentionStyle`, `expiredRetentionValue` |
 | 多文件/收件箱 | `maxSendFiles`, `maxMultiFileCount`, `maxCollectionFiles` |
 | 主题设置 | `themesSelect`, `opacity`, `background` |
-| 安全设置 | `admin_token`, `showAdminAddr`, `errorMinute`, `errorCount` |
+| 安全设置 | `admin_token`, `showAdminAddr`, `errorMinute`, `errorCount`, `virusScan*` |
 | 存储设置 | `file_storage`, `storage_path` 及各存储后端的配置 |
 | 网络设置 | `trustedProxies`, `cors_origins` |
 | 实时通信 | `directRelayEnabled`, `directRelaySpeedLimit`, `directTurnServers` |

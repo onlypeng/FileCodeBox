@@ -372,7 +372,7 @@ await fetch(`/chunk/upload/complete/${upload_id}`, {
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `uploadMinute` | 1 | 限制时间窗口（分钟） |
-| `uploadCount` | 10 | 时间窗口内最大上传次数 |
+| `uploadRateLimitCount` | 10 | 时间窗口内最大上传次数 |
 
 当超过频率限制时，需要等待时间窗口过后才能继续上传。
 
@@ -391,10 +391,10 @@ await fetch(`/chunk/upload/complete/${upload_id}`, {
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `openUpload` | int | 1 | 是否开放上传（1=开放，0=关闭） |
-| `uploadSize` | int | 10485760 | 最大上传大小（字节） |
+| `uploadSize` | int | 104857600 | 最大上传大小（字节），默认 100MB |
 | `enableChunk` | int | 0 | 是否启用分片上传（1=启用，0=禁用） |
 | `uploadMinute` | int | 1 | 上传频率限制时间窗口（分钟） |
-| `uploadCount` | int | 10 | 时间窗口内最大上传次数 |
+| `uploadRateLimitCount` | int | 10 | 时间窗口内最大上传次数 |
 | `expireStyle` | list | ["day","hour","minute","forever","count"] | 允许的过期方式 |
 
 ### 配置示例
@@ -406,7 +406,7 @@ enableChunk = 1
 
 # 放宽上传频率限制：每 5 分钟最多 50 次
 uploadMinute = 5
-uploadCount = 50
+uploadRateLimitCount = 50
 
 # 只允许按天和按次数过期
 expireStyle = ["day", "count"]

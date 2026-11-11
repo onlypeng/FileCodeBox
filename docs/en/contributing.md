@@ -96,11 +96,16 @@ same commit**:
 
 | Change | Docs to update |
 |--------|----------------|
-| Add/change a route | `readme.md` API overview, `docs/api/index.md` |
-| Add a config key | `readme.md` config section, `docs/guide/configuration.md` |
-| Add an env var | `readme.md` env var table, `docs/guide/getting-started.md` |
+| Add/change a route | `docs/api/index.md` + `docs/en/api/index.md` |
+| Add a config key | `core/settings.py:DEFAULT_CONFIG` → `docs/guide/configuration.md` + English |
+| Add an env var | `.env.example` → `docs/guide/getting-started.md` + English |
 | Add/change a model field | `apps/base/models.py` comment + the migration file |
-| Deployment-related | `readme.md` multi-instance section, `docs/guide/getting-started.md` |
+| Deployment-related | `docs/guide/getting-started.md` + English |
+| A user-facing feature | add a row to `readme.md` Features, plus a screenshot in `.github/images/` |
+
+`readme.md` / `readme_en.md` keep only the feature list, screenshots, quick start and
+a docs index. **Details belong in `docs/`** — duplicating config tables and API tables
+in the README guarantees they drift.
 
 ### Keep Chinese and English in sync
 

@@ -1,207 +1,205 @@
 # Configuration Guide
 
-FileCodeBox provides rich configuration options that can be customized through the admin panel or by directly modifying the configuration. This document details all available configuration options.
+Settings come from two places: `DEFAULT_CONFIG` in `core/settings.py` (factory defaults)
+and the override stored in the database. **Change them from Admin → Settings** — saving
+writes the DB and hot-reloads the running process, no restart needed.
+Editing the DB directly is only for initial provisioning.
 
-## Configuration Methods
-
-FileCodeBox supports two configuration methods:
-
-1. **Admin Panel Configuration** (Recommended): Access `/admin` to enter the admin panel and modify settings on the settings page
-2. **Database Configuration**: Configuration is stored in the `data/filecodebox.db` database
-
-::: tip Note
-On first startup, the system uses default configuration from `core/settings.py`. Modified configurations are saved to the database.
+::: warning Keys that need a restart
+`serverHost` / `serverPort` / `serverWorkers` are startup arguments; restart after changing.
+`redisUrl` and the `db*` keys are **rejected** on save (HTTP 400) when the value actually
+changes — the subscription connection and the pool cannot be hot-swapped. Set them via
+environment variables and restart.
 :::
 
-## Basic Settings
+## Site & appearance
 
-### Site Information
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `name` | string | `驿码 - FileCodeBox` | Site name, displayed in page title and navigation bar |
-| `description` | string | `开箱即用的文件快传系统` | Site description, used for SEO |
-| `keywords` | string | `FileCodeBox, 驿码...` | Site keywords, used for SEO |
-| `port` | int | `12345` | Service listening port |
-
-### Notification Settings
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `notify_title` | string | `系统通知` | Notification title |
-| `notify_content` | string | Welcome message | Notification content, supports HTML |
-| `page_explain` | string | Legal disclaimer | Footer explanation text |
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | `驿码 - FileCodeBox` | Site name in the page title and navbar |
+| `description` | string | `开箱即用的文件快传系统` | Site description (SEO) |
+| `keywords` | string | `FileCodeBox, 驿码, ...` | Site keywords (SEO) |
+| `notify_title` / `notify_content` | string | `系统通知` / welcome text | Top banner title and body; HTML allowed |
+| `page_explain` | string | legal notice | Footer notice text |
 | `robotsText` | string | `User-agent: *\nDisallow: /` | robots.txt content |
+| `showAdminAddr` | int | `0` | Show the admin entry on the home page (1 = yes) |
+| `opacity` | float | `0.9` | UI opacity (0–1) |
+| `background` | string | `""` | Custom background image URL; empty = default |
+| `themesSelect` / `themesChoices` | string / list | `themes/2024` / two built-in themes | Legacy theme picker; **not used by the dist build**, kept for compatibility |
+| `spaTheme` | string | `light` | Default SPA theme: `light` / `dark` / `enterprise`, written by the theme module |
 
-## Upload Settings
+## Upload
 
-### File Upload Limits
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `openUpload` | int | `1` | Allow uploads (0 = admin only) |
+| `uploadSize` | int | `104857600` | Per-file limit in **bytes**, default 100MB |
+| `fileTypeWhitelist` | string | `""` | Comma-separated extensions (`jpg,png,pdf`); empty = unrestricted |
+| `expireStyle` | list | `day,hour,minute,forever,count` | Expiry modes offered to uploaders |
+| `maxTextLength` | int | `200000` | Max **characters** for a text share or remark |
+| `uploadMinute` | int | `1` | Upload rate-limit window (minutes) |
+| `uploadRateLimitCount` | int | `10` | Uploads allowed per IP inside that window |
+| `maxSendFiles` | int | `20` | Files per send operation |
+| `maxMultiFileCount` | int | `20` | Records per multi-file share |
+| `codeLength` | int | `6` | Pickup code length (4–12); shared by file, inbox and room codes |
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `openUpload` | int | `1` | Enable upload functionality (1=enabled, 0=disabled) |
-| `uploadSize` | int | `10485760` | Maximum single file upload size (bytes), default 10MB |
-| `enableChunk` | int | `0` | Enable chunked upload (1=enabled, 0=disabled) |
+### Chunked upload
 
-::: warning Note
-`uploadSize` is in bytes. 10MB = 10 * 1024 * 1024 = 10485760 bytes
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enableChunk` | int | `0` | Enable chunked upload (1 = on) |
+| `uploadChunkSize` | int | `5` | Chunk size in **MB**, only when chunking is on |
+| `chunkExpireHours` | int | `24` | Hours before an unfinished chunk session is garbage-collected |
+
+Chunked upload resumes from the current page only: `uploadId` + uploaded chunk indices +
+the `File` object live in page memory. A refresh loses the `File` and forces a re-upload;
+only an explicit abandon or leaving the page rolls back the consumed delivery quota.
+
+## Expiry & cleanup
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `expiredRetentionStyle` | string | `day` | Unit for retention after expiry: `day` / `hour` / `minute` / `forever` |
+| `expiredRetentionValue` | int | `1` | Retention amount; `forever` = never auto-clean, files accumulate |
+
+Retention covers all three record kinds (file shares, inboxes, rooms); the background
+task deletes records and physical files together. `forever` is an escape hatch: the
+cleanup loop exits immediately, so disk usage only grows and you must prune it yourself.
+
+## Security
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `admin_token` | string | `FileCodeBox2023` | Admin password; **forced change on first login** |
+| `errorMinute` | int | `1` | Wrong-pickup-code rate-limit window (minutes) |
+| `errorCount` | int | `10` | Wrong attempts allowed in that window |
+| `auditLogRetentionDays` | int | `90` | Audit log retention in days (0 = never prune) |
+| `trustedProxies` | string | `""` | Comma-separated trusted proxy IPs; required behind Nginx or you log the proxy IP |
+| `cors_origins` | string | `http://localhost:5173,...` | CORS allowlist; empty for same-origin production |
+
+Password storage details (PBKDF2, sensitive-value encryption, placeholder write-back) are
+in [Security](/en/guide/security).
+
+### Virus scanning (optional)
+
+Off by default with zero overhead until a hook is set. When enabled, every upload calls an
+external scanner after the file lands on disk.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `virusScanEnabled` | bool | `false` | Master switch |
+| `virusScanHook` | string | `""` | Command or HTTP endpoint, see below |
+| `virusScanTimeoutSec` | int | `30` | Per-scan timeout (1–300 s) |
+| `virusScanFailOpen` | bool | `true` | When the scanner is unavailable: `true` = allow + warn, `false` = reject the upload |
+
+```bash
+# Command form: {file} is replaced by the staged path; exit 0 = clean, 1 = infected
+clamscan --no-summary {file}
+
+# HTTP form: POST the file bytes, expect {"infected": true, "reason": "..."}
+https://scan.example.com/check
+```
+
+::: tip Why fail-open is the default
+Scanning is an auxiliary control; a flaky scanner should not take the whole upload feature
+down. Set it to `false` when security must win over availability, accepting that uploads
+fail entirely while the scanner is unreachable.
 :::
 
-### Upload Rate Limiting
+## Storage
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `uploadMinute` | int | `1` | Upload limit time window (minutes) |
-| `uploadCount` | int | `10` | Maximum uploads allowed within the time window |
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `file_storage` | string | `local` | Backend: `local` / `s3` / `onedrive` / `webdav` / `opendal` |
+| `storage_path` | string | `""` | Local directory; empty = `data/storage` |
 
-Example: Default configuration allows up to 10 uploads per minute.
+Backend credentials (`s3_*`, `onedrive_*`, `webdav_*`, `opendal_*`) are documented in
+[Storage](/en/guide/storage).
 
+## Inbox
 
-### File Expiration Settings
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `maxCollectionFiles` | int | `100` | Hard cap on files per inbox |
+| `collectionDefaultMaxFiles` | int | `20` | Default file cap when creating |
+| `collectionDefaultExpireDays` | int | `7` | Default lifetime in days when creating |
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `expireStyle` | list | `["day","hour","minute","forever","count"]` | Available expiration methods |
-| `max_save_seconds` | int | `0` | Maximum file retention time (seconds), 0 means no limit |
+## Direct transfer & rooms
 
-Expiration methods explained:
-- `day` - Expire by days
-- `hour` - Expire by hours
-- `minute` - Expire by minutes
-- `forever` - Never expire
-- `count` - Expire by download count
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `directRelayEnabled` | int | `1` | Server relay toggle (1 = on); off means P2P only |
+| `directRelaySpeedLimit` | int | `0` | Relay speed limit in KB/s (0 = unlimited) |
+| `directRelayChunkSize` | int | `64` | Relay chunk size in KB (16–256). An encrypted frame is chunk + ~40B; gateways often cap at 256KB, so do not max it out |
+| `directMaxRelaySize` | int | `0` | Max size of a single relayed file in MB (0 = unlimited); P2P is not affected |
+| `directTurnServers` | list | `[]` | WebRTC TURN list for symmetric-NAT fallback |
+| `defaultMaxMembers` | int | `10` | Default room member cap (0 = unlimited); a room may pick 1..this |
+| `mediaDefaultQuality` | string | `auto` | Default shared-stream quality: `low` / `sd` / `hd` / `auto` |
 
-## Theme Settings
-
-### Theme Selection
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `themesSelect` | string | `themes/2024` | Currently active theme |
-| `themesChoices` | list | See below | Available themes list |
-
-Default available themes:
 ```json
-[
-  {
-    "name": "2023",
-    "key": "themes/2023",
-    "author": "Lan",
-    "version": "1.0"
-  },
-  {
-    "name": "2024",
-    "key": "themes/2024",
-    "author": "Lan",
-    "version": "1.0"
-  }
-]
+// One entry of directTurnServers
+[{ "urls": "turn:host:3478?transport=udp", "username": "xxx", "credential": "yyy" }]
 ```
 
-### Interface Style
+### Room file cache
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `opacity` | float | `0.9` | Interface opacity (0-1) |
-| `background` | string | `""` | Custom background image URL, empty uses default background |
+The room's server cache stages files on local disk so late joiners can fetch them without
+the sender being online.
 
-## Admin Settings
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `roomCacheEnabled` | int | `1` | Allow staging room files on the server; off means P2P multi-source only |
+| `roomCacheDefaultHours` | int | `72` | Default retention in hours (0 = follow the room lifetime) |
+| `roomCacheMaxSize` | int | `100` | Per-file cap in MB (0 = unlimited) |
+| `roomCacheRoomQuota` | int | `500` | Per-room quota in MB (0 = unlimited); over quota rejects new uploads, released as files expire |
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `admin_token` | string | `FileCodeBox2023` | Admin login password |
-| `showAdminAddr` | int | `0` | Show admin panel entry on homepage (1=show, 0=hide) |
+Source priority is fixed: **online holder that already downloaded (P2P) > server cache >
+no source**. Users who already hold a copy are never asked again whether to serve it,
+which is what prevents duplicate prompts.
 
-::: danger Security Warning
-Always change the default `admin_token` in production environments! Using the default password poses serious security risks.
-:::
+## Global quota
 
-## Security Settings
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `globalStorageQuotaMB` | int | `0` | Global quota in MB (0 = unlimited). Counts file-share records plus the room cache directory |
 
-### Error Rate Limiting
+Exceeding the quota **does not block uploads** — the panel keeps warning and shows the
+ratio. Set a value if anonymous uploads are open, otherwise the disk fills up silently.
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `errorMinute` | int | `1` | Error limit time window (minutes) |
-| `errorCount` | int | `1` | Maximum errors allowed within the time window |
+## Outbound links
 
-This setting prevents brute-force attacks on extraction codes.
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `shareDomain` | string | `""` | Site address used to build share/pickup links (download URL, QR code, wget command), e.g. `https://share.example.com`; empty = current origin |
+| `wsBaseUrl` | string | `""` | Dedicated WebSocket origin. Set it when a CDN/edge layer drops `Upgrade`; empty = same origin |
 
-## Storage Settings
+`shareDomain` only affects outbound share links; API calls still use the real origin.
+`wsBaseUrl` only affects WebSockets; HTTP still goes through the CDN. Both are delivered at
+runtime with the public config, so a page refresh applies them. Setup and troubleshooting
+are in [Getting Started](/en/guide/getting-started).
 
-### Storage Type
+## Server & database
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `file_storage` | string | `local` | Storage backend type |
-| `storage_path` | string | `""` | Custom storage path |
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `serverHost` | string | `0.0.0.0` | Bind address (restart) |
+| `serverPort` | int | `12345` | Port (restart) |
+| `serverWorkers` | int | `1` | Worker processes (restart). **Keep 1** unless the multi-instance prerequisites hold |
+| `redisUrl` | string | `""` | Redis URL for multi-instance coordination; empty = single instance. Restart required |
+| `dbType` | string | `sqlite` | `sqlite` / `postgres` / `mysql`; SQLite is single-writer, single process only |
+| `dbHost` / `dbPort` | string / int | `127.0.0.1` / `0` | Port 0 means the type default (postgres 5432 / mysql 3306) |
+| `dbUser` / `dbPassword` | string | `""` | Database credentials |
+| `dbName` | string | `filecodebox` | Database name |
+| `dbSchema` | string | `public` | PostgreSQL schema; ignored elsewhere |
 
-Supported storage types:
-- `local` - Local storage
-- `s3` - S3-compatible storage (AWS S3, Aliyun OSS, MinIO, etc.)
-- `onedrive` - OneDrive storage
-- `webdav` - WebDAV storage
-- `opendal` - OpenDAL storage
+`redisUrl` and the `db*` keys are **deliberately not hot-editable**: the admin panel posts
+the *entire* config object back, so the backend only rejects a request when a value truly
+changed, otherwise touching one unrelated switch would break the whole form. Inject these
+through `REDIS_URL`, `DB_TYPE`, etc. and restart.
 
-For detailed storage configuration, see [Storage Configuration](/en/guide/storage).
+## Next steps
 
-## Configuration Examples
-
-### Example 1: Small Personal Use
-
-Suitable for personal or small team use with relaxed limits:
-
-```python
-{
-    "name": "My File Share",
-    "uploadSize": 52428800,        # 50MB
-    "uploadMinute": 5,             # 5 minutes
-    "uploadCount": 20,             # Max 20 uploads
-    "expireStyle": ["day", "hour", "forever"],
-    "admin_token": "your-secure-password",
-    "showAdminAddr": 1
-}
-```
-
-### Example 2: Public Service
-
-Suitable for public services requiring stricter limits:
-
-```python
-{
-    "name": "Public File Box",
-    "uploadSize": 10485760,        # 10MB
-    "uploadMinute": 1,             # 1 minute
-    "uploadCount": 5,              # Max 5 uploads
-    "errorMinute": 5,              # 5 minutes
-    "errorCount": 3,               # Max 3 errors
-    "expireStyle": ["hour", "minute", "count"],
-    "max_save_seconds": 86400,     # Max retention 1 day
-    "admin_token": "very-secure-password-123",
-    "showAdminAddr": 0
-}
-```
-
-### Example 3: Enterprise Internal Use
-
-Suitable for enterprise internal use with large file and chunked upload support:
-
-```python
-{
-    "name": "Enterprise File Transfer",
-    "uploadSize": 1073741824,      # 1GB
-    "enableChunk": 1,              # Enable chunked upload
-    "uploadMinute": 10,            # 10 minutes
-    "uploadCount": 100,            # Max 100 uploads
-    "expireStyle": ["day", "forever"],
-    "file_storage": "s3",          # Use S3 storage
-    "admin_token": "enterprise-secure-token",
-    "showAdminAddr": 1
-}
-```
-
-## Next Steps
-
-- [Storage Configuration](/en/guide/storage) - Learn how to configure different storage backends
-- [Security Settings](/en/guide/security) - Learn how to enhance system security
-- [File Sharing](/en/guide/share) - Learn about file sharing features
+- [Getting Started](/en/guide/getting-started) — deploy, env vars, reverse proxy, multi-instance
+- [Storage](/en/guide/storage) — backend-specific parameters
+- [Security](/en/guide/security) — passwords, rate limits, allowlist, virus scanning
+- [Management](/en/guide/management) — what each admin module does
