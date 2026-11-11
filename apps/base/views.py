@@ -3975,6 +3975,7 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                         holder_names = set(
                             n for n in ((cached.holder_names or "").split(",") if cached else []) if n
                         )
+                        was_holder = client_id in holders
                         holders.add(client_id)
                         holder_names.add(nickname or "匿名")
                         if cached:
@@ -3991,6 +3992,10 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                                 cache_holder_ids=",".join(holders),
                                 holder_names=",".join(holder_names),
                             )
+                        # 已登记过的持有者不重复广播：重连时服务端会把同一列表再下发一次，
+                        # 否则 N 个成员会刷出 N 条相同的「已缓存」系统消息。
+                        if was_holder:
+                            continue
                         # 广播缓存列表更新（其他成员可从此缓存源收取）
                         await ws_manager.broadcast(room.room_code, {
                             "type": "file_cache_update",
@@ -4018,6 +4023,15 @@ async def websocket_room(websocket: WebSocket, room_code: str):
                                 f"part={part_id} [{r_start}, {r_end}]"
                             )
                         else:
+                            # holders 是静态 client_id，断线不清理。离线持有者收不到定向消息，
+                            # 请求方会一直卡在"接收中"直到合并计划 TTL 清扫，必须立即回错。
+                            if not ws_manager.is_member_online(room.room_code, holder):
+                                await ws_manager.send_to_client(room.room_code, client_id, {
+                                    "type": "file_error",
+                                    "transfer_id": (msg.get("transfer_id") or "")[:64],
+                                    "reason": "holder_offline",
+                                })
+                                continue
                             await ws_manager.send_to_client(room.room_code, holder, {
                                 "type": "file_cache_request",
                                 "transfer_id": (msg.get("transfer_id") or "")[:64],
