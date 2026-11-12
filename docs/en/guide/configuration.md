@@ -157,9 +157,14 @@ Source priority is fixed: **online holder that already downloaded (P2P) > server
 no source**. Users who already hold a copy are never asked again whether to serve it,
 which is what prevents duplicate prompts.
 
+The gear icon ("Room settings") in the room header collects all visitor-side settings:
+**My nickname**, the **prompt for existing files** switch, and **Reset download reminders**.
+These are per-browser preferences, not admin settings, and are never synced across devices.
+
 Late joiners get **no automatic prompt by default** — files simply appear in the cached file
-list. Each visitor can opt in via the "Silent / Prompt" button in the room header; this is a
-per-browser preference, not an admin setting and not synced across browsers.
+list. Once prompts are enabled, each file is offered only once: a "room code + file ID" record
+is kept locally so refreshing or re-joining never asks again. "Reset download reminders" clears
+that room's records so the next join offers the files once more.
 
 ## Global quota
 

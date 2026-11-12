@@ -49,9 +49,10 @@ truth for "no duplicate prompts, no duplicate downloads, no inconsistent cache s
 
 1. The file is staged on the server and **nobody is asked to accept**
 2. Late joiners see the copy already available in the file list
-3. **No prompt by default**: late joiners simply see the copy in the cached file list and download it when they choose. The "Silent / Prompt" button in the room header turns prompts on (stored per browser, never shared with other members)
+3. **No prompt by default**: late joiners simply see the copy in the cached file list and download it when they choose. The gear icon ("Room settings") in the room header holds the "Prompt to download existing files when joining" switch (stored per browser, never shared with other members)
 4. Anyone who already downloaded becomes a `holder` and is **never asked again** to serve it
 5. Late joiners prefer an online `holder` over the server copy
+6. **Each file is offered once**: after a prompt, a "room code + file ID" record is kept locally, so refreshing or re-joining never asks again. "Reset download reminders" in Room settings clears the records for that room
 
 ### Source priority (fixed)
 
