@@ -88,6 +88,23 @@ Room write endpoints require "currently online **or** a member token". The token
 issued by the server on WS join, so a briefly disconnected client can still finish
 an action. `GET /room/history/{room_code}` backfills messages after a reconnect.
 
+## Scroll position
+
+On entry the message list lands on the **latest message** (bottom). History is
+fetched asynchronously, so sticking to the bottom only happens after those
+messages are actually in the DOM — scrolling before that would scroll an empty
+list and leave the view at the top once history arrives.
+
+Rules:
+
+- While at the bottom, new messages keep the view pinned to the bottom
+- After scrolling up to read earlier messages, new arrivals do **not** yank the
+  view back down
+- Reaching the top loads one earlier page; the scroll offset is compensated so
+  the viewport does not jump
+- File cards and fonts grow after the first frame, so the pin is re-applied on
+  the next frame
+
 ## Multi-instance deployments
 
 Text signaling is synchronized across instances (incremental events plus a 5-second
