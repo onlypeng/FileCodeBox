@@ -157,6 +157,10 @@ Source priority is fixed: **online holder that already downloaded (P2P) > server
 no source**. Users who already hold a copy are never asked again whether to serve it,
 which is what prevents duplicate prompts.
 
+Late joiners get **no automatic prompt by default** — files simply appear in the cached file
+list. Each visitor can opt in via the "Silent / Prompt" button in the room header; this is a
+per-browser preference, not an admin setting and not synced across browsers.
+
 ## Global quota
 
 | Key | Type | Default | Description |
