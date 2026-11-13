@@ -92,7 +92,7 @@ docker run -d --restart always -p 12345:12345 \
   --name filecodebox onlypeng/filecodebox:latest
 ```
 
-国内拉取缓慢时可换镜像：`docker.cnb.cool/aixk/filecodebox`。
+镜像地址固定为 `onlypeng/filecodebox`（Docker Hub），请勿使用其它第三方镜像源。
 
 打开 `http://<服务器IP>:12345`。管理后台在 `/#/admin`，默认口令 `FileCodeBox2023`，**首次登录会强制修改**。
 

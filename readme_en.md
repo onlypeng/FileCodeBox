@@ -92,7 +92,7 @@ docker run -d --restart always -p 12345:12345 \
   --name filecodebox onlypeng/filecodebox:latest
 ```
 
-If Docker Hub is slow from China, use the mirror `docker.cnb.cool/aixk/filecodebox`.
+The image is `onlypeng/filecodebox` (Docker Hub); do not use third-party mirrors of it.
 
 Open `http://<server-ip>:12345`. The admin panel lives at `/#/admin` with the default password `FileCodeBox2023`, **which you will be forced to change on first login**.
 
