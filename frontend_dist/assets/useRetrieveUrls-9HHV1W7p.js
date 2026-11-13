@@ -1,1 +1,0 @@
-import"./index-D7vi4dIt.js";import{C as t}from"./collection-kThxtY7U.js";function u(){return{getDownloadUrl:(l,o)=>t.getDownloadUrl(l,o),getZipDownloadUrl:l=>t.getZipDownloadUrl(l),getMultiFileDownloadUrl:(l,o,e)=>t.getMultiFileDownloadUrl(l,o,e),getMultiFileZipUrl:(l,o)=>t.getMultiFileZipUrl(l,o)}}export{u};

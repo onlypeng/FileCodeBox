@@ -38,6 +38,12 @@ truth for "no duplicate prompts, no duplicate downloads, no inconsistent cache s
 **Per-user state** (key `transfer_id + client_id`, independent per person):
 `pending → accepted | declined → downloading → done → holder`
 
+Once the file reaches `done`, one copy is saved locally. The save only runs after the
+data has actually landed: while the OPFS writer is still open there is nothing to read
+yet, so the file is not marked as delivered — the save is retried after assembly
+completes. Skipping this produced "received/cached but no download". A file is saved at
+most once per session and is never downloaded twice.
+
 ### Cache off
 
 1. Sender emits `file_offer` to the other online members
